@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Provider-neutral payment capabilities and PayPal adapter extracted from EmployeeDrivenContent",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iDEVconn/payment-providers.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iDEVconn/payment-providers/issues"
+  },
+  "homepage": "https://github.com/iDEVconn/payment-providers#readme",
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -42,12 +50,14 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "@idevconn/payment": "^1.2.0"
   },
   "devDependencies": {
+    "@changesets/cli": "^3.0.3",
     "@types/node": "^22.10.0",
     "@typescript-eslint/eslint-plugin": "^8.70.0",
     "@typescript-eslint/parser": "^8.70.0",
