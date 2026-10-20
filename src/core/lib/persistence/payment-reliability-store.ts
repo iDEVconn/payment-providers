@@ -15,7 +15,15 @@ import type {
   UpdatePaymentOperationInput,
   UpdateProviderEvidenceInput,
   UpdateSellerConnectionInput,
+  ClaimPendingEvidenceInput,
+  ListPaymentEvidenceForRecoveryInput,
+  ListPaymentEvidenceForRecoveryResult,
 } from '../../../contracts/index';
+
+export type AcquireCheckoutCreateExecutionLeaseResult =
+  | { kind: 'acquired'; operation: PaymentOperation; executionOwnerToken: string }
+  | { kind: 'in_flight'; operation: PaymentOperation }
+  | { kind: 'not_eligible'; operation: PaymentOperation };
 
 export interface PaymentReliabilityStore {
   createOperation(input: CreatePaymentOperationInput): Promise<PaymentOperation>;
@@ -100,6 +108,10 @@ export interface PaymentReliabilityStore {
     operationId: string;
     expectedVersion: number;
   }): Promise<PaymentOperation>;
+  acquireCheckoutCreateExecutionLease(input: {
+    operationId: string;
+    expectedVersion: number;
+  }): Promise<AcquireCheckoutCreateExecutionLeaseResult>;
   updateOperation(input: UpdatePaymentOperationInput): Promise<PaymentOperation>;
   transitionOperation(input: TransitionPaymentOperationInput): Promise<PaymentOperation>;
   listOperationTransitions(operationId: string): Promise<PaymentOperationTransitionRecord[]>;
@@ -113,11 +125,10 @@ export interface PaymentReliabilityStore {
     providerEventId: string,
   ): Promise<ProviderEvidenceRecord | null>;
   updateEvidence(input: UpdateProviderEvidenceInput): Promise<ProviderEvidenceRecord>;
-  claimPendingEvidence(input: {
-    limit: number;
-    leaseMs: number;
-    workerId: string;
-  }): Promise<ProviderEvidenceRecord[]>;
+  claimPendingEvidence(input: ClaimPendingEvidenceInput): Promise<ProviderEvidenceRecord[]>;
+  listProviderEvidenceForRecovery(
+    input: ListPaymentEvidenceForRecoveryInput,
+  ): Promise<ListPaymentEvidenceForRecoveryResult>;
   listReconciliationCandidates(limit: number): Promise<ProviderEvidenceRecord[]>;
   listUncertainOperations(limit: number): Promise<PaymentOperation[]>;
   listOperationsByParent(parentOperationId: string): Promise<PaymentOperation[]>;

@@ -1,3 +1,12 @@
+import {
+  sanitizePaypalTransportFailure,
+  type PaypalTransportContext,
+} from './paypal-transport-error';
+
+function throwSanitizedTransportFailure(context: PaypalTransportContext, error: unknown): never {
+  const sanitized = sanitizePaypalTransportFailure(context, error);
+  throw Object.assign(new Error(sanitized.message), sanitized);
+}
 import type { PaypalOAuthHttpClient } from './paypal-oauth-client';
 import type {
   PaypalOrdersHttpClient,
@@ -58,15 +67,7 @@ export class FetchPaypalOAuthHttpClient implements PaypalOAuthHttpClient {
         debugId: extractDebugId(response.headers),
       };
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw {
-          code: 'PROVIDER_UNCERTAIN',
-          message: 'PayPal OAuth request timed out',
-          retryable: true,
-          uncertain: true,
-        };
-      }
-      throw error;
+      throwSanitizedTransportFailure('oauth', error);
     } finally {
       clearTimeout(timer);
     }
@@ -99,15 +100,7 @@ export class FetchPaypalPayoutHttpClient implements PaypalPayoutHttpClient {
         debugId: extractDebugId(response.headers),
       };
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw {
-          code: 'PROVIDER_UNCERTAIN',
-          message: 'PayPal payout HTTP request timed out',
-          retryable: true,
-          uncertain: true,
-        };
-      }
-      throw error;
+      throwSanitizedTransportFailure('payout', error);
     } finally {
       clearTimeout(timer);
     }
@@ -140,15 +133,7 @@ export class FetchPaypalSubscriptionHttpClient implements PaypalSubscriptionHttp
         debugId: extractDebugId(response.headers),
       };
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw {
-          code: 'PROVIDER_UNCERTAIN',
-          message: 'PayPal subscription HTTP request timed out',
-          retryable: true,
-          uncertain: true,
-        };
-      }
-      throw error;
+      throwSanitizedTransportFailure('subscription', error);
     } finally {
       clearTimeout(timer);
     }
@@ -187,15 +172,7 @@ export class FetchPaypalOrdersHttpClient implements PaypalOrdersHttpClient {
         debugId: extractDebugId(response.headers),
       };
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw {
-          code: 'PROVIDER_UNCERTAIN',
-          message: 'PayPal HTTP request timed out',
-          retryable: true,
-          uncertain: true,
-        };
-      }
-      throw error;
+      throwSanitizedTransportFailure('orders', error);
     } finally {
       clearTimeout(timer);
     }
@@ -231,15 +208,7 @@ export class FetchPaypalSellerOnboardingHttpClient implements PaypalSellerOnboar
         debugId: extractDebugId(response.headers),
       };
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw {
-          code: 'PROVIDER_UNCERTAIN',
-          message: 'PayPal seller onboarding HTTP request timed out',
-          retryable: true,
-          uncertain: true,
-        };
-      }
-      throw error;
+      throwSanitizedTransportFailure('seller_onboarding', error);
     } finally {
       clearTimeout(timer);
     }

@@ -1,6 +1,8 @@
 import {
   PAYMENT_RELIABILITY_ERROR,
+  PAYMENT_TRANSITION_REJECTION_REASON,
   PaymentReliabilityError,
+  type PaymentReliabilityErrorCode,
   type BillingPlanResult,
   type CatalogProductResult,
   type CreateBillingPlanRequest,
@@ -15,11 +17,20 @@ import {
   type PaymentOperation,
   type PlanLifecycleRequest,
   type PlanLifecycleResult,
+  type ExecuteSubscriptionLifecycleResult,
   type SubscriptionLifecycleCommandRequest,
   type SubscriptionLifecycleCommandResult,
   type SubscriptionResult,
+  type RetrySubscriptionCreateRequest,
+  type SubscriptionProviderContext,
+  type SubscriptionProviderCreateRetryEligibility,
+  isExecuteSubscriptionLifecycleRefreshPending,
 } from '../../contracts/index';
 import { buildCommandFingerprint } from './command-fingerprint';
+import {
+  isTerminalPreProviderFailureCode,
+  resolveProviderFailure,
+} from './resolve-provider-failure';
 import { maskSubscriberEmail, maskSubscriberRef } from './mask-subscriber';
 import { buildOperationIdempotencyScope } from './operation-idempotency';
 import { validateBillingCycles } from './subscription-billing-cycles';
@@ -33,9 +44,62 @@ import {
   applyPlanDomainUpdate,
   applySubscriptionDomainUpdate,
 } from './subscription-evidence-application';
+import {
+  assertSubscriptionProviderPlanSnapshotConsistent,
+  isSubscriptionProviderPlanMismatchError,
+} from './subscription-provider-plan-consistency';
+
+const SUBSCRIPTION_CLAIMED_FOR_EXECUTION_REASON = 'Claimed for provider execution';
 
 function isTerminal(status: PaymentOperation['status']): boolean {
   return status === 'succeeded' || status === 'failed';
+}
+
+export type SubscriptionCreateRetryOptions = {
+  evaluateProviderCreateRetryEligibility: (
+    firstProviderExecutionAt: string | null,
+  ) => SubscriptionProviderCreateRetryEligibility;
+};
+
+function buildSubscriptionCreateCommandFingerprint(
+  input: Pick<
+    CreateSubscriptionRequest,
+    'subscriber' | 'returnUrl' | 'cancelUrl' | 'planOperationId' | 'providerPlanId' | 'offeringRef'
+  >,
+): string {
+  const reference = resolveSubscriptionPlanReference(input);
+  if (reference.form === 'plan_operation') {
+    return buildCommandFingerprint({
+      planOperationId: reference.planOperationId,
+      subscriberRef: input.subscriber.subscriberRef,
+      returnUrl: input.returnUrl ?? null,
+      cancelUrl: input.cancelUrl ?? null,
+    });
+  }
+  return buildCommandFingerprint({
+    providerPlanId: reference.providerPlanId,
+    offeringRef: reference.offeringRef,
+    subscriberRef: input.subscriber.subscriberRef,
+    returnUrl: input.returnUrl ?? null,
+    cancelUrl: input.cancelUrl ?? null,
+  });
+}
+
+function assertSubscriptionOperationScope(
+  operation: PaymentOperation,
+  input: SubscriptionProviderContext & { subscriptionOperationId?: string },
+): void {
+  if (
+    operation.providerCode !== input.providerCode ||
+    operation.accountRef !== input.accountRef ||
+    operation.applicationRef !== input.applicationRef ||
+    operation.environment !== input.environment
+  ) {
+    throw new PaymentReliabilityError(
+      PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+      'Subscription operation scope does not match the request',
+    );
+  }
 }
 
 function toProductResult(operation: PaymentOperation): CatalogProductResult {
@@ -64,7 +128,13 @@ function toPlanResult(operation: PaymentOperation): BillingPlanResult {
   };
 }
 
-function toSubscriptionResult(operation: PaymentOperation): SubscriptionResult {
+function toSubscriptionResult(
+  operation: PaymentOperation,
+  extras?: Pick<
+    SubscriptionResult,
+    'subscriptionStateRefreshPending' | 'subscriptionStateRefreshErrorCode'
+  >,
+): SubscriptionResult {
   return {
     subscriptionOperationId: operation.operationId,
     operationStatus: operation.status,
@@ -77,15 +147,43 @@ function toSubscriptionResult(operation: PaymentOperation): SubscriptionResult {
     nextBillingTime: operation.nextBillingTime,
     lifecycleReason: operation.lifecycleReason,
     correlationId: operation.correlationId,
+    ...extras,
   };
+}
+
+async function markSubscriptionLifecycleCommandSucceeded(
+  store: PaymentReliabilityStore,
+  commandOp: PaymentOperation,
+  kind: string,
+): Promise<PaymentOperation> {
+  return store.transitionOperation({
+    operationId: commandOp.operationId,
+    expectedVersion: commandOp.version,
+    nextStatus: 'succeeded',
+    reason: `PayPal subscription ${kind}`,
+  });
+}
+
+function throwNormalizedCommandFailure(commandOp: PaymentOperation): never {
+  const code = (commandOp.failureCode ??
+    PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN) as PaymentReliabilityErrorCode;
+  throw new PaymentReliabilityError(
+    code,
+    commandOp.failureMessage ?? 'Subscription lifecycle command failed',
+  );
 }
 
 type SubscriptionPlanReference =
   | { form: 'plan_operation'; planOperationId: string }
   | { form: 'provider_plan'; providerPlanId: string; offeringRef: string };
 
+type SubscriptionPlanReferenceInput = Pick<
+  CreateSubscriptionRequest,
+  'planOperationId' | 'providerPlanId' | 'offeringRef'
+>;
+
 function resolveSubscriptionPlanReference(
-  input: CreateSubscriptionRequest,
+  input: SubscriptionPlanReferenceInput,
 ): SubscriptionPlanReference {
   const hasPlanOperation = input.planOperationId !== undefined;
   const hasProviderPlan = input.providerPlanId !== undefined || input.offeringRef !== undefined;
@@ -479,6 +577,104 @@ export class SubscriptionLifecycleService {
     return toSubscriptionResult(operation);
   }
 
+  async retrySubscriptionCreate(
+    input: RetrySubscriptionCreateRequest,
+    options: SubscriptionCreateRetryOptions,
+  ): Promise<SubscriptionResult> {
+    let operation = await this.store.findOperationById(input.subscriptionOperationId);
+    if (!operation || operation.kind !== 'subscription') {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+        'Subscription operation was not found',
+      );
+    }
+    assertSubscriptionOperationScope(operation, input);
+
+    const fingerprint = buildSubscriptionCreateCommandFingerprint(input);
+    if (fingerprint !== operation.commandFingerprint) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT,
+        'Retry parameters do not match the original subscription command',
+      );
+    }
+
+    const reference = resolveSubscriptionPlanReference(input);
+    if (reference.form === 'plan_operation') {
+      if (operation.parentOperationId !== reference.planOperationId) {
+        throw new PaymentReliabilityError(
+          PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+          'Subscription operation plan reference does not match the request',
+        );
+      }
+    } else if (
+      operation.providerPlanId !== reference.providerPlanId ||
+      operation.offeringRef !== reference.offeringRef
+    ) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+        'Subscription operation plan reference does not match the request',
+      );
+    }
+
+    if (operation.providerSubscriptionId?.trim()) {
+      return toSubscriptionResult(operation);
+    }
+    if (isTerminal(operation.status)) {
+      return toSubscriptionResult(operation);
+    }
+    if (operation.status !== 'unknown' && operation.status !== 'submitted') {
+      if (operation.status === 'prepared') {
+        return toSubscriptionResult(operation);
+      }
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+        'Subscription operation is not eligible for create retry',
+      );
+    }
+
+    const providerPlanId = operation.providerPlanId;
+    if (!providerPlanId?.trim()) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+        'Subscription operation is missing a provider plan reference',
+      );
+    }
+
+    if (!this.isSubscriptionExecutionLeaseInFlight(operation)) {
+      const firstExecutionAt = await this.resolveFirstSubscriptionProviderExecutionAt(
+        operation.operationId,
+      );
+      const eligibility = options.evaluateProviderCreateRetryEligibility(firstExecutionAt);
+      if (eligibility !== 'allowed') {
+        return toSubscriptionResult(operation);
+      }
+    }
+
+    const latest = await this.store.findOperationById(operation.operationId);
+    if (!latest || latest.kind !== 'subscription') {
+      return toSubscriptionResult(latest ?? operation);
+    }
+    operation = latest;
+
+    const lease = await this.store.acquireCheckoutCreateExecutionLease({
+      operationId: operation.operationId,
+      expectedVersion: operation.version,
+    });
+    if (lease.kind === 'in_flight') {
+      return toSubscriptionResult(lease.operation);
+    }
+    if (lease.kind === 'not_eligible') {
+      return toSubscriptionResult(lease.operation);
+    }
+
+    return this.executeSubscriptionCreateProviderRetry(
+      input,
+      lease.operation,
+      lease.executionOwnerToken,
+      providerPlanId,
+    );
+  }
+
   async cancelSubscription(
     input: SubscriptionLifecycleCommandRequest,
   ): Promise<SubscriptionLifecycleCommandResult> {
@@ -619,12 +815,7 @@ export class SubscriptionLifecycleService {
   private async runSubscriptionLifecycle(
     input: SubscriptionLifecycleCommandRequest,
     kind: 'subscription_cancel' | 'subscription_suspend' | 'subscription_activate',
-    execute: (providerSubscriptionId: string) => Promise<{
-      subscriptionStatus: SubscriptionResult['subscriptionStatus'];
-      lifecycleReason: string | null;
-      startTime: string | null;
-      nextBillingTime: string | null;
-    }>,
+    execute: (providerSubscriptionId: string) => Promise<ExecuteSubscriptionLifecycleResult>,
   ): Promise<SubscriptionLifecycleCommandResult> {
     const subscription = await this.store.findOperationById(input.subscriptionOperationId);
     if (
@@ -678,35 +869,213 @@ export class SubscriptionLifecycleService {
       expectedVersion: commandOp.version,
     });
 
+    let providerResult: ExecuteSubscriptionLifecycleResult;
     try {
-      const result = await execute(subscription.providerSubscriptionId);
-      commandOp = await this.store.transitionOperation({
-        operationId: commandOp.operationId,
-        expectedVersion: commandOp.version,
-        nextStatus: subscriptionStatusToOperationStatus(result.subscriptionStatus),
-        subscriptionStatus: result.subscriptionStatus,
-        reason: `PayPal subscription ${kind}`,
-      });
-
-      const currentSubscription = await this.store.findOperationById(subscription.operationId);
-      if (!currentSubscription) {
-        throw new PaymentReliabilityError(
-          PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
-          'Subscription with provider reference was not found',
-        );
-      }
-
-      const updated = await applySubscriptionDomainUpdate(this.store, currentSubscription, {
-        subscriptionStatus: result.subscriptionStatus,
-        lifecycleReason: result.lifecycleReason ?? input.reason,
-        startTime: result.startTime,
-        nextBillingTime: result.nextBillingTime,
-        reason: `PayPal subscription ${kind}`,
-      });
-      return toSubscriptionResult(updated);
+      providerResult = await execute(subscription.providerSubscriptionId);
     } catch (error) {
-      await this.handleFailure(commandOp, error);
-      return toSubscriptionResult(subscription);
+      commandOp = await this.handleFailure(commandOp, error);
+      throwNormalizedCommandFailure(commandOp);
+    }
+
+    commandOp = await markSubscriptionLifecycleCommandSucceeded(this.store, commandOp, kind);
+
+    if (isExecuteSubscriptionLifecycleRefreshPending(providerResult)) {
+      return toSubscriptionResult(subscription, {
+        subscriptionStateRefreshPending: true,
+        subscriptionStateRefreshErrorCode: providerResult.subscriptionStateRefreshErrorCode ?? null,
+      });
+    }
+
+    const currentSubscription = await this.store.findOperationById(subscription.operationId);
+    if (!currentSubscription) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+        'Subscription with provider reference was not found',
+      );
+    }
+
+    try {
+      assertSubscriptionProviderPlanSnapshotConsistent(currentSubscription, providerResult);
+    } catch (error) {
+      if (isSubscriptionProviderPlanMismatchError(error)) {
+        return toSubscriptionResult(currentSubscription, {
+          subscriptionStateRefreshErrorCode: PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
+        });
+      }
+      throw error;
+    }
+
+    const updated = await applySubscriptionDomainUpdate(this.store, currentSubscription, {
+      subscriptionStatus: providerResult.subscriptionStatus,
+      lifecycleReason: providerResult.lifecycleReason ?? input.reason,
+      startTime: providerResult.startTime,
+      nextBillingTime: providerResult.nextBillingTime,
+      providerSubscriptionStateAt: providerResult.providerSubscriptionStateAt ?? null,
+      reason: `PayPal subscription ${kind}`,
+    });
+    return toSubscriptionResult(updated);
+  }
+
+  private isSubscriptionExecutionLeaseInFlight(operation: PaymentOperation): boolean {
+    if (!operation.executionOwnerToken || !operation.executionLeaseExpiresAt) {
+      return false;
+    }
+    const expiresMs = Date.parse(operation.executionLeaseExpiresAt);
+    return Number.isFinite(expiresMs) && Date.now() < expiresMs;
+  }
+
+  private async resolveFirstSubscriptionProviderExecutionAt(
+    operationId: string,
+  ): Promise<string | null> {
+    const transitions = await this.store.listOperationTransitions(operationId);
+    const executionTransitions = transitions
+      .filter(
+        (row) =>
+          row.toStatus === 'submitted' && row.reason === SUBSCRIPTION_CLAIMED_FOR_EXECUTION_REASON,
+      )
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    return executionTransitions[0]?.createdAt ?? null;
+  }
+
+  private async executeSubscriptionCreateProviderRetry(
+    input: RetrySubscriptionCreateRequest,
+    operation: PaymentOperation,
+    executionOwnerToken: string,
+    providerPlanId: string,
+  ): Promise<SubscriptionResult> {
+    let executingOperation = operation;
+    try {
+      const result = await this.provider.createSubscription({
+        providerCode: input.providerCode,
+        accountRef: input.accountRef,
+        applicationRef: input.applicationRef,
+        environment: input.environment,
+        providerRequestId: executingOperation.operationId,
+        providerPlanId,
+        subscriberEmail: input.subscriber.email ?? null,
+        returnUrl: input.returnUrl ?? null,
+        cancelUrl: input.cancelUrl ?? null,
+      });
+      executingOperation = await this.persistSubscriptionCreateExecutionTransition(
+        executingOperation,
+        executionOwnerToken,
+        {
+          nextStatus: subscriptionStatusToOperationStatus(result.subscriptionStatus),
+          subscriptionStatus: result.subscriptionStatus,
+          providerSubscriptionId: result.providerSubscriptionId,
+          providerReferenceId: result.providerSubscriptionId,
+          approvalUrl: result.approvalUrl,
+          startTime: result.startTime,
+          nextBillingTime: result.nextBillingTime,
+          reason: 'PayPal subscription created awaiting approval if required',
+        },
+      );
+    } catch (error) {
+      executingOperation = await this.handleSubscriptionCreateProviderFailure(
+        executingOperation,
+        error,
+        executionOwnerToken,
+      );
+    }
+    return toSubscriptionResult(executingOperation);
+  }
+
+  private isSubscriptionExecutorPersistenceConflict(error: unknown): boolean {
+    if (!(error instanceof PaymentReliabilityError)) {
+      return false;
+    }
+    if (error.code === PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT) {
+      return true;
+    }
+    return (
+      error.code === PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED &&
+      error.rejectionReason === PAYMENT_TRANSITION_REJECTION_REASON.EXECUTION_OWNER_MISMATCH
+    );
+  }
+
+  private async reloadSubscriptionOperationAfterPersistenceConflict(
+    operationId: string,
+  ): Promise<PaymentOperation> {
+    const reloaded = await this.store.findOperationById(operationId);
+    if (!reloaded) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT,
+        'Operation was not found after persistence conflict',
+      );
+    }
+    return reloaded;
+  }
+
+  private async persistSubscriptionCreateExecutionTransition(
+    operation: PaymentOperation,
+    executionOwnerToken: string,
+    input: Omit<
+      Parameters<PaymentReliabilityStore['transitionOperation']>[0],
+      | 'operationId'
+      | 'expectedVersion'
+      | 'expectedExecutionOwnerToken'
+      | 'executionOwnerToken'
+      | 'executionLeaseExpiresAt'
+    >,
+  ): Promise<PaymentOperation> {
+    try {
+      return await this.store.transitionOperation({
+        operationId: operation.operationId,
+        expectedVersion: operation.version,
+        expectedExecutionOwnerToken: executionOwnerToken,
+        executionOwnerToken: null,
+        executionLeaseExpiresAt: null,
+        ...input,
+      });
+    } catch (error) {
+      if (!this.isSubscriptionExecutorPersistenceConflict(error)) {
+        throw error;
+      }
+      return this.reloadSubscriptionOperationAfterPersistenceConflict(operation.operationId);
+    }
+  }
+
+  private async handleSubscriptionCreateProviderFailure(
+    operation: PaymentOperation,
+    error: unknown,
+    executionOwnerToken?: string | null,
+  ): Promise<PaymentOperation> {
+    const resolved = resolveProviderFailure(error);
+    const nextStatus =
+      resolved.code === PAYMENT_RELIABILITY_ERROR.PROVIDER_ACTION_REQUIRED
+        ? 'failed'
+        : resolved.uncertain || resolved.retryable
+          ? 'unknown'
+          : isTerminalPreProviderFailureCode(resolved.code) ||
+              resolved.code === PAYMENT_RELIABILITY_ERROR.PROVIDER_TERMINAL_REJECTION
+            ? 'failed'
+            : 'unknown';
+
+    const ownerToken = executionOwnerToken ?? operation.executionOwnerToken;
+    const transitionInput = {
+      operationId: operation.operationId,
+      expectedVersion: operation.version,
+      ...(ownerToken
+        ? {
+            expectedExecutionOwnerToken: ownerToken,
+            executionOwnerToken: null,
+            executionLeaseExpiresAt: null,
+          }
+        : {}),
+      nextStatus,
+      subscriptionStatus: nextStatus === 'unknown' ? 'unknown' : operation.subscriptionStatus,
+      failureCode: resolved.code,
+      failureMessage: resolved.message,
+      reason: 'Subscription provider mutation returned uncertain or terminal outcome',
+    } as Parameters<PaymentReliabilityStore['transitionOperation']>[0];
+
+    try {
+      return await this.store.transitionOperation(transitionInput);
+    } catch (transitionError) {
+      if (ownerToken && this.isSubscriptionExecutorPersistenceConflict(transitionError)) {
+        return this.reloadSubscriptionOperationAfterPersistenceConflict(operation.operationId);
+      }
+      throw transitionError;
     }
   }
 
@@ -743,7 +1112,12 @@ export class SubscriptionLifecycleService {
       planStatus: nextStatus === 'unknown' ? 'unknown' : current.planStatus,
       productStatus: nextStatus === 'unknown' ? 'unknown' : current.productStatus,
       failureCode: err?.code ?? PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
-      failureMessage: err instanceof Error ? err.message : String(error),
+      failureMessage:
+        typeof err?.message === 'string'
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(error),
       reason: 'Subscription provider mutation returned uncertain or terminal outcome',
     });
   }

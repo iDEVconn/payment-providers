@@ -35,7 +35,7 @@ export const CAPABILITY_DEFINITIONS: readonly CapabilityDefinition[] = [
     implemented: true,
     enabledEnvKey: 'PAYPAL_SUBSCRIPTIONS_ENABLED',
     requiredEnvKeys: ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET'],
-    defaultEnabled: false,
+    defaultEnabled: true,
   },
   {
     capability: 'seller_onboarding',

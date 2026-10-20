@@ -1,4 +1,9 @@
 import type { PaymentCapability } from './capabilities';
+import { sanitizePublicErrorMessage } from './public-error-sanitizer';
+import {
+  PaymentReliabilityError,
+  type PaymentReliabilityErrorPaymentOutcome,
+} from './reliability-errors';
 
 export const PAYMENT_CAPABILITY_UNAVAILABLE = 'CAPABILITY_UNAVAILABLE' as const;
 
@@ -63,6 +68,29 @@ function payloadFromUnknown(value: unknown): PaymentCapabilityErrorPayload | nul
   return payloadFromUnknown(row['message']) ?? payloadFromUnknown(row['error']);
 }
 
+/** JSON-safe TCP payload for {@link PaymentReliabilityError}. */
+export type PaymentReliabilityErrorPayload = {
+  name: 'PaymentReliabilityError';
+  code: PaymentReliabilityError['code'];
+  message: string;
+  rejectionReason?: PaymentReliabilityError['rejectionReason'];
+  operationId?: string;
+  paymentOutcome?: PaymentReliabilityErrorPaymentOutcome;
+};
+
+export function toPaymentReliabilityErrorPayload(
+  error: PaymentReliabilityError,
+): PaymentReliabilityErrorPayload {
+  return {
+    name: 'PaymentReliabilityError',
+    code: error.code,
+    message: error.message,
+    ...(error.rejectionReason ? { rejectionReason: error.rejectionReason } : {}),
+    ...(error.operationId ? { operationId: error.operationId } : {}),
+    ...(error.paymentOutcome ? { paymentOutcome: error.paymentOutcome } : {}),
+  };
+}
+
 export function rehydratePaymentCapabilityError(value: unknown): PaymentCapabilityError | null {
   if (value instanceof PaymentCapabilityError) {
     return value;
@@ -74,6 +102,38 @@ export function rehydratePaymentCapabilityError(value: unknown): PaymentCapabili
   return new PaymentCapabilityError(payload.capability, payload.unavailableReason);
 }
 
+function rehydratePaymentReliabilityError(value: unknown): PaymentReliabilityError | null {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+  const row = value as Record<string, unknown>;
+  if (row['name'] === 'PaymentReliabilityError' && typeof row['code'] === 'string') {
+    const rejectionReason = row['rejectionReason'];
+    const operationId = row['operationId'];
+    const paymentOutcome = row['paymentOutcome'];
+    return new PaymentReliabilityError(
+      row['code'] as PaymentReliabilityError['code'],
+      typeof row['message'] === 'string'
+        ? sanitizePublicErrorMessage(row['message'], 'Payment reliability error')
+        : 'Payment reliability error',
+      {
+        ...(typeof rejectionReason === 'string'
+          ? { rejectionReason: rejectionReason as PaymentReliabilityError['rejectionReason'] }
+          : {}),
+        ...(typeof operationId === 'string' ? { operationId } : {}),
+        ...(paymentOutcome === 'unknown' || paymentOutcome === 'failed' ? { paymentOutcome } : {}),
+      },
+    );
+  }
+  if (typeof row['getError'] === 'function') {
+    return rehydratePaymentReliabilityError(row['getError']());
+  }
+  return (
+    rehydratePaymentReliabilityError(row['message']) ??
+    rehydratePaymentReliabilityError(row['error'])
+  );
+}
+
 export function rehydratePaymentRpcError(value: unknown): unknown {
-  return rehydratePaymentCapabilityError(value) ?? value;
+  return rehydratePaymentCapabilityError(value) ?? rehydratePaymentReliabilityError(value) ?? value;
 }

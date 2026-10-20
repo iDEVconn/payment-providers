@@ -1,4 +1,5 @@
 import type {
+  NormalizedDeployedPaymentConfig,
   PaymentDeploymentEnvironment,
   PaymentExecutionIssue,
   PaymentExecutionMode,
@@ -7,33 +8,12 @@ import type {
   PaymentRuntimeState,
 } from '../../contracts/index';
 
+/** @deprecated Legacy env name — read only at composition root for conflict detection. */
 export const PAYMENT_EXECUTION_MODE_ENV = 'PAYMENT_EXECUTION_MODE';
+/** @deprecated Legacy env name — read only at composition root for conflict detection. */
 export const PAYMENT_DEPLOYMENT_ENVIRONMENT_ENV = 'PAYMENT_DEPLOYMENT_ENVIRONMENT';
+/** @deprecated Legacy env name — read only at composition root for conflict detection. */
 export const FUNDING_SIMULATION_ENV = 'FUNDING_SIMULATION';
-
-const ALLOWED_MODES: Readonly<
-  Record<PaymentDeploymentEnvironment, readonly PaymentExecutionMode[]>
-> = {
-  local: ['simulation', 'sandbox'],
-  ci: ['simulation'],
-  staging: ['simulation', 'sandbox'],
-  live: ['live'],
-};
-
-const DEPLOYMENTS: readonly PaymentDeploymentEnvironment[] = [
-  'local',
-  'ci',
-  'staging',
-  'live',
-] as const;
-
-const MODES: readonly PaymentExecutionMode[] = ['simulation', 'sandbox', 'live'] as const;
-
-export type ResolvePaymentExecutionModeInput = {
-  paymentExecutionMode?: string | null;
-  paymentDeploymentEnvironment?: string | null;
-  fundingSimulation?: string | null;
-};
 
 function issue(code: PaymentExecutionIssue['code']): PaymentExecutionIssue {
   return { code };
@@ -44,26 +24,27 @@ function normalize(value: string | null | undefined): string | undefined {
   return trimmed ? trimmed.toLowerCase() : undefined;
 }
 
-function parseDeployment(
-  raw: string | null | undefined,
-): PaymentDeploymentEnvironment | null | 'invalid' {
-  const normalized = normalize(raw);
-  if (!normalized) {
+function deriveDeploymentEnvironment(
+  nodeEnv: string,
+  providerEnvironment: 'sandbox' | 'live' | null,
+  financialSimulation: boolean,
+): PaymentDeploymentEnvironment | null {
+  if (financialSimulation) {
+    return 'ci';
+  }
+  if (nodeEnv === 'production') {
+    if (providerEnvironment === 'live') {
+      return 'live';
+    }
+    if (providerEnvironment === 'sandbox') {
+      return 'staging';
+    }
     return null;
   }
-  return (DEPLOYMENTS as readonly string[]).includes(normalized)
-    ? (normalized as PaymentDeploymentEnvironment)
-    : 'invalid';
-}
-
-function parseMode(raw: string | null | undefined): PaymentExecutionMode | null | 'invalid' {
-  const normalized = normalize(raw);
-  if (!normalized) {
-    return null;
+  if (providerEnvironment === 'sandbox' || providerEnvironment === 'live') {
+    return 'local';
   }
-  return (MODES as readonly string[]).includes(normalized)
-    ? (normalized as PaymentExecutionMode)
-    : 'invalid';
+  return null;
 }
 
 function buildStatus(input: {
@@ -90,76 +71,131 @@ function buildStatus(input: {
   };
 }
 
+function detectLegacyConflicts(
+  normalized: NormalizedDeployedPaymentConfig,
+  derivedExecutionMode: PaymentExecutionMode | null,
+  derivedDeployment: PaymentDeploymentEnvironment | null,
+  issues: PaymentExecutionIssue[],
+): boolean {
+  let conflict = false;
+
+  const legacyMode = normalize(normalized.legacyPaymentExecutionMode);
+  if (legacyMode) {
+    if (legacyMode === 'simulation') {
+      issues.push(issue('LEGACY_ALIAS_CONFLICT'));
+      conflict = true;
+    } else if (
+      derivedExecutionMode &&
+      legacyMode !== derivedExecutionMode &&
+      (legacyMode === 'sandbox' || legacyMode === 'live')
+    ) {
+      issues.push(issue('PAYPAL_ENVIRONMENT_MISMATCH'));
+      conflict = true;
+    } else if (legacyMode !== 'sandbox' && legacyMode !== 'live' && legacyMode !== 'simulation') {
+      issues.push(issue('INVALID_EXECUTION_MODE'));
+      conflict = true;
+    }
+  }
+
+  const legacyDeployment = normalize(normalized.legacyPaymentDeploymentEnvironment);
+  if (legacyDeployment && derivedDeployment && legacyDeployment !== derivedDeployment) {
+    issues.push(issue('LEGACY_ALIAS_CONFLICT'));
+    conflict = true;
+  }
+
+  if (normalize(normalized.legacyFundingSimulation)) {
+    issues.push(issue('LEGACY_ALIAS_CONFLICT'));
+    conflict = true;
+  }
+
+  return conflict;
+}
+
 export function resolvePaymentExecutionMode(
-  input: ResolvePaymentExecutionModeInput,
+  normalized: NormalizedDeployedPaymentConfig,
 ): PaymentExecutionStatus {
   const issues: PaymentExecutionIssue[] = [];
-  const deployment = parseDeployment(input.paymentDeploymentEnvironment);
-  const explicitMode = parseMode(input.paymentExecutionMode);
+  const isProduction = normalized.nodeEnv === 'production';
+  const financialSimulation = normalized.financialSimulation === true;
 
-  if (deployment === 'invalid') {
-    issues.push(issue('INVALID_DEPLOYMENT_ENVIRONMENT'));
-    return buildStatus({
-      executionMode: explicitMode === 'invalid' ? null : explicitMode,
-      deploymentEnvironment: null,
-      runtimeState: 'forbidden',
-      source: 'unconfigured',
-      issues,
-    });
-  }
-
-  if (deployment === null) {
-    issues.push(issue('MISSING_DEPLOYMENT_ENVIRONMENT'));
-    return buildStatus({
-      executionMode: explicitMode === 'invalid' ? null : explicitMode,
-      deploymentEnvironment: null,
-      runtimeState: 'forbidden',
-      source: 'unconfigured',
-      issues,
-    });
-  }
-
-  if (explicitMode === 'invalid') {
-    issues.push(issue('INVALID_EXECUTION_MODE'));
-    return buildStatus({
-      executionMode: null,
-      deploymentEnvironment: deployment,
-      runtimeState: 'conflict',
-      source: 'unconfigured',
-      issues,
-    });
-  }
-
-  if (explicitMode !== null) {
-    const allowed = ALLOWED_MODES[deployment];
-    if (!allowed.includes(explicitMode)) {
-      issues.push(issue('DEPLOYMENT_MODE_FORBIDDEN'));
+  if (financialSimulation) {
+    if (isProduction) {
+      issues.push(issue('SIMULATION_FORBIDDEN_IN_PRODUCTION'));
       return buildStatus({
-        executionMode: explicitMode,
-        deploymentEnvironment: deployment,
+        executionMode: null,
+        deploymentEnvironment: null,
         runtimeState: 'forbidden',
-        source: 'explicit',
+        source: 'test-simulation',
         issues,
       });
     }
-
+    if (detectLegacyConflicts(normalized, 'simulation', 'ci', issues)) {
+      return buildStatus({
+        executionMode: 'simulation',
+        deploymentEnvironment: 'ci',
+        runtimeState: 'conflict',
+        source: 'legacy-alias',
+        issues,
+      });
+    }
     return buildStatus({
-      executionMode: explicitMode,
-      deploymentEnvironment: deployment,
+      executionMode: 'simulation',
+      deploymentEnvironment: 'ci',
       runtimeState: 'configured',
-      source: 'explicit',
+      source: 'test-simulation',
       issues,
     });
   }
 
-  issues.push(issue('MISSING_EXECUTION_MODE'));
+  const parsed = parsePaypalEnvironment(normalized, issues);
+  if (!parsed) {
+    return buildStatus({
+      executionMode: null,
+      deploymentEnvironment: null,
+      runtimeState: 'forbidden',
+      source: 'unconfigured',
+      issues,
+    });
+  }
+
+  const executionMode: PaymentExecutionMode = parsed;
+  const deploymentEnvironment = deriveDeploymentEnvironment(normalized.nodeEnv, parsed, false);
+
+  if (detectLegacyConflicts(normalized, executionMode, deploymentEnvironment, issues)) {
+    return buildStatus({
+      executionMode,
+      deploymentEnvironment,
+      runtimeState: 'conflict',
+      source: 'legacy-alias',
+      issues,
+    });
+  }
+
   return buildStatus({
-    executionMode: null,
-    deploymentEnvironment: deployment,
-    runtimeState: 'unconfigured',
-    source: 'unconfigured',
+    executionMode,
+    deploymentEnvironment,
+    runtimeState: 'configured',
+    source: 'provider-environment',
     issues,
   });
+}
+
+function parsePaypalEnvironment(
+  normalized: NormalizedDeployedPaymentConfig,
+  issues: PaymentExecutionIssue[],
+): 'sandbox' | 'live' | null {
+  const env = normalized.providerEnvironment;
+  if (env === 'sandbox' || env === 'live') {
+    return env;
+  }
+  issues.push(
+    issue(
+      normalized.providerEnvironmentInvalid
+        ? 'INVALID_PROVIDER_ENVIRONMENT'
+        : 'MISSING_PROVIDER_ENVIRONMENT',
+    ),
+  );
+  return null;
 }
 
 export function executionStatusDisplayLabel(status: PaymentExecutionStatus): string {
@@ -183,4 +219,20 @@ export function isLiveSafetyViolation(status: PaymentExecutionStatus): boolean {
       status.executionMode === 'simulation' ||
       status.executionMode === 'sandbox')
   );
+}
+
+export function shouldAbortPaymentStartup(
+  status: PaymentExecutionStatus,
+  nodeEnv: string,
+): boolean {
+  if (isLiveSafetyViolation(status)) {
+    return true;
+  }
+  if (nodeEnv === 'production' && status.runtimeState !== 'configured') {
+    return true;
+  }
+  if (nodeEnv === 'production' && status.executionMode === 'simulation') {
+    return true;
+  }
+  return false;
 }

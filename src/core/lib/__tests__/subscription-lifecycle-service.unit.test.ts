@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { PAYMENT_RELIABILITY_ERROR } from '../../../contracts/index';
+import { PAYMENT_RELIABILITY_ERROR, PaymentReliabilityError } from '../../../contracts/index';
+import * as subscriptionEvidence from '../subscription-evidence-application';
 import { buildOperationIdempotencyScope } from '../operation-idempotency';
 import type { SubscriptionProviderPort } from '../subscription-provider-port';
 import { SubscriptionLifecycleService } from '../subscription-lifecycle-service';
@@ -57,6 +58,7 @@ const provider: SubscriptionProviderPort = {
     approvalUrl: null,
     startTime: null,
     nextBillingTime: null,
+    lifecycleReason: 'cancelled',
   }),
   suspendSubscription: async () => ({
     providerSubscriptionId: 'SUB-1',
@@ -65,6 +67,7 @@ const provider: SubscriptionProviderPort = {
     approvalUrl: null,
     startTime: null,
     nextBillingTime: null,
+    lifecycleReason: 'suspended',
   }),
   activateSubscription: async () => ({
     providerSubscriptionId: 'SUB-1',
@@ -73,12 +76,13 @@ const provider: SubscriptionProviderPort = {
     approvalUrl: null,
     startTime: null,
     nextBillingTime: null,
+    lifecycleReason: 'active',
   }),
 };
 
 async function seedBillingPlan(store: MemoryPaymentReliabilityStore) {
   const scope = buildOperationIdempotencyScope({
-    applicationRef: 'edc',
+    applicationRef: 'test-app',
     accountRef: 'default',
     environment: 'sandbox',
     kind: 'billing_plan',
@@ -89,7 +93,7 @@ async function seedBillingPlan(store: MemoryPaymentReliabilityStore) {
     commandFingerprint: 'fp-plan',
     providerCode: 'paypal',
     accountRef: 'default',
-    applicationRef: 'edc',
+    applicationRef: 'test-app',
     environment: 'sandbox',
     kind: 'billing_plan',
     providerPlanId: 'PLAN-1',
@@ -111,7 +115,7 @@ describe('SubscriptionLifecycleService', () => {
     const result = await service.createCatalogProduct({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'prod-idem-1',
       name: 'Premium',
@@ -134,7 +138,7 @@ describe('SubscriptionLifecycleService', () => {
     const input = {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox' as const,
       idempotencyKey: 'prod-idem-2',
       name: 'Premium',
@@ -159,7 +163,7 @@ describe('SubscriptionLifecycleService', () => {
     const result = await service.createCatalogProduct({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'prod-timeout',
       name: 'Premium',
@@ -174,7 +178,7 @@ describe('SubscriptionLifecycleService', () => {
     const product = await service.createCatalogProduct({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'prod-plan-life',
       name: 'Premium',
@@ -183,7 +187,7 @@ describe('SubscriptionLifecycleService', () => {
     const plan = await service.createBillingPlan({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'plan-life',
       productOperationId: product.productOperationId,
@@ -205,7 +209,7 @@ describe('SubscriptionLifecycleService', () => {
     const activated = await service.activateBillingPlan({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'plan-activate',
       planOperationId: plan.planOperationId,
@@ -215,7 +219,7 @@ describe('SubscriptionLifecycleService', () => {
     const deactivated = await service.deactivateBillingPlan({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'plan-deactivate',
       planOperationId: plan.planOperationId,
@@ -227,7 +231,7 @@ describe('SubscriptionLifecycleService', () => {
     const store = new MemoryPaymentReliabilityStore();
     const service = new SubscriptionLifecycleService(store, provider);
     const scope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'billing_plan',
@@ -238,7 +242,7 @@ describe('SubscriptionLifecycleService', () => {
       commandFingerprint: 'fp-plan-offering',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'billing_plan',
       providerPlanId: 'PLAN-OFFERING',
@@ -255,7 +259,7 @@ describe('SubscriptionLifecycleService', () => {
     const result = await service.createSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'sub-offering-copy',
       planOperationId: plan.operationId,
@@ -274,7 +278,7 @@ describe('SubscriptionLifecycleService', () => {
     const result = await service.createSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'sub-null-offering',
       planOperationId: plan.operationId,
@@ -292,7 +296,7 @@ describe('SubscriptionLifecycleService', () => {
     const input = {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox' as const,
       idempotencyKey: 'sub-idem-replay',
       planOperationId: plan.operationId,
@@ -310,7 +314,7 @@ describe('SubscriptionLifecycleService', () => {
     const result = await service.createSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'sub-idem-1',
       planOperationId: plan.operationId,
@@ -333,7 +337,7 @@ describe('SubscriptionLifecycleService', () => {
     const base = {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox' as const,
       idempotencyKey: 'sub-idem-2',
       planOperationId: plan.operationId,
@@ -366,7 +370,7 @@ describe('SubscriptionLifecycleService', () => {
     const created = await service.createSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'sub-readonly',
       planOperationId: plan.operationId,
@@ -376,7 +380,7 @@ describe('SubscriptionLifecycleService', () => {
     const result = await service.getSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       subscriptionOperationId: created.subscriptionOperationId,
     });
@@ -392,7 +396,7 @@ describe('SubscriptionLifecycleService', () => {
     const created = await service.createSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'sub-life',
       planOperationId: plan.operationId,
@@ -402,7 +406,7 @@ describe('SubscriptionLifecycleService', () => {
     const suspended = await service.suspendSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'sub-suspend',
       subscriptionOperationId: created.subscriptionOperationId,
@@ -413,12 +417,302 @@ describe('SubscriptionLifecycleService', () => {
     const reactivated = await service.activateSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'sub-activate',
       subscriptionOperationId: created.subscriptionOperationId,
       reason: 'Payment received',
     });
     expect(reactivated.subscriptionStatus).toBe('active');
+  });
+
+  it('marks lifecycle command succeeded independently of refreshed subscription status', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const service = new SubscriptionLifecycleService(store, provider);
+    const plan = await seedBillingPlan(store);
+    const created = await service.createSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-command-status',
+      planOperationId: plan.operationId,
+      subscriber: { subscriberRef: 'user-command-status' },
+    });
+
+    await service.cancelSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-cancel-command',
+      subscriptionOperationId: created.subscriptionOperationId,
+      reason: 'User requested cancellation',
+    });
+
+    const commandOps = await store.listOperationsByParent(created.subscriptionOperationId);
+    const cancelCommand = commandOps.find((op) => op.kind === 'subscription_cancel');
+    expect(cancelCommand?.status).toBe('succeeded');
+    expect(cancelCommand?.subscriptionStatus).not.toBe('cancelled');
+  });
+
+  it('keeps lifecycle command success when post-refresh plan id mismatches stored plan', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const mismatchProvider: SubscriptionProviderPort = {
+      ...provider,
+      cancelSubscription: async () => ({
+        providerSubscriptionId: 'SUB-1',
+        providerPlanId: 'PLAN-OTHER',
+        subscriptionStatus: 'cancelled',
+        approvalUrl: null,
+        startTime: '2099-01-01T00:00:00.000Z',
+        nextBillingTime: '2099-02-01T00:00:00.000Z',
+        lifecycleReason: 'User requested cancellation',
+        providerSubscriptionStateAt: '2099-01-01T00:00:00.000Z',
+      }),
+    };
+    const service = new SubscriptionLifecycleService(store, mismatchProvider);
+    const plan = await seedBillingPlan(store);
+    const created = await service.createSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-plan-mismatch-refresh',
+      planOperationId: plan.operationId,
+      subscriber: { subscriberRef: 'user-plan-mismatch' },
+    });
+    const before = await store.findOperationById(created.subscriptionOperationId);
+
+    const result = await service.cancelSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-cancel-plan-mismatch',
+      subscriptionOperationId: created.subscriptionOperationId,
+      reason: 'User requested cancellation',
+    });
+
+    const commandOps = await store.listOperationsByParent(created.subscriptionOperationId);
+    const cancelCommand = commandOps.find((op) => op.kind === 'subscription_cancel');
+    expect(cancelCommand?.status).toBe('succeeded');
+
+    expect(result.subscriptionStateRefreshErrorCode).toBe(
+      PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
+    );
+    expect(result.subscriptionStatus).toBe(before?.subscriptionStatus);
+    expect(result.providerPlanId).toBe(before?.providerPlanId);
+
+    const after = await store.findOperationById(created.subscriptionOperationId);
+    expect(after?.providerPlanId).toBe(before?.providerPlanId);
+    expect(after?.subscriptionStatus).toBe(before?.subscriptionStatus);
+    expect(after?.startTime).toBe(before?.startTime);
+  });
+
+  it('returns refresh pending when provider POST succeeds but GET refresh does not', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const refreshPendingProvider: SubscriptionProviderPort = {
+      ...provider,
+      cancelSubscription: async () => ({
+        providerSubscriptionId: 'SUB-1',
+        subscriptionStateRefreshPending: true,
+        subscriptionStateRefreshErrorCode: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+        lifecycleReason: 'User requested cancellation',
+      }),
+    };
+    const service = new SubscriptionLifecycleService(store, refreshPendingProvider);
+    const plan = await seedBillingPlan(store);
+    const created = await service.createSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-refresh-pending',
+      planOperationId: plan.operationId,
+      subscriber: { subscriberRef: 'user-refresh-pending' },
+    });
+    const beforeStatus = created.subscriptionStatus;
+
+    const result = await service.cancelSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-cancel-refresh-pending',
+      subscriptionOperationId: created.subscriptionOperationId,
+      reason: 'User requested cancellation',
+    });
+
+    expect(result.subscriptionStateRefreshPending).toBe(true);
+    expect(result.subscriptionStatus).toBe(beforeStatus);
+    expect(result.subscriptionStateRefreshErrorCode).toBe(
+      PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+    );
+  });
+
+  it('surfaces normalized command failure when provider POST fails', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const failingProvider: SubscriptionProviderPort = {
+      ...provider,
+      cancelSubscription: async () => {
+        throw {
+          code: PAYMENT_RELIABILITY_ERROR.PROVIDER_TERMINAL_REJECTION,
+          message: 'PayPal rejected cancellation',
+          retryable: false,
+          uncertain: false,
+        };
+      },
+    };
+    const service = new SubscriptionLifecycleService(store, failingProvider);
+    const plan = await seedBillingPlan(store);
+    const created = await service.createSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-post-fail',
+      planOperationId: plan.operationId,
+      subscriber: { subscriberRef: 'user-post-fail' },
+    });
+
+    await expect(
+      service.cancelSubscription({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        idempotencyKey: 'sub-cancel-post-fail',
+        subscriptionOperationId: created.subscriptionOperationId,
+        reason: 'User requested cancellation',
+      }),
+    ).rejects.toMatchObject({
+      code: PAYMENT_RELIABILITY_ERROR.PROVIDER_TERMINAL_REJECTION,
+    });
+  });
+
+  it('surfaces unknown command outcome when provider POST times out', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const uncertainProvider: SubscriptionProviderPort = {
+      ...provider,
+      cancelSubscription: async () => {
+        throw {
+          code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+          message: 'PayPal subscription cancel failed',
+          retryable: true,
+          uncertain: true,
+        };
+      },
+    };
+    const service = new SubscriptionLifecycleService(store, uncertainProvider);
+    const plan = await seedBillingPlan(store);
+    const created = await service.createSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-post-timeout',
+      planOperationId: plan.operationId,
+      subscriber: { subscriberRef: 'user-post-timeout' },
+    });
+
+    await expect(
+      service.cancelSubscription({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        idempotencyKey: 'sub-cancel-timeout',
+        subscriptionOperationId: created.subscriptionOperationId,
+        reason: 'User requested cancellation',
+      }),
+    ).rejects.toMatchObject({
+      code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+    });
+  });
+
+  it('persists provider subscription state timestamp with refreshed status', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const timestampProvider: SubscriptionProviderPort = {
+      ...provider,
+      cancelSubscription: async () => ({
+        providerSubscriptionId: 'SUB-1',
+        providerPlanId: 'PLAN-1',
+        subscriptionStatus: 'cancelled',
+        approvalUrl: null,
+        startTime: null,
+        nextBillingTime: null,
+        lifecycleReason: 'User requested cancellation',
+        providerSubscriptionStateAt: '2026-10-20T12:00:00.000Z',
+      }),
+    };
+    const service = new SubscriptionLifecycleService(store, timestampProvider);
+    const plan = await seedBillingPlan(store);
+    const created = await service.createSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-watermark',
+      planOperationId: plan.operationId,
+      subscriber: { subscriberRef: 'user-watermark' },
+    });
+
+    await service.cancelSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-cancel-watermark',
+      subscriptionOperationId: created.subscriptionOperationId,
+      reason: 'User requested cancellation',
+    });
+
+    const updated = await store.findOperationById(created.subscriptionOperationId);
+    expect(updated?.subscriptionStatus).toBe('cancelled');
+    expect(updated?.providerSubscriptionStateAt).toBe('2026-10-20T12:00:00.000Z');
+  });
+
+  it('does not mark provider command failed when persistence fails after POST success', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const service = new SubscriptionLifecycleService(store, provider);
+    const plan = await seedBillingPlan(store);
+    const created = await service.createSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      idempotencyKey: 'sub-persist-fail',
+      planOperationId: plan.operationId,
+      subscriber: { subscriberRef: 'user-persist-fail' },
+    });
+
+    const persistSpy = vi
+      .spyOn(subscriptionEvidence, 'applySubscriptionDomainUpdate')
+      .mockRejectedValueOnce(
+        new PaymentReliabilityError(
+          PAYMENT_RELIABILITY_ERROR.PERSISTENCE_FAILURE,
+          'Subscription persistence failed',
+        ),
+      );
+
+    await expect(
+      service.cancelSubscription({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        idempotencyKey: 'sub-cancel-persist-fail',
+        subscriptionOperationId: created.subscriptionOperationId,
+        reason: 'User requested cancellation',
+      }),
+    ).rejects.toMatchObject({
+      code: PAYMENT_RELIABILITY_ERROR.PERSISTENCE_FAILURE,
+    });
+
+    const commandOps = await store.listOperationsByParent(created.subscriptionOperationId);
+    const cancelCommand = commandOps.find((op) => op.kind === 'subscription_cancel');
+    expect(cancelCommand?.status).toBe('succeeded');
+    persistSpy.mockRestore();
   });
 });

@@ -1,9 +1,15 @@
 import {
   PAYMENT_RELIABILITY_ERROR,
+  PAYMENT_TRANSITION_REJECTION_REASON,
   PaymentReliabilityError,
   type EvidenceVerificationStatus,
   type PaymentOperationStatus,
 } from '../../contracts/index';
+
+const invalidTransitionRejection = (message: string) =>
+  new PaymentReliabilityError(PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED, message, {
+    rejectionReason: PAYMENT_TRANSITION_REJECTION_REASON.INVALID_TRANSITION,
+  });
 
 const TERMINAL: ReadonlySet<PaymentOperationStatus> = new Set(['succeeded', 'failed']);
 
@@ -22,17 +28,13 @@ export function assertTransitionAllowed(
 ): void {
   if (currentStatus === nextStatus) {
     if (currentStatus === 'succeeded') {
-      throw new PaymentReliabilityError(
-        PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
-        'Duplicate success transition is not allowed',
-      );
+      throw invalidTransitionRejection('Duplicate success transition is not allowed');
     }
     return;
   }
 
   if (TERMINAL.has(currentStatus)) {
-    throw new PaymentReliabilityError(
-      PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
+    throw invalidTransitionRejection(
       `Terminal operation status "${currentStatus}" cannot regress to "${nextStatus}"`,
     );
   }
@@ -40,14 +42,13 @@ export function assertTransitionAllowed(
   const allowed: Record<PaymentOperationStatus, PaymentOperationStatus[]> = {
     prepared: ['submitted', 'unknown', 'succeeded', 'failed'],
     submitted: ['unknown', 'succeeded', 'failed'],
-    unknown: ['succeeded', 'failed', 'unknown'],
+    unknown: ['succeeded', 'failed', 'unknown', 'submitted'],
     succeeded: [],
     failed: [],
   };
 
   if (!allowed[currentStatus].includes(nextStatus)) {
-    throw new PaymentReliabilityError(
-      PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
+    throw invalidTransitionRejection(
       `Transition from "${currentStatus}" to "${nextStatus}" is not allowed`,
     );
   }

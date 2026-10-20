@@ -11,6 +11,8 @@ export type EvidenceProcessingStatus =
   | 'unsupported'
   | 'failed';
 
+export type ConsumerDeliveryStatus = 'pending' | 'confirmed' | 'failed';
+
 export type ProviderEvidence = {
   evidenceId: string;
   providerCode: string;
@@ -31,6 +33,10 @@ export type ProviderEvidence = {
   claimLeaseExpiresAt: string | null;
   claimWorkerId: string | null;
   processedAt: string | null;
+  consumerDeliveryStatus?: ConsumerDeliveryStatus;
+  consumerDeliveredAt?: string | null;
+  consumerDeliveryAttempts?: number;
+  consumerDeliveryLastError?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -65,6 +71,10 @@ export type UpdateProviderEvidenceInput = {
   claimLeaseExpiresAt?: string | null;
   claimWorkerId?: string | null;
   processedAt?: string | null;
+  consumerDeliveryStatus?: ConsumerDeliveryStatus;
+  consumerDeliveredAt?: string | null;
+  consumerDeliveryAttempts?: number;
+  consumerDeliveryLastError?: string | null;
 };
 
 export type ReconciliationAttempt = {

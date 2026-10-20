@@ -10,6 +10,7 @@ import type {
   SubscriptionStatus,
 } from '../../contracts/index';
 import { PAYMENT_RELIABILITY_ERROR } from '../../contracts/index';
+import { sanitizeOperationalErrorMessage } from './public-error-sanitizer';
 import {
   assertTransitionAllowed,
   assertVerifiedEvidence,
@@ -32,12 +33,20 @@ import {
 import {
   mapPlanWebhookEventToStatus,
   mapSubscriptionWebhookEventToStatus,
+  parseSubscriptionResourceStateTimestamp,
   planStatusToOperationStatus,
+  resolveSubscriptionStatusTransition,
   subscriptionStatusToOperationStatus,
+  type SubscriptionStateApplySource,
 } from './subscription-transition-policy';
 import { isSellerOnboardingWebhookEvent } from './seller-transition-policy';
 import { reconcileSellerConnectionAggregate } from './seller-connection-reconciliation';
 import type { ReconciliationProviderLookup } from './checkout-provider-port';
+import { subscriptionBillingFieldsFromProviderSnapshot } from './subscription-provider-snapshot-fields';
+import {
+  assertSubscriptionProviderPlanSnapshotConsistent,
+  isSubscriptionProviderPlanMismatchError,
+} from './subscription-provider-plan-consistency';
 import { applyMarketplaceUnitSnapshots } from './marketplace-evidence-application';
 import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
 import { sha256Payload } from './persistence/memory-payment-reliability-store';
@@ -48,6 +57,11 @@ type ReconciliationOutcome = {
   executionStatus: PaymentOperationStatus | null;
   payoutStatus: PayoutFinancialStatus | null;
   subscriptionStatus?: SubscriptionStatus | null;
+  subscriptionStartTime?: string | null;
+  subscriptionNextBillingTime?: string | null;
+  subscriptionProviderPlanId?: string | null;
+  subscriptionApplySource?: SubscriptionStateApplySource;
+  subscriptionProviderStateTimestamp?: string | null;
   planStatus?: PlanStatus | null;
   providerTransactionId?: string | null;
   providerFeeMinor?: string | null;
@@ -59,6 +73,16 @@ type ReconciliationOutcome = {
   marketplaceUnits?: ExecuteMarketplaceUnitSnapshot[];
   marketplaceCheckoutOperationId?: string;
 };
+
+function reconciliationSubscriptionBillingFieldsFromOutcome(outcome: ReconciliationOutcome): {
+  startTime?: string;
+  nextBillingTime?: string;
+} {
+  return subscriptionBillingFieldsFromProviderSnapshot({
+    startTime: outcome.subscriptionStartTime,
+    nextBillingTime: outcome.subscriptionNextBillingTime,
+  });
+}
 
 function mapMarketplaceStatusToOperationStatus(
   marketplaceStatus: MarketplaceOrderStatus,
@@ -218,18 +242,44 @@ export class ReconciliationService {
     }
 
     const providerOutcome = await this.lookupProviderOutcome(operation, evidence.resourceId);
+    const recognizedProviderSubscriptionStatus =
+      providerOutcome.subscriptionStatus && providerOutcome.subscriptionStatus !== 'unknown'
+        ? providerOutcome.subscriptionStatus
+        : null;
+    const subscriptionStatus = this.resolveReconciliationSubscriptionStatus(
+      operation,
+      mappedSubscriptionFromEvent,
+      providerOutcome.subscriptionStatus,
+    );
+    const subscriptionApplySource: SubscriptionStateApplySource | undefined =
+      mappedSubscriptionFromEvent || subscriptionStatus
+        ? recognizedProviderSubscriptionStatus
+          ? 'reconcile_provider'
+          : mappedSubscriptionFromEvent
+            ? 'reconcile_event'
+            : undefined
+        : undefined;
+    const subscriptionProviderStateTimestamp =
+      subscriptionApplySource === 'reconcile_event'
+        ? parseSubscriptionResourceStateTimestamp(evidence.rawPayload)
+        : null;
     const outcome: ReconciliationOutcome = {
       executionStatus:
         mappedFromEvent ??
         (mappedPayoutFromEvent
           ? payoutFinancialStatusToOperationStatus(mappedPayoutFromEvent)
-          : mappedSubscriptionFromEvent
-            ? subscriptionStatusToOperationStatus(mappedSubscriptionFromEvent)
+          : subscriptionStatus
+            ? subscriptionStatusToOperationStatus(subscriptionStatus)
             : mappedPlanFromEvent
               ? planStatusToOperationStatus(mappedPlanFromEvent)
               : providerOutcome.executionStatus),
       payoutStatus: mappedPayoutFromEvent ?? providerOutcome.payoutStatus,
-      subscriptionStatus: mappedSubscriptionFromEvent ?? providerOutcome.subscriptionStatus,
+      subscriptionStatus,
+      subscriptionStartTime: providerOutcome.subscriptionStartTime,
+      subscriptionNextBillingTime: providerOutcome.subscriptionNextBillingTime,
+      subscriptionProviderPlanId: providerOutcome.subscriptionProviderPlanId,
+      subscriptionApplySource,
+      subscriptionProviderStateTimestamp,
       planStatus: mappedPlanFromEvent ?? providerOutcome.planStatus,
     };
 
@@ -376,6 +426,22 @@ export class ReconciliationService {
     );
   }
 
+  private resolveReconciliationSubscriptionStatus(
+    operation: PaymentOperation,
+    fromEvent: SubscriptionStatus | null,
+    fromProvider: SubscriptionStatus | null | undefined,
+  ): SubscriptionStatus | null | undefined {
+    const stored = operation.subscriptionStatus ?? null;
+    if (fromProvider && fromProvider !== 'unknown') {
+      return fromProvider;
+    }
+    if (fromEvent) {
+      const current = stored ?? 'approval_pending';
+      return resolveSubscriptionStatusTransition(current, fromEvent);
+    }
+    return fromProvider ?? stored ?? null;
+  }
+
   private async lookupProviderOutcome(
     operation: PaymentOperation,
     providerReferenceId: string | null | undefined,
@@ -473,6 +539,9 @@ export class ReconciliationService {
           executionStatus: subscriptionStatusToOperationStatus(lookup.subscriptionStatus),
           payoutStatus: null,
           subscriptionStatus: lookup.subscriptionStatus,
+          subscriptionStartTime: lookup.startTime,
+          subscriptionNextBillingTime: lookup.nextBillingTime,
+          subscriptionProviderPlanId: lookup.providerPlanId,
         };
       }
 
@@ -571,6 +640,7 @@ export class ReconciliationService {
     ) {
       await this.applySubscriptionReconciliationOutcome({
         evidenceId,
+        rawPayload,
         operation,
         outcome,
         result,
@@ -660,6 +730,7 @@ export class ReconciliationService {
 
   private async applySubscriptionReconciliationOutcome(input: {
     evidenceId: string;
+    rawPayload?: string;
     operation: PaymentOperation;
     outcome: ReconciliationOutcome;
     result: ReconcileCounters;
@@ -680,6 +751,9 @@ export class ReconciliationService {
     }
 
     try {
+      assertSubscriptionProviderPlanSnapshotConsistent(operation, {
+        providerPlanId: outcome.subscriptionProviderPlanId,
+      });
       await applySubscriptionTransition(this.store, {
         operation,
         subscriptionStatus,
@@ -687,6 +761,13 @@ export class ReconciliationService {
         reason: 'Reconciliation applied subscription transition',
         providerReferenceId,
         providerSubscriptionId: providerReferenceId ?? undefined,
+        applySource: outcome.subscriptionApplySource ?? 'reconcile_provider',
+        providerStateTimestamp:
+          (outcome.subscriptionApplySource ?? 'reconcile_provider') === 'reconcile_provider'
+            ? null
+            : (outcome.subscriptionProviderStateTimestamp ??
+              parseSubscriptionResourceStateTimestamp(input.rawPayload)),
+        ...reconciliationSubscriptionBillingFieldsFromOutcome(outcome),
       });
       await this.store.updateEvidence({
         evidenceId,
@@ -702,6 +783,17 @@ export class ReconciliationService {
       });
       result.applied += 1;
     } catch (error) {
+      if (isSubscriptionProviderPlanMismatchError(error)) {
+        await this.store.insertReconciliationAttempt({
+          evidenceId,
+          operationId: operation.operationId,
+          outcome: 'terminal_failure',
+          resultCode: PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
+          resultMessage: sanitizeOperationalErrorMessage(error, 'Subscription plan mismatch'),
+        });
+        result.terminalFailures += 1;
+        return;
+      }
       await this.recordReconciliationFailure({
         evidenceId,
         operationId: operation.operationId,
@@ -1015,8 +1107,13 @@ export class ReconciliationService {
     result: ReconcileCounters;
     error: unknown;
   }): Promise<void> {
-    const message = input.error instanceof Error ? input.error.message : String(input.error);
-    const terminal = message.includes('Terminal operation status');
+    const rawMessage =
+      input.error instanceof Error ? input.error.message : String(input.error);
+    const message = sanitizeOperationalErrorMessage(
+      input.error,
+      'Reconciliation processing failed',
+    );
+    const terminal = rawMessage.includes('Terminal operation status');
     await this.store.insertReconciliationAttempt({
       evidenceId: input.evidenceId,
       operationId: input.operationId,

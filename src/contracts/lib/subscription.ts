@@ -158,6 +158,8 @@ export type SubscriptionResult = {
   lifecycleReason: string | null;
   correlationId: string | null;
   providerDebugId?: string | null;
+  subscriptionStateRefreshPending?: boolean;
+  subscriptionStateRefreshErrorCode?: string | null;
 };
 
 export type GetSubscriptionRequest = SubscriptionProviderContext & {
@@ -165,6 +167,16 @@ export type GetSubscriptionRequest = SubscriptionProviderContext & {
 };
 
 export type GetSubscriptionResult = SubscriptionResult;
+
+/** Explicit recovery for subscription create stuck without a provider subscription id. */
+export type RetrySubscriptionCreateRequest = SubscriptionProviderContext & {
+  subscriptionOperationId: string;
+  subscriber: SubscriberInput;
+  returnUrl?: string | null;
+  cancelUrl?: string | null;
+} & (SubscriptionPlanOperationReference | SubscriptionProviderPlanReference);
+
+export type SubscriptionProviderCreateRetryEligibility = 'allowed' | 'expired' | 'unavailable';
 
 export type SubscriptionLifecycleCommandRequest = SubscriptionProviderContext & {
   idempotencyKey: string;
@@ -272,6 +284,7 @@ export type ExecuteGetSubscriptionResult = {
   nextBillingTime: string | null;
   lifecycleReason: string | null;
   providerDebugId?: string | null;
+  providerSubscriptionStateAt?: string | null;
 };
 
 export type ExecuteSubscriptionLifecycleRequest = SubscriptionProviderContext & {
@@ -279,4 +292,24 @@ export type ExecuteSubscriptionLifecycleRequest = SubscriptionProviderContext & 
   reason: string;
 };
 
-export type ExecuteSubscriptionLifecycleResult = ExecuteGetSubscriptionResult;
+export type ExecuteSubscriptionLifecycleRefreshPendingResult = {
+  providerSubscriptionId: string;
+  subscriptionStateRefreshPending: true;
+  subscriptionStateRefreshErrorCode?: string | null;
+  lifecycleReason: string | null;
+  providerDebugId?: string | null;
+};
+
+export type ExecuteSubscriptionLifecycleRefreshedResult = ExecuteGetSubscriptionResult & {
+  subscriptionStateRefreshPending?: false;
+};
+
+export type ExecuteSubscriptionLifecycleResult =
+  | ExecuteSubscriptionLifecycleRefreshPendingResult
+  | ExecuteSubscriptionLifecycleRefreshedResult;
+
+export function isExecuteSubscriptionLifecycleRefreshPending(
+  result: ExecuteSubscriptionLifecycleResult,
+): result is ExecuteSubscriptionLifecycleRefreshPendingResult {
+  return result.subscriptionStateRefreshPending === true;
+}

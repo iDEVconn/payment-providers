@@ -17,7 +17,7 @@ const OFFERING_REF = 'campaign_creator_individual_monthly_v1';
 const context = {
   providerCode: 'paypal',
   accountRef: 'default',
-  applicationRef: 'edc',
+  applicationRef: 'test-app',
   environment: 'sandbox',
 } as const;
 
@@ -311,6 +311,41 @@ describe('providerPlanId subscription idempotency', () => {
 
     expect(second).toEqual(first);
     expect(provider.getPlan).toHaveBeenCalledTimes(1);
+    expect(provider.createSubscription).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns unknown with null providerSubscriptionId when create omits provider id', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const provider = makeProvider({
+      createSubscription: vi.fn(async () => {
+        throw {
+          code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+          message: 'PayPal subscription response did not include a provider id',
+          uncertain: true,
+          retryable: true,
+        };
+      }),
+    });
+    const service = new SubscriptionLifecycleService(store, provider);
+
+    const first = await service.createSubscription(request());
+    expect(first.subscriptionOperationId).toBeTruthy();
+    expect(first.operationStatus).toBe('unknown');
+    expect(first.providerSubscriptionId).toBeNull();
+    expect(first.subscriptionStatus).toBe('unknown');
+
+    const stored = await store.findOperationById(first.subscriptionOperationId);
+    expect(stored?.operationId).toBe(first.subscriptionOperationId);
+    expect(stored?.status).toBe('unknown');
+    expect(stored?.providerSubscriptionId).toBeNull();
+    expect(stored?.failureCode).toBe(PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN);
+    expect(stored?.failureMessage).toBe(
+      'PayPal subscription response did not include a provider id',
+    );
+
+    const second = await service.createSubscription(request());
+    expect(second.subscriptionOperationId).toBe(first.subscriptionOperationId);
+    expect(second.operationStatus).toBe('unknown');
     expect(provider.createSubscription).toHaveBeenCalledTimes(1);
   });
 

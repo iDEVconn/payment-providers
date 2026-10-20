@@ -18,12 +18,18 @@ export type VerifyWebhookRequest = {
   headers: PaypalWebhookTransmissionHeaders;
 };
 
+export type VerifyWebhookFailureKind =
+  | 'signature_rejected'
+  | 'verification_unavailable'
+  | 'invalid_payload';
+
 export type VerifyWebhookResult = {
   verified: boolean;
   transmissionId: string;
   eventType: string | null;
   resourceId: string | null;
   unavailableReason?: string;
+  failureKind?: VerifyWebhookFailureKind;
 };
 
 export type WebhookReceiptResponse = {

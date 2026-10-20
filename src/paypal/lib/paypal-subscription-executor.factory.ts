@@ -1,10 +1,10 @@
-import { formatEnvBanner, missingEnv } from '../../core/lib/host-env-banner';
+import { PaymentConfigurationError } from '../../core/lib/payment-configuration-error';
 import type { PaymentExecutionStatus } from '../../contracts/index';
 import type { ResolvedPaymentRuntime } from '../../core/index';
 import {
   blockedHttpClient,
   blockedOAuthGetter,
-  isExecutionModeNetworkBlocked,
+  shouldRejectProviderNetworkCalls,
 } from './build-reject-only-executor';
 import { FakePaypalSubscriptionHttpClient } from './fake-paypal-subscription-http-client';
 import {
@@ -18,7 +18,6 @@ import type { PaypalSubscriptionHttpClient } from './paypal-subscription-http-cl
 export type BuildPaypalSubscriptionExecutorInput = {
   runtime: ResolvedPaymentRuntime;
   nodeEnv?: string;
-  envPath: string;
   executionStatus?: PaymentExecutionStatus;
   forceFakeHttp?: boolean;
   httpClient?: PaypalSubscriptionHttpClient;
@@ -27,23 +26,18 @@ export type BuildPaypalSubscriptionExecutorInput = {
 export function buildPaypalSubscriptionExecutor(
   input: BuildPaypalSubscriptionExecutorInput,
 ): PaypalSubscriptionExecutor {
-  const { runtime, nodeEnv, envPath, forceFakeHttp, httpClient, executionStatus } = input;
+  const { runtime, nodeEnv, forceFakeHttp, httpClient, executionStatus } = input;
   const isProduction = nodeEnv === 'production';
 
-  if (isExecutionModeNetworkBlocked(executionStatus)) {
+  if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
     return new PaypalSubscriptionExecutor(runtime, blockedHttpClient(), blockedOAuthGetter());
   }
 
   if (forceFakeHttp) {
     if (isProduction) {
-      throw new Error(
-        formatEnvBanner({
-          service: 'payment MS',
-          provider: runtime.context.providerCode,
-          missing: ['PRODUCTION_FAKE_HTTP_FORBIDDEN'],
-          envPath,
-          headline: '⚠  payment MS — fake PayPal subscription HTTP is forbidden in production',
-        }),
+      throw new PaymentConfigurationError(
+        'Fake PayPal subscription HTTP is forbidden in production',
+        ['forceFakeHttp'],
       );
     }
     return new PaypalSubscriptionExecutor(
@@ -60,45 +54,9 @@ export function buildPaypalSubscriptionExecutor(
     );
   }
 
-  if (runtime.mode === 'fake') {
-    if (isProduction) {
-      const missing = missingEnv(() => undefined, ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET']);
-      throw new Error(
-        formatEnvBanner({
-          service: 'payment MS',
-          provider: runtime.context.providerCode,
-          missing,
-          envPath,
-          headline: '⚠  payment MS — PayPal credentials missing (startup aborted)',
-        }),
-      );
-    }
-    return new PaypalSubscriptionExecutor(
-      runtime,
-      new FakePaypalSubscriptionHttpClient(),
-      async () => {
-        throw {
-          code: 'PROVIDER_AUTH_FAILURE',
-          message: 'PayPal subscription HTTP is unavailable in unconfigured development mode',
-          retryable: false,
-          uncertain: false,
-        };
-      },
-    );
-  }
-
   const credentials = runtime.checkoutCredentials;
   if (!credentials) {
-    const missing = missingEnv(() => undefined, ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET']);
-    throw new Error(
-      formatEnvBanner({
-        service: 'payment MS',
-        provider: runtime.context.providerCode,
-        missing,
-        envPath,
-        headline: '⚠  payment MS — PayPal credentials missing (startup aborted)',
-      }),
-    );
+    return new PaypalSubscriptionExecutor(runtime, blockedHttpClient(), blockedOAuthGetter());
   }
 
   const oauthClient = new PaypalOAuthClient(

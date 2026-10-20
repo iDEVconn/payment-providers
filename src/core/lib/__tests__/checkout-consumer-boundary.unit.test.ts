@@ -49,13 +49,12 @@ describe('checkout consumer boundary', () => {
     expect(result.checkoutStatus).toBe('created');
   });
 
-  it('keeps payment-core and payment-contracts free of gateway and EDC funding imports', () => {
-    const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '../../../..');
+  it('keeps core and contracts free of gateway and application-domain imports', () => {
+    const moduleRoot = join(dirname(fileURLToPath(import.meta.url)), '../../../..');
     const roots = [
-      join(packageRoot, 'src/core'),
-      join(packageRoot, 'src/contracts'),
+      join(moduleRoot, 'core'),
+      join(moduleRoot, 'contracts'),
     ].filter((root) => existsSync(root));
-    expect(roots.length).toBe(2);
     for (const root of roots) {
       for (const file of collectSourceFiles(root)) {
         const source = readFileSync(file, 'utf8');

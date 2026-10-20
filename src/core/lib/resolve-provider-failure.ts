@@ -1,10 +1,13 @@
 import {
+  EXECUTION_MODE_BLOCKED,
+  EXECUTION_MODE_MISMATCH,
   PAYMENT_CAPABILITY_UNAVAILABLE,
   PAYMENT_RELIABILITY_ERROR,
   PaymentCapabilityError,
   PaymentReliabilityError,
   rehydratePaymentCapabilityError,
 } from '../../contracts/index';
+import { sanitizePublicErrorMessage } from './public-error-sanitizer';
 
 export type ResolvedProviderFailure = {
   code: string;
@@ -13,6 +16,14 @@ export type ResolvedProviderFailure = {
   retryable: boolean;
   providerDebugId: string | null;
 };
+
+function isUnconfiguredFakePaymentError(error: unknown): boolean {
+  if (!isRecord(error)) {
+    return false;
+  }
+  const details = error['details'];
+  return isRecord(details) && details['simulation'] === 'unconfigured-fake';
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -44,8 +55,11 @@ export function isTerminalPreProviderFailureCode(code: string | undefined): bool
   return (
     code === PAYMENT_CAPABILITY_UNAVAILABLE ||
     code === PAYMENT_RELIABILITY_ERROR.CAPABILITY_UNAVAILABLE ||
+    code === EXECUTION_MODE_BLOCKED ||
+    code === EXECUTION_MODE_MISMATCH ||
     code === PAYMENT_RELIABILITY_ERROR.PROVIDER_TERMINAL_REJECTION ||
-    code === PAYMENT_RELIABILITY_ERROR.PROVIDER_VALIDATION_REJECTION
+    code === PAYMENT_RELIABILITY_ERROR.PROVIDER_VALIDATION_REJECTION ||
+    code === PAYMENT_RELIABILITY_ERROR.PROVIDER_AUTH_FAILURE
   );
 }
 
@@ -62,22 +76,34 @@ export function resolveProviderFailure(error: unknown): ResolvedProviderFailure 
     };
   }
 
+  if (isUnconfiguredFakePaymentError(error)) {
+    return {
+      code: PAYMENT_CAPABILITY_UNAVAILABLE,
+      message: 'Payment capability is unavailable',
+      uncertain: false,
+      retryable: false,
+      providerDebugId: null,
+    };
+  }
+
   const nested = nestedRecord(error);
   const code =
     error instanceof PaymentReliabilityError
       ? error.code
       : ((nested ? readString(nested, 'code') : null) ??
         (isRecord(error) ? readString(error, 'code') : null));
-  const message =
+  const rawMessage =
     error instanceof Error
       ? error.message
       : ((nested ? readString(nested, 'message') : null) ??
         (isRecord(error) && typeof error['message'] === 'string' ? error['message'] : null) ??
         'Provider submission failed');
+  const message = sanitizePublicErrorMessage(rawMessage, 'Provider submission failed');
+  const retryableFromError =
+    isRecord(error) && error['retryable'] === true ? true : undefined;
   const uncertain =
     nested?.['uncertain'] === true || (isRecord(error) && error['uncertain'] === true);
-  const retryable =
-    nested?.['retryable'] === true || (isRecord(error) && error['retryable'] === true);
+  const retryable = retryableFromError === true || nested?.['retryable'] === true;
   const providerDebugId =
     (nested ? readString(nested, 'providerDebugId') : null) ??
     (isRecord(error) ? readString(error, 'providerDebugId') : null);

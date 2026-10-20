@@ -3,6 +3,7 @@ import {
   PAYMENT_CAPABILITY_UNAVAILABLE,
   PAYMENT_RELIABILITY_ERROR,
   PaymentCapabilityError,
+  PaymentReliabilityError,
 } from '../../../contracts/index';
 import { resolveProviderFailure } from '../resolve-provider-failure';
 
@@ -33,6 +34,15 @@ describe('resolveProviderFailure', () => {
       uncertain: false,
       retryable: false,
     });
+  });
+
+  it('sanitizes PaymentReliabilityError messages that contain secrets', () => {
+    const error = new PaymentReliabilityError(
+      PAYMENT_RELIABILITY_ERROR.PROVIDER_RETRYABLE,
+      'upstream Authorization: Bearer fake-access-token',
+    );
+    expect(resolveProviderFailure(error).message).toBe('Payment reliability error');
+    expect(JSON.stringify(resolveProviderFailure(error))).not.toContain('fake-access-token');
   });
 
   it('keeps uncertain transport failures as PROVIDER_UNCERTAIN', () => {

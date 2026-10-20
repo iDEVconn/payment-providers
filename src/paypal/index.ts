@@ -1,3 +1,4 @@
+export * from './lib/deployed-paypal-config';
 export * from './lib/blocked-provider-network';
 export * from './lib/provider-network-policy';
 export * from './lib/unconfigured-fake-checkout.strategy';
@@ -12,6 +13,8 @@ export * from './lib/paypal-orders-http-client';
 export * from './lib/fake-paypal-orders-http-client';
 export * from './lib/paypal-checkout-executor';
 export * from './lib/paypal-checkout-executor.factory';
+export * from './lib/paypal-checkout-create-retry-policy';
+export * from './lib/paypal-subscription-create-retry-policy';
 export * from './lib/paypal-payout-http-client';
 export * from './lib/fake-paypal-payout-http-client';
 export * from './lib/paypal-payout-executor';

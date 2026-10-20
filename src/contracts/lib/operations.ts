@@ -72,8 +72,12 @@ export type PaymentOperation = {
   startTime: string | null;
   nextBillingTime: string | null;
   lifecycleReason: string | null;
+  /** Last accepted PayPal subscription resource update/create time for webhook ordering. */
+  providerSubscriptionStateAt: string | null;
   sellerRef: string | null;
   providerReferralId: string | null;
+  executionLeaseExpiresAt: string | null;
+  executionOwnerToken: string | null;
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -120,8 +124,11 @@ export type CreatePaymentOperationInput = {
   startTime?: string | null;
   nextBillingTime?: string | null;
   lifecycleReason?: string | null;
+  providerSubscriptionStateAt?: string | null;
   sellerRef?: string | null;
   providerReferralId?: string | null;
+  executionLeaseExpiresAt?: string | null;
+  executionOwnerToken?: string | null;
 };
 
 export type TransitionPaymentOperationInput = {
@@ -163,8 +170,12 @@ export type TransitionPaymentOperationInput = {
   startTime?: string | null;
   nextBillingTime?: string | null;
   lifecycleReason?: string | null;
+  providerSubscriptionStateAt?: string | null;
   sellerRef?: string | null;
   providerReferralId?: string | null;
+  executionLeaseExpiresAt?: string | null;
+  executionOwnerToken?: string | null;
+  expectedExecutionOwnerToken?: string | null;
   reason: string;
 };
 
@@ -203,6 +214,7 @@ export type UpdatePaymentOperationInput = {
   startTime?: string | null;
   nextBillingTime?: string | null;
   lifecycleReason?: string | null;
+  providerSubscriptionStateAt?: string | null;
   sellerRef?: string | null;
   providerReferralId?: string | null;
 };

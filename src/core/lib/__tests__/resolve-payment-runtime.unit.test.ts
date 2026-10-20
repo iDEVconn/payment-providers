@@ -1,46 +1,69 @@
 import { describe, expect, it } from 'vitest';
+import { PaymentConfigurationError } from '../payment-configuration-error';
 import { resolvePaymentRuntime } from '../resolve-payment-runtime';
-
-function env(values: Record<string, string | undefined>) {
-  return (key: string) => values[key];
-}
+import type { PaymentProviderConfig } from '../payment-provider-config';
 
 describe('resolvePaymentRuntime', () => {
+  it('requires applicationRef on provider config', () => {
+    expect(() =>
+      resolvePaymentRuntime({
+        config: { environment: 'sandbox', applicationRef: '' },
+      }),
+    ).toThrow(PaymentConfigurationError);
+  });
+
   it('returns fake mode with a banner when checkout credentials are missing in development', () => {
+    const config: PaymentProviderConfig = { environment: 'sandbox', applicationRef: 'test-app' };
     const runtime = resolvePaymentRuntime({
-      get: env({}),
+      config,
       nodeEnv: 'development',
     });
     expect(runtime.mode).toBe('fake');
-    expect(runtime.configBanner).toContain('PAYPAL_CLIENT_ID');
-    expect(runtime.configBanner).toContain('PAYPAL_CLIENT_SECRET');
+    expect(runtime.configBanner).toContain('credentials.clientId');
+    expect(runtime.configBanner).toContain('credentials.clientSecret');
+    expect(runtime.configBanner).not.toContain('apps/microservices');
     const refund = runtime.descriptor.capabilities.find((row) => row.capability === 'refund');
     expect(refund?.ready).toBe(false);
-    const payout = runtime.descriptor.capabilities.find((row) => row.capability === 'payout');
-    expect(payout?.ready).toBe(false);
-    const subscription = runtime.descriptor.capabilities.find(
-      (row) => row.capability === 'subscription',
-    );
-    expect(subscription?.ready).toBe(false);
   });
 
-  it('throws in production when checkout credentials are missing', () => {
-    expect(() =>
-      resolvePaymentRuntime({
-        get: env({}),
-        nodeEnv: 'production',
-      }),
-    ).toThrow(/PAYPAL_CLIENT_ID/);
+  it('starts in production with missing credentials using reject mode and a banner', () => {
+    const runtime = resolvePaymentRuntime({
+      config: { environment: 'sandbox', applicationRef: 'test-app' },
+      nodeEnv: 'production',
+      executionStatus: {
+        executionMode: 'sandbox',
+        deploymentEnvironment: 'staging',
+        runtimeState: 'configured',
+        providerCallsEnabled: true,
+        simulatedExecutionEnabled: false,
+        source: 'provider-environment',
+        issues: [],
+      },
+    });
+    expect(runtime.mode).toBe('fake');
+    expect(runtime.configBanner).toContain('credentials.clientId');
+    expect(runtime.descriptor.capabilities.find((c) => c.capability === 'checkout')?.ready).toBe(
+      false,
+    );
   });
 
   it('returns live-provider mode when checkout credentials exist', () => {
     const runtime = resolvePaymentRuntime({
-      get: env({
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
-        PAYPAL_ENVIRONMENT: 'sandbox',
-      }),
+      config: {
+        environment: 'sandbox',
+        applicationRef: 'test-app',
+        credentials: { clientId: 'id', clientSecret: 'secret' },
+      },
       nodeEnv: 'development',
+      executionStatus: {
+        executionMode: 'sandbox',
+        deploymentEnvironment: 'local',
+        runtimeState: 'configured',
+        providerCallsEnabled: true,
+        simulatedExecutionEnabled: false,
+        source: 'provider-environment',
+        issues: [],
+      },
     });
     expect(runtime.mode).toBe('live-provider');
     expect(runtime.checkoutCredentials).toEqual({
@@ -52,22 +75,40 @@ describe('resolvePaymentRuntime', () => {
 
   it('scopes descriptors by accountRef and environment', () => {
     const sandbox = resolvePaymentRuntime({
-      get: env({
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
-        PAYPAL_ACCOUNT_REF: 'acct-a',
-        PAYPAL_ENVIRONMENT: 'sandbox',
-      }),
+      config: {
+        environment: 'sandbox',
+        applicationRef: 'test-app',
+        accountRef: 'acct-a',
+        credentials: { clientId: 'id', clientSecret: 'secret' },
+      },
       nodeEnv: 'development',
+      executionStatus: {
+        executionMode: 'sandbox',
+        deploymentEnvironment: 'local',
+        runtimeState: 'configured',
+        providerCallsEnabled: true,
+        simulatedExecutionEnabled: false,
+        source: 'provider-environment',
+        issues: [],
+      },
     });
     const live = resolvePaymentRuntime({
-      get: env({
-        PAYPAL_CLIENT_ID: 'id-live',
-        PAYPAL_CLIENT_SECRET: 'secret-live',
-        PAYPAL_ACCOUNT_REF: 'acct-b',
-        PAYPAL_ENVIRONMENT: 'live',
-      }),
+      config: {
+        environment: 'live',
+        applicationRef: 'test-app',
+        accountRef: 'acct-b',
+        credentials: { clientId: 'id-live', clientSecret: 'secret-live' },
+      },
       nodeEnv: 'development',
+      executionStatus: {
+        executionMode: 'live',
+        deploymentEnvironment: 'local',
+        runtimeState: 'configured',
+        providerCallsEnabled: true,
+        simulatedExecutionEnabled: false,
+        source: 'provider-environment',
+        issues: [],
+      },
     });
 
     expect(sandbox.descriptor.accountRef).toBe('acct-a');

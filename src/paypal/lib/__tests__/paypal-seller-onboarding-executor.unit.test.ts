@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { evaluateCapabilities } from '../../../core/index';
+import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
 import { FakePaypalSellerOnboardingHttpClient } from '../fake-paypal-seller-onboarding-http-client';
 import { PaypalSellerOnboardingExecutor } from '../paypal-seller-onboarding-executor';
 import type { ResolvedPaymentRuntime } from '../../../core/index';
@@ -12,22 +13,6 @@ const context = {
 };
 
 function runtime(enabled: boolean): ResolvedPaymentRuntime {
-  const get = (key: string) => {
-    if (key === 'PAYPAL_CLIENT_ID' || key === 'PAYPAL_CLIENT_SECRET') {
-      return 'set';
-    }
-    if (key === 'PAYPAL_SELLER_ONBOARDING_ENABLED') {
-      return enabled ? 'true' : undefined;
-    }
-    if (
-      key === 'PAYPAL_PARTNER_MERCHANT_ID' ||
-      key === 'PAYPAL_PARTNER_ATTRIBUTION_ID' ||
-      key === 'PAYPAL_SELLER_ONBOARDING_RETURN_URL'
-    ) {
-      return enabled ? 'set' : undefined;
-    }
-    return undefined;
-  };
   return {
     mode: 'live-provider',
     context,
@@ -38,7 +23,20 @@ function runtime(enabled: boolean): ResolvedPaymentRuntime {
     },
     descriptor: {
       ...context,
-      capabilities: evaluateCapabilities(get, context),
+      capabilities: evaluateCapabilities(
+        sandboxPaypalProviderConfig({
+          credentials: { clientId: 'set', clientSecret: 'set' },
+          capabilityFlags: { seller_onboarding: enabled },
+          partner: enabled
+            ? {
+                merchantId: 'set',
+                attributionId: 'set',
+                sellerOnboardingReturnUrl: 'https://example.com/return',
+              }
+            : undefined,
+        }),
+        context,
+      ),
     },
   } as ResolvedPaymentRuntime;
 }

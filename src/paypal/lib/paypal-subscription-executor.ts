@@ -36,6 +36,18 @@ function baseUrl(environment: 'sandbox' | 'live'): string {
   return environment === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
 }
 
+function parsePaypalSubscriptionBodyStateTimestamp(body: Record<string, unknown>): string | null {
+  const candidate = body['update_time'] ?? body['create_time'];
+  if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+    return null;
+  }
+  const epochMs = Date.parse(candidate);
+  if (Number.isNaN(epochMs)) {
+    return null;
+  }
+  return new Date(epochMs).toISOString();
+}
+
 function mapHttpError(response: { status: number; debugId?: string | null }, message: string) {
   if (response.status >= 500 || response.status === 429) {
     throw {
@@ -289,7 +301,10 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
     mapHttpError(response, 'PayPal rejected subscription creation');
     const billingInfo = response.body['billing_info'] as Record<string, unknown> | undefined;
     return {
-      providerSubscriptionId: String(response.body['id'] ?? 'unknown-subscription'),
+      providerSubscriptionId: requireProviderResourceId(
+        response.body['id'],
+        'PayPal subscription response did not include a provider id',
+      ),
       providerPlanId: input.providerPlanId,
       subscriptionStatus: mapPaypalSubscriptionStatus(
         String(response.body['status'] ?? 'APPROVAL_PENDING'),
@@ -329,6 +344,7 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
         : null,
       lifecycleReason: null,
       providerDebugId: response.debugId ?? null,
+      providerSubscriptionStateAt: parsePaypalSubscriptionBodyStateTimestamp(response.body),
     };
   }
 
@@ -396,18 +412,28 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
       body: { reason: input.reason },
     });
     mapHttpError(response, `PayPal subscription ${action} failed`);
-    const billingInfo = response.body['billing_info'] as Record<string, unknown> | undefined;
-    return {
-      providerSubscriptionId: input.providerSubscriptionId,
-      providerPlanId: response.body['plan_id'] ? String(response.body['plan_id']) : null,
-      subscriptionStatus: mapPaypalSubscriptionStatus(String(response.body['status'] ?? 'UNKNOWN')),
-      approvalUrl: extractApproveUrl(response.body),
-      startTime: response.body['start_time'] ? String(response.body['start_time']) : null,
-      nextBillingTime: billingInfo?.['next_billing_time']
-        ? String(billingInfo['next_billing_time'])
-        : null,
-      lifecycleReason: input.reason,
-      providerDebugId: response.debugId ?? null,
-    };
+    try {
+      const refreshed = await this.getSubscription({
+        providerCode: input.providerCode,
+        accountRef: input.accountRef,
+        applicationRef: input.applicationRef,
+        environment: input.environment,
+        providerSubscriptionId: input.providerSubscriptionId,
+      });
+      return {
+        ...refreshed,
+        lifecycleReason: input.reason,
+      };
+    } catch (error) {
+      const err = error as { code?: string; providerDebugId?: string | null };
+      return {
+        providerSubscriptionId: input.providerSubscriptionId,
+        subscriptionStateRefreshPending: true,
+        subscriptionStateRefreshErrorCode:
+          err?.code ?? PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+        lifecycleReason: input.reason,
+        providerDebugId: err?.providerDebugId ?? response.debugId ?? null,
+      };
+    }
   }
 }

@@ -7,12 +7,18 @@ import {
   type SubscriptionStatus,
 } from '../../contracts/index';
 import {
-  assertSubscriptionTransitionAllowed,
+  evaluateSubscriptionProviderStateOrdering,
   planStatusToOperationStatus,
+  readSubscriptionProviderStateWatermark,
+  resolveProviderTransactionIdAfterSubscriptionStateWatermarkPersist,
+  resolveSubscriptionStatusTransition,
   subscriptionStatusToOperationStatus,
+  type SubscriptionStateApplySource,
 } from './subscription-transition-policy';
 import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
 import { assertTransitionAllowed } from './transition-policy';
+
+const SUBSCRIPTION_TRANSITION_MAX_VERSION_RETRIES = 8;
 
 function resolveExecutionTransition(
   currentStatus: PaymentOperationStatus,
@@ -36,6 +42,13 @@ function resolveExecutionTransition(
   }
 }
 
+function isTransitionVersionConflict(error: unknown): boolean {
+  return (
+    error instanceof PaymentReliabilityError &&
+    error.code === PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT
+  );
+}
+
 async function persistDomainAwareOperationUpdate(
   store: PaymentReliabilityStore,
   operation: PaymentOperation,
@@ -52,12 +65,34 @@ async function persistDomainAwareOperationUpdate(
     lifecycleReason?: string | null;
     planStatus?: PlanStatus;
     subscriptionStatus?: SubscriptionStatus;
+    providerStateWatermark?: string;
   },
 ): Promise<PaymentOperation> {
+  const subscriptionStatus =
+    input.subscriptionStatus !== undefined
+      ? resolveSubscriptionStatusTransition(
+          operation.subscriptionStatus ?? 'approval_pending',
+          input.subscriptionStatus,
+        )
+      : undefined;
+
+  const providerSubscriptionStateAt = input.providerStateWatermark;
+  const providerTransactionId =
+    input.providerStateWatermark !== undefined
+      ? resolveProviderTransactionIdAfterSubscriptionStateWatermarkPersist(operation)
+      : undefined;
+  const watermarkChanged =
+    providerSubscriptionStateAt !== undefined &&
+    providerSubscriptionStateAt !== operation.providerSubscriptionStateAt;
+  const providerTransactionIdChanged =
+    providerTransactionId !== undefined &&
+    providerTransactionId !== operation.providerTransactionId;
+
   const domainChanged =
     (input.planStatus !== undefined && input.planStatus !== operation.planStatus) ||
-    (input.subscriptionStatus !== undefined &&
-      input.subscriptionStatus !== operation.subscriptionStatus);
+    (subscriptionStatus !== undefined && subscriptionStatus !== operation.subscriptionStatus) ||
+    watermarkChanged ||
+    providerTransactionIdChanged;
 
   if (input.nextExecution === operation.status) {
     if (!domainChanged) {
@@ -68,7 +103,9 @@ async function persistDomainAwareOperationUpdate(
       operationId: operation.operationId,
       expectedVersion: operation.version,
       planStatus: input.planStatus,
-      subscriptionStatus: input.subscriptionStatus,
+      subscriptionStatus,
+      providerSubscriptionStateAt,
+      providerTransactionId,
       providerReferenceId: input.providerReferenceId ?? undefined,
       providerSubscriptionId: input.providerSubscriptionId ?? undefined,
       providerPlanId: input.providerPlanId ?? undefined,
@@ -84,7 +121,9 @@ async function persistDomainAwareOperationUpdate(
     expectedVersion: operation.version,
     nextStatus: input.nextExecution,
     planStatus: input.planStatus,
-    subscriptionStatus: input.subscriptionStatus,
+    subscriptionStatus,
+    providerSubscriptionStateAt,
+    providerTransactionId,
     providerReferenceId: input.providerReferenceId ?? operation.providerReferenceId,
     providerSubscriptionId: input.providerSubscriptionId ?? undefined,
     providerPlanId: input.providerPlanId ?? undefined,
@@ -109,6 +148,8 @@ export type ApplySubscriptionTransitionInput = {
   startTime?: string | null;
   nextBillingTime?: string | null;
   lifecycleReason?: string | null;
+  providerStateTimestamp?: string | null;
+  applySource?: SubscriptionStateApplySource;
 };
 
 export type ApplyPlanTransitionInput = {
@@ -129,27 +170,45 @@ function isDuplicateSubscriptionEvidence(
   return current === subscriptionStatus && operation.status === nextExecution;
 }
 
-export async function applySubscriptionTransition(
+async function applySubscriptionTransitionOnce(
   store: PaymentReliabilityStore,
   input: ApplySubscriptionTransitionInput,
 ): Promise<PaymentOperation> {
   const { operation, subscriptionStatus } = input;
-
-  if (isDuplicateSubscriptionEvidence(operation, subscriptionStatus)) {
+  const current = operation.subscriptionStatus ?? 'approval_pending';
+  const resolvedStatus = resolveSubscriptionStatusTransition(current, subscriptionStatus);
+  const ordering = evaluateSubscriptionProviderStateOrdering({
+    operation,
+    desiredStatus: resolvedStatus,
+    providerStateTimestamp: input.providerStateTimestamp ?? null,
+    applySource: input.applySource ?? 'webhook',
+  });
+  if (ordering.action === 'noop') {
     return operation;
   }
 
-  const current = operation.subscriptionStatus ?? 'approval_pending';
-  assertSubscriptionTransitionAllowed(current, subscriptionStatus);
+  const watermarkUnchanged =
+    ordering.providerStateWatermark !== null &&
+    ordering.providerStateWatermark === readSubscriptionProviderStateWatermark(operation);
+
+  if (
+    isDuplicateSubscriptionEvidence(operation, resolvedStatus) &&
+    (ordering.providerStateWatermark === null || watermarkUnchanged)
+  ) {
+    return operation;
+  }
 
   const nextExecution = resolveExecutionTransition(
     operation.status,
-    subscriptionStatusToOperationStatus(subscriptionStatus),
+    subscriptionStatusToOperationStatus(resolvedStatus),
   );
 
   return persistDomainAwareOperationUpdate(store, operation, {
     nextExecution,
-    subscriptionStatus,
+    subscriptionStatus: resolvedStatus,
+    ...(ordering.providerStateWatermark !== null
+      ? { providerStateWatermark: ordering.providerStateWatermark }
+      : {}),
     providerReferenceId: input.providerReferenceId ?? operation.providerReferenceId,
     providerSubscriptionId: input.providerSubscriptionId ?? undefined,
     providerPlanId: input.providerPlanId ?? undefined,
@@ -160,6 +219,30 @@ export async function applySubscriptionTransition(
     evidenceId: input.evidenceId ?? null,
     reason: input.reason,
   });
+}
+
+export async function applySubscriptionTransition(
+  store: PaymentReliabilityStore,
+  input: ApplySubscriptionTransitionInput,
+): Promise<PaymentOperation> {
+  let operation = input.operation;
+
+  for (let attempt = 0; attempt < SUBSCRIPTION_TRANSITION_MAX_VERSION_RETRIES; attempt += 1) {
+    try {
+      return await applySubscriptionTransitionOnce(store, { ...input, operation });
+    } catch (error) {
+      if (!isTransitionVersionConflict(error)) {
+        throw error;
+      }
+      const fresh = await store.findOperationById(operation.operationId);
+      if (!fresh) {
+        return operation;
+      }
+      operation = fresh;
+    }
+  }
+
+  return operation;
 }
 
 export async function applyPlanTransition(
@@ -219,22 +302,26 @@ export async function applySubscriptionDomainUpdate(
     lifecycleReason?: string | null;
     startTime?: string | null;
     nextBillingTime?: string | null;
+    providerSubscriptionStateAt?: string | null;
   },
 ): Promise<PaymentOperation> {
   const current = operation.subscriptionStatus ?? 'approval_pending';
-  assertSubscriptionTransitionAllowed(current, input.subscriptionStatus);
+  const resolvedStatus = resolveSubscriptionStatusTransition(current, input.subscriptionStatus);
 
   const nextExecution = resolveExecutionTransition(
     operation.status,
-    subscriptionStatusToOperationStatus(input.subscriptionStatus),
+    subscriptionStatusToOperationStatus(resolvedStatus),
   );
 
   return persistDomainAwareOperationUpdate(store, operation, {
     nextExecution,
-    subscriptionStatus: input.subscriptionStatus,
+    subscriptionStatus: resolvedStatus,
     lifecycleReason: input.lifecycleReason ?? undefined,
     startTime: input.startTime ?? undefined,
     nextBillingTime: input.nextBillingTime ?? undefined,
+    ...(input.providerSubscriptionStateAt != null
+      ? { providerStateWatermark: input.providerSubscriptionStateAt }
+      : {}),
     reason: input.reason,
   });
 }

@@ -1,13 +1,15 @@
-import { formatEnvBanner, missingEnv } from './host-env-banner';
+import {
+  formatConfigurationIssue,
+  requireApplicationRef,
+} from './payment-configuration-error';
 import type {
   PaymentAccountContext,
+  PaymentEnvironment,
   PaymentExecutionStatus,
   PaymentProviderDescriptor,
 } from '../../contracts/index';
 import { evaluateCapabilities } from './evaluate-capabilities';
-import { type EnvGetter, readEnvEnabled, readPaymentEnvironment } from './env-access';
-
-export const PAYMENT_MS_ENV_PATH = 'apps/microservices/payment/.env';
+import type { PaymentProviderConfig } from './payment-provider-config';
 
 export type PaymentRuntimeMode = 'live-provider' | 'fake';
 
@@ -27,45 +29,42 @@ export type ResolvedPaymentRuntime = {
 };
 
 export type ResolvePaymentRuntimeInput = {
-  get: EnvGetter;
+  config: PaymentProviderConfig;
   nodeEnv?: string;
-  providerCode?: string;
-  envPath?: string;
   executionStatus?: PaymentExecutionStatus;
 };
 
-function resolveContext(get: EnvGetter, providerCode: string): PaymentAccountContext {
+function resolveContext(config: PaymentProviderConfig): PaymentAccountContext {
   return {
-    providerCode,
-    accountRef: get('PAYPAL_ACCOUNT_REF')?.trim() || 'default',
-    environment: readPaymentEnvironment(get),
-    applicationRef: get('PAYMENT_APPLICATION_REF')?.trim() || 'edc',
+    providerCode: (config.providerCode ?? 'paypal').trim(),
+    accountRef: config.accountRef?.trim() || 'default',
+    environment: config.environment,
+    applicationRef: requireApplicationRef(config.applicationRef),
   };
 }
 
-function checkoutEnabled(get: EnvGetter): boolean {
-  return readEnvEnabled(get, 'PAYPAL_CHECKOUT_ENABLED', true);
+function checkoutEnabled(config: PaymentProviderConfig): boolean {
+  if (config.capabilityFlags?.checkout !== undefined) {
+    return config.capabilityFlags.checkout === true;
+  }
+  return true;
 }
 
-function readRequestTimeoutMs(get: EnvGetter): number | undefined {
-  const raw = get('PAYPAL_REQUEST_TIMEOUT_MS')?.trim();
-  if (!raw) {
+function readRequestTimeoutMs(config: PaymentProviderConfig): number | undefined {
+  const raw = config.credentials?.requestTimeoutMs;
+  if (raw == null) {
     return undefined;
   }
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`Invalid PAYPAL_REQUEST_TIMEOUT_MS: ${raw}`);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    throw new Error('Invalid requestTimeoutMs in payment provider configuration');
   }
-  return parsed;
+  return raw;
 }
 
-function buildConfigBanner(providerCode: string, missing: string[], envPath: string): string {
-  return formatEnvBanner({
-    service: 'payment MS',
-    provider: providerCode,
-    missing,
-    envPath,
-    headline: `⚠  payment MS — ${providerCode} credentials missing (payments will fail)`,
+function buildConfigBanner(providerCode: string, missingFields: string[]): string {
+  return formatConfigurationIssue({
+    headline: `Payment provider "${providerCode}" credentials are missing (payments will fail)`,
+    missingFields,
   });
 }
 
@@ -96,37 +95,24 @@ function executionRequiresRejectOnly(status: PaymentExecutionStatus | undefined)
   );
 }
 
-function assertPaypalEnvironmentMatchesExecutionMode(
-  status: PaymentExecutionStatus,
-  paypalEnvironment: PaymentAccountContext['environment'],
-): void {
-  if (status.executionMode === 'sandbox' && paypalEnvironment !== 'sandbox') {
-    throw new Error('PAYPAL_ENVIRONMENT must be sandbox when PAYMENT_EXECUTION_MODE=sandbox');
-  }
-  if (status.executionMode === 'live' && paypalEnvironment !== 'live') {
-    throw new Error('PAYPAL_ENVIRONMENT must be live when PAYMENT_EXECUTION_MODE=live');
-  }
-}
+const CHECKOUT_CREDENTIAL_FIELDS = ['credentials.clientId', 'credentials.clientSecret'] as const;
 
 export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): ResolvedPaymentRuntime {
-  const providerCode = (input.providerCode ?? input.get('PAYMENT_PROVIDER') ?? 'paypal').trim();
-  const context = resolveContext(input.get, providerCode);
-  const capabilities = evaluateCapabilities(input.get, context);
+  const config = input.config;
+  const providerCode = (config.providerCode ?? 'paypal').trim();
+  const context = resolveContext(config);
+  const capabilities = evaluateCapabilities(config, context);
   const descriptor: PaymentProviderDescriptor = { ...context, capabilities };
   const executionStatus = input.executionStatus;
-  const envPath = input.envPath ?? PAYMENT_MS_ENV_PATH;
   const isProduction = input.nodeEnv === 'production';
 
   if (
     executionStatus?.runtimeState === 'forbidden' ||
     executionStatus?.runtimeState === 'conflict'
   ) {
-    const banner = formatEnvBanner({
-      service: 'payment MS',
-      provider: providerCode,
-      missing: executionStatus.issues.map((row) => row.code),
-      envPath,
-      headline: `⚠  payment MS — payment execution mode is ${executionStatus.runtimeState}`,
+    const banner = formatConfigurationIssue({
+      headline: `Payment execution mode is ${executionStatus.runtimeState}`,
+      missingFields: executionStatus.issues.map((row) => row.code),
     });
     if (isProduction || executionStatus.deploymentEnvironment === 'live') {
       throw new Error(banner);
@@ -144,14 +130,10 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
 
   if (executionRequiresRejectOnly(executionStatus)) {
     const banner =
-      executionStatus?.runtimeState === 'unconfigured'
-        ? formatEnvBanner({
-            service: 'payment MS',
-            provider: providerCode,
-            missing: executionStatus.issues.map((row) => row.code),
-            envPath,
-            headline:
-              '⚠  payment MS — payment execution mode is unconfigured (provider calls rejected)',
+      executionStatus?.runtimeState !== 'configured'
+        ? formatConfigurationIssue({
+            headline: 'Payment execution is not configured (provider calls rejected)',
+            missingFields: executionStatus?.issues.map((row) => row.code) ?? [],
           })
         : undefined;
     return {
@@ -165,22 +147,13 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
     };
   }
 
-  if (!checkoutEnabled(input.get)) {
+  if (!checkoutEnabled(config)) {
     return { mode: 'live-provider', context, descriptor };
   }
 
-  const missing = missingEnv(input.get, ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET']);
-  if (missing.length === 0) {
-    const clientId = input.get('PAYPAL_CLIENT_ID')?.trim();
-    const clientSecret = input.get('PAYPAL_CLIENT_SECRET')?.trim();
-    if (!clientId || !clientSecret) {
-      throw new Error('Checkout credentials resolved empty after validation');
-    }
-
-    if (executionStatus?.runtimeState === 'configured' && executionStatus.executionMode) {
-      assertPaypalEnvironmentMatchesExecutionMode(executionStatus, context.environment);
-    }
-
+  const clientId = config.credentials?.clientId?.trim();
+  const clientSecret = config.credentials?.clientSecret?.trim();
+  if (clientId && clientSecret) {
     return {
       mode: 'live-provider',
       context,
@@ -189,28 +162,38 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
         clientId,
         clientSecret,
         environment: context.environment,
-        requestTimeoutMs: readRequestTimeoutMs(input.get),
+        requestTimeoutMs: readRequestTimeoutMs(config),
       },
     };
   }
 
-  if (executionStatus?.runtimeState === 'configured') {
-    const banner = buildConfigBanner(providerCode, missing, envPath);
-    throw new Error(banner);
-  }
-
-  const banner = buildConfigBanner(providerCode, missing, envPath);
-  if (isProduction) {
-    throw new Error(banner);
-  }
-
+  const banner = buildConfigBanner(providerCode, [...CHECKOUT_CREDENTIAL_FIELDS]);
   return {
     mode: 'fake',
     context,
     descriptor: {
       ...context,
-      capabilities: forceFakeCapabilityReadiness(capabilities),
+      capabilities: reinforceMissingCredentialReadiness(capabilities),
     },
     configBanner: banner,
   };
 }
+
+function reinforceMissingCredentialReadiness(
+  capabilities: PaymentProviderDescriptor['capabilities'],
+): PaymentProviderDescriptor['capabilities'] {
+  const label = CHECKOUT_CREDENTIAL_FIELDS.join(', ');
+  return capabilities.map((row) => {
+    if (row.ready) {
+      return row;
+    }
+    return {
+      ...row,
+      ready: false,
+      unavailableReason:
+        row.unavailableReason ?? `Required configuration values are missing (${label})`,
+    };
+  });
+}
+
+export type { PaymentEnvironment };

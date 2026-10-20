@@ -1,23 +1,24 @@
 import { describe, expect, it } from 'vitest';
+import type { PaymentProviderConfig } from '../payment-provider-config';
+import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
 import { evaluateCapabilities } from '../evaluate-capabilities';
 
 const baseContext = {
   providerCode: 'paypal',
   accountRef: 'default',
   environment: 'sandbox' as const,
-  applicationRef: 'edc',
+  applicationRef: 'test-app',
 };
 
-function env(values: Record<string, string | undefined>) {
-  return (key: string) => values[key];
+function config(patch: Partial<PaymentProviderConfig> = {}): PaymentProviderConfig {
+  return sandboxPaypalProviderConfig(patch);
 }
 
 describe('evaluateCapabilities', () => {
   it('reports checkout ready with unknown eligibility when credentials exist', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
+      config({
+        credentials: { clientId: 'id', clientSecret: 'secret' },
       }),
       baseContext,
     );
@@ -32,7 +33,7 @@ describe('evaluateCapabilities', () => {
   });
 
   it('does not require credentials for disabled payout capability', () => {
-    const rows = evaluateCapabilities(env({}), baseContext);
+    const rows = evaluateCapabilities(config(), baseContext);
     const payout = rows.find((row) => row.capability === 'payout');
     expect(payout).toMatchObject({
       implemented: true,
@@ -44,7 +45,10 @@ describe('evaluateCapabilities', () => {
   });
 
   it('marks enabled payout as not ready without credentials or eligible true', () => {
-    const rows = evaluateCapabilities(env({ PAYPAL_PAYOUTS_ENABLED: 'true' }), baseContext);
+    const rows = evaluateCapabilities(
+      config({ capabilityFlags: { payout: true } }),
+      baseContext,
+    );
     const payout = rows.find((row) => row.capability === 'payout');
     expect(payout).toMatchObject({
       implemented: true,
@@ -58,10 +62,9 @@ describe('evaluateCapabilities', () => {
 
   it('marks payout ready when enabled and credentials exist', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_PAYOUTS_ENABLED: 'true',
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
+      config({
+        capabilityFlags: { payout: true },
+        credentials: { clientId: 'id', clientSecret: 'secret' },
       }),
       baseContext,
     );
@@ -76,7 +79,7 @@ describe('evaluateCapabilities', () => {
   });
 
   it('marks checkout not ready when credentials are missing', () => {
-    const rows = evaluateCapabilities(env({}), baseContext);
+    const rows = evaluateCapabilities(config(), baseContext);
     const checkout = rows.find((row) => row.capability === 'checkout');
     expect(checkout).toMatchObject({
       configured: false,
@@ -84,11 +87,38 @@ describe('evaluateCapabilities', () => {
     });
   });
 
-  it('marks subscription implemented but disabled by default', () => {
+  it('marks subscription enabled but not ready without credentials when flag is absent', () => {
+    const rows = evaluateCapabilities(config(), baseContext);
+    const subscription = rows.find((row) => row.capability === 'subscription');
+    expect(subscription).toMatchObject({
+      enabled: true,
+      configured: false,
+      ready: false,
+    });
+  });
+
+  it('marks subscription enabled by default when subscription flag is absent', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
+      config({
+        credentials: { clientId: 'id', clientSecret: 'secret' },
+      }),
+      baseContext,
+    );
+    const subscription = rows.find((row) => row.capability === 'subscription');
+    expect(subscription).toMatchObject({
+      implemented: true,
+      enabled: true,
+      configured: true,
+      eligible: 'unknown',
+      ready: true,
+    });
+  });
+
+  it('marks subscription disabled when subscription flag is false', () => {
+    const rows = evaluateCapabilities(
+      config({
+        capabilityFlags: { subscription: false },
+        credentials: { clientId: 'id', clientSecret: 'secret' },
       }),
       baseContext,
     );
@@ -102,12 +132,11 @@ describe('evaluateCapabilities', () => {
     });
   });
 
-  it('marks subscription ready when enabled and credentials exist', () => {
+  it('marks subscription ready when explicitly enabled and credentials exist', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_SUBSCRIPTIONS_ENABLED: 'true',
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
+      config({
+        capabilityFlags: { subscription: true },
+        credentials: { clientId: 'id', clientSecret: 'secret' },
       }),
       baseContext,
     );
@@ -123,9 +152,8 @@ describe('evaluateCapabilities', () => {
 
   it('marks seller onboarding implemented but disabled by default', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
+      config({
+        credentials: { clientId: 'id', clientSecret: 'secret' },
       }),
       baseContext,
     );
@@ -142,13 +170,14 @@ describe('evaluateCapabilities', () => {
 
   it('keeps seller onboarding platform eligible unknown when enabled and configured', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_SELLER_ONBOARDING_ENABLED: 'true',
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
-        PAYPAL_PARTNER_MERCHANT_ID: 'partner',
-        PAYPAL_PARTNER_ATTRIBUTION_ID: 'BN',
-        PAYPAL_SELLER_ONBOARDING_RETURN_URL: 'https://app.example/return',
+      config({
+        capabilityFlags: { seller_onboarding: true },
+        credentials: { clientId: 'id', clientSecret: 'secret' },
+        partner: {
+          merchantId: 'partner',
+          attributionId: 'BN',
+          sellerOnboardingReturnUrl: 'https://app.example/return',
+        },
       }),
       baseContext,
     );
@@ -159,10 +188,9 @@ describe('evaluateCapabilities', () => {
 
   it('does not treat seller onboarding as configured when enabled without partner vars', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_SELLER_ONBOARDING_ENABLED: 'true',
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
+      config({
+        capabilityFlags: { seller_onboarding: true },
+        credentials: { clientId: 'id', clientSecret: 'secret' },
       }),
       baseContext,
     );
@@ -178,9 +206,8 @@ describe('evaluateCapabilities', () => {
 
   it('marks marketplace checkout implemented but disabled by default', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
+      config({
+        credentials: { clientId: 'id', clientSecret: 'secret' },
       }),
       baseContext,
     );
@@ -197,12 +224,13 @@ describe('evaluateCapabilities', () => {
 
   it('keeps marketplace platform eligible unknown when enabled and configured', () => {
     const rows = evaluateCapabilities(
-      env({
-        PAYPAL_MARKETPLACE_ENABLED: 'true',
-        PAYPAL_CLIENT_ID: 'id',
-        PAYPAL_CLIENT_SECRET: 'secret',
-        PAYPAL_PARTNER_MERCHANT_ID: 'partner',
-        PAYPAL_PARTNER_ATTRIBUTION_ID: 'BN',
+      config({
+        capabilityFlags: { marketplace_checkout: true },
+        credentials: { clientId: 'id', clientSecret: 'secret' },
+        partner: {
+          merchantId: 'partner',
+          attributionId: 'BN',
+        },
       }),
       baseContext,
     );

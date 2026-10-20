@@ -4,6 +4,7 @@ import {
   type ExecuteCreateBillingPlanRequest,
 } from '../../../contracts/index';
 import { evaluateCapabilities, type ResolvedPaymentRuntime } from '../../../core/index';
+import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
 import type {
   PaypalSubscriptionHttpClient,
   PaypalSubscriptionHttpResponse,
@@ -15,7 +16,7 @@ function runtime(enabled: boolean): ResolvedPaymentRuntime {
   const context = {
     providerCode: 'paypal',
     accountRef: 'default',
-    applicationRef: 'edc',
+    applicationRef: 'test-app',
     environment: 'sandbox' as const,
   };
   return {
@@ -23,11 +24,13 @@ function runtime(enabled: boolean): ResolvedPaymentRuntime {
     context,
     descriptor: {
       ...context,
-      capabilities: evaluateCapabilities((key) => {
-        if (key === 'PAYPAL_CLIENT_ID' || key === 'PAYPAL_CLIENT_SECRET') return 'set';
-        if (key === 'PAYPAL_SUBSCRIPTIONS_ENABLED') return enabled ? 'true' : undefined;
-        return undefined;
-      }, context),
+      capabilities: evaluateCapabilities(
+        sandboxPaypalProviderConfig({
+          credentials: { clientId: 'set', clientSecret: 'set' },
+          capabilityFlags: { subscription: enabled },
+        }),
+        context,
+      ),
     },
     checkoutCredentials: {
       clientId: 'id',
@@ -47,7 +50,7 @@ describe('PaypalSubscriptionExecutor', () => {
     const result = await executor.createSubscription({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerRequestId: 'req-1',
       providerPlanId: 'FAKE-PLAN-1',
@@ -68,7 +71,7 @@ describe('PaypalSubscriptionExecutor', () => {
     const result = await executor.createProduct({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerRequestId: 'req-2',
       name: 'Premium',
@@ -93,7 +96,7 @@ describe('PaypalSubscriptionExecutor', () => {
       executor.createProduct({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         providerRequestId: 'req-missing-product',
         name: 'Premium',
@@ -102,6 +105,35 @@ describe('PaypalSubscriptionExecutor', () => {
     ).rejects.toMatchObject({
       code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
       message: 'PayPal catalog product response did not include a provider id',
+    });
+  });
+
+  it('rejects subscription responses without a provider id', async () => {
+    const httpClient: PaypalSubscriptionHttpClient = {
+      request: vi.fn(
+        async (): Promise<PaypalSubscriptionHttpResponse> => ({
+          status: 201,
+          body: { status: 'APPROVAL_PENDING' },
+          debugId: 'missing-sub-id',
+        }),
+      ),
+    };
+    const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
+    await expect(
+      executor.createSubscription({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        providerRequestId: 'req-missing-sub',
+        providerPlanId: 'PLAN-1',
+        subscriberEmail: null,
+      }),
+    ).rejects.toMatchObject({
+      code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+      message: 'PayPal subscription response did not include a provider id',
+      uncertain: true,
+      retryable: true,
     });
   });
 
@@ -120,7 +152,7 @@ describe('PaypalSubscriptionExecutor', () => {
       executor.createPlan({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         providerRequestId: 'req-missing-plan',
         providerProductId: 'PROD-1',
@@ -160,7 +192,7 @@ describe('PaypalSubscriptionExecutor', () => {
     const context = {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox' as const,
     };
     function monthlyPlanFixture(input: {
@@ -217,5 +249,87 @@ describe('PaypalSubscriptionExecutor', () => {
     expect(
       (companyCycles[0]?.['pricing_scheme'] as Record<string, unknown>)?.['fixed_price'],
     ).toEqual({ currency_code: 'USD', value: '15.00' });
+  });
+
+  const lifecycleContext = {
+    providerCode: 'paypal' as const,
+    accountRef: 'default',
+    applicationRef: 'test-app',
+    environment: 'sandbox' as const,
+    providerSubscriptionId: 'FAKE-SUB-1',
+    reason: 'Lifecycle test',
+  };
+
+  it('refreshes subscription state via GET after lifecycle POST 204', async () => {
+    const executor = new PaypalSubscriptionExecutor(
+      runtime(true),
+      new FakePaypalSubscriptionHttpClient(),
+      async () => 'token',
+    );
+    await executor.createSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      providerRequestId: 'req-sub-life',
+      providerPlanId: 'FAKE-PLAN-1',
+    });
+
+    const cancelled = await executor.cancelSubscription(lifecycleContext);
+    expect(cancelled.subscriptionStateRefreshPending).not.toBe(true);
+    expect(cancelled.subscriptionStatus).toBe('cancelled');
+    expect(cancelled.providerSubscriptionStateAt).toBe('2026-10-20T12:00:00.000Z');
+  });
+
+  it('returns refresh pending when lifecycle POST succeeds but GET fails', async () => {
+    let callCount = 0;
+    const httpClient: PaypalSubscriptionHttpClient = {
+      request: vi.fn(async (input) => {
+        if (input.method === 'POST' && input.path.includes('/cancel')) {
+          return { status: 204, body: {}, debugId: 'post-204' };
+        }
+        callCount += 1;
+        return { status: 503, body: {}, debugId: 'get-fail' };
+      }),
+    };
+    const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
+    const result = await executor.cancelSubscription(lifecycleContext);
+    expect(result.subscriptionStateRefreshPending).toBe(true);
+    expect(result.subscriptionStateRefreshErrorCode).toBe(
+      PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+    );
+    expect(callCount).toBe(1);
+  });
+
+  it('rejects lifecycle POST failures without treating them as refresh pending', async () => {
+    const httpClient: PaypalSubscriptionHttpClient = {
+      request: vi.fn(async () => ({
+        status: 422,
+        body: {},
+        debugId: 'post-reject',
+      })),
+    };
+    const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
+    await expect(executor.cancelSubscription(lifecycleContext)).rejects.toMatchObject({
+      code: PAYMENT_RELIABILITY_ERROR.PROVIDER_TERMINAL_REJECTION,
+    });
+  });
+
+  it('surfaces uncertain outcome when lifecycle POST times out', async () => {
+    const httpClient: PaypalSubscriptionHttpClient = {
+      request: vi.fn(async () => {
+        throw {
+          code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+          message: 'PayPal subscription cancel failed',
+          retryable: true,
+          uncertain: true,
+        };
+      }),
+    };
+    const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
+    await expect(executor.cancelSubscription(lifecycleContext)).rejects.toMatchObject({
+      code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+      uncertain: true,
+    });
   });
 });

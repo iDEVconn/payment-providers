@@ -8,13 +8,13 @@ function runtime(overrides: Partial<ResolvedPaymentRuntime> = {}): ResolvedPayme
     context: {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
     },
     descriptor: {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       capabilities: [],
     },
@@ -28,15 +28,13 @@ function runtime(overrides: Partial<ResolvedPaymentRuntime> = {}): ResolvedPayme
 }
 
 describe('buildPaypalCheckoutExecutor', () => {
-  it('throws in production when checkout credentials are missing', () => {
-    expect(() =>
-      buildPaypalCheckoutExecutor({
-        runtime: runtime({ mode: 'fake', checkoutCredentials: undefined }),
-        strategyFactory: vi.fn(),
-        nodeEnv: 'production',
-        envPath: 'apps/microservices/payment/.env',
-      }),
-    ).toThrow(/PAYPAL_CLIENT_ID/);
+  it('builds a reject-mode executor in production when checkout credentials are missing', () => {
+    const executor = buildPaypalCheckoutExecutor({
+      runtime: runtime({ mode: 'fake', checkoutCredentials: undefined }),
+      strategyFactory: vi.fn(),
+      nodeEnv: 'production',
+    });
+    expect(executor).toBeDefined();
   });
 
   it('forbids explicit fake HTTP composition in production', () => {
@@ -45,10 +43,9 @@ describe('buildPaypalCheckoutExecutor', () => {
         runtime: runtime(),
         strategyFactory: vi.fn(),
         nodeEnv: 'production',
-        envPath: 'apps/microservices/payment/.env',
         forceFakeHttp: true,
       }),
-    ).toThrow(/fake PayPal HTTP is forbidden/);
+    ).toThrow(/Fake PayPal HTTP is forbidden in production/);
   });
 
   it('builds a live-provider executor when credentials exist', () => {
@@ -56,7 +53,6 @@ describe('buildPaypalCheckoutExecutor', () => {
       runtime: runtime(),
       strategyFactory: vi.fn(),
       nodeEnv: 'development',
-      envPath: 'apps/microservices/payment/.env',
     });
 
     expect(executor).toBeDefined();

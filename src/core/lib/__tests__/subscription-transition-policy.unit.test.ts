@@ -21,5 +21,15 @@ describe('subscription-transition-policy', () => {
 
   it('blocks cancelled subscriptions from reactivating', () => {
     expect(() => assertSubscriptionTransitionAllowed('cancelled', 'active')).toThrow();
+    expect(() => assertSubscriptionTransitionAllowed('cancelled', 'suspended')).toThrow();
+  });
+
+  it('blocks active subscriptions from regressing to approval_pending', () => {
+    expect(() => assertSubscriptionTransitionAllowed('active', 'approval_pending')).toThrow();
+  });
+
+  it('allows active and suspended to toggle', () => {
+    expect(() => assertSubscriptionTransitionAllowed('active', 'suspended')).not.toThrow();
+    expect(() => assertSubscriptionTransitionAllowed('suspended', 'active')).not.toThrow();
   });
 });

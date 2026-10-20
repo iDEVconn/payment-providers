@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PAYMENT_RELIABILITY_ERROR } from '../../../contracts/index';
 import { evaluateCapabilities, type ResolvedPaymentRuntime } from '../../../core/index';
+import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
 import { PaypalMarketplaceExecutor } from '../paypal-marketplace-executor';
 import type { PaypalOrdersHttpClient } from '../paypal-orders-http-client';
 
 const ctx = {
   providerCode: 'paypal',
   accountRef: 'default',
-  applicationRef: 'edc',
+  applicationRef: 'test-app',
   environment: 'sandbox' as const,
   providerRequestId: 'req-1',
 };
@@ -18,13 +19,17 @@ function runtime(): ResolvedPaymentRuntime {
     context: ctx,
     descriptor: {
       ...ctx,
-      capabilities: evaluateCapabilities((key) => {
-        if (key === 'PAYPAL_CLIENT_ID' || key === 'PAYPAL_CLIENT_SECRET') return 'set';
-        if (key === 'PAYPAL_MARKETPLACE_ENABLED') return 'true';
-        if (key === 'PAYPAL_PARTNER_MERCHANT_ID') return 'partner-merchant';
-        if (key === 'PAYPAL_PARTNER_ATTRIBUTION_ID') return 'BN-TEST';
-        return undefined;
-      }, ctx),
+      capabilities: evaluateCapabilities(
+        sandboxPaypalProviderConfig({
+          credentials: { clientId: 'set', clientSecret: 'set' },
+          capabilityFlags: { marketplace_checkout: true },
+          partner: {
+            merchantId: 'partner-merchant',
+            attributionId: 'BN-TEST',
+          },
+        }),
+        ctx,
+      ),
     },
     checkoutCredentials: {
       clientId: 'id',

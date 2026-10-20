@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { PaymentConfigurationError } from '../payment-configuration-error';
 import { buildOperationIdempotencyScope } from '../operation-idempotency';
 import { resolvePaymentSubscriptionProviderContext } from '../subscription-provider-context';
 
@@ -6,22 +7,34 @@ describe('resolvePaymentSubscriptionProviderContext', () => {
   const env = {
     PAYMENT_PROVIDER: 'paypal-trusted',
     PAYPAL_ACCOUNT_REF: 'trusted-acct',
-    PAYMENT_APPLICATION_REF: 'trusted-app',
     PAYPAL_ENVIRONMENT: 'live',
   };
   const read = (key: string) => env[key as keyof typeof env];
 
-  it('defaults provider, account, application and treats non-live env as sandbox', () => {
-    expect(resolvePaymentSubscriptionProviderContext(() => undefined)).toEqual({
-      providerCode: 'paypal',
-      accountRef: 'default',
-      applicationRef: 'edc',
-      environment: 'sandbox',
-    });
+  it('requires environment from the composition root when not overridden', () => {
+    expect(() =>
+      resolvePaymentSubscriptionProviderContext(() => undefined, {
+        applicationRef: 'trusted-app',
+      }),
+    ).toThrow(/composition root/);
   });
 
-  it('reads live environment from configuration when not overridden', () => {
-    expect(resolvePaymentSubscriptionProviderContext(read)).toEqual({
+  it('requires applicationRef from the composition root', () => {
+    expect(() =>
+      resolvePaymentSubscriptionProviderContext(read, {
+        applicationRef: '',
+        environment: 'live',
+      }),
+    ).toThrow(PaymentConfigurationError);
+  });
+
+  it('uses explicit environment override with configuration defaults', () => {
+    expect(
+      resolvePaymentSubscriptionProviderContext(read, {
+        environment: 'live',
+        applicationRef: 'trusted-app',
+      }),
+    ).toEqual({
       providerCode: 'paypal-trusted',
       accountRef: 'trusted-acct',
       applicationRef: 'trusted-app',
@@ -30,7 +43,12 @@ describe('resolvePaymentSubscriptionProviderContext', () => {
   });
 
   it('allows explicit sandbox override when configuration is live', () => {
-    expect(resolvePaymentSubscriptionProviderContext(read, { environment: 'sandbox' })).toEqual({
+    expect(
+      resolvePaymentSubscriptionProviderContext(read, {
+        environment: 'sandbox',
+        applicationRef: 'trusted-app',
+      }),
+    ).toEqual({
       providerCode: 'paypal-trusted',
       accountRef: 'trusted-acct',
       applicationRef: 'trusted-app',
@@ -39,16 +57,26 @@ describe('resolvePaymentSubscriptionProviderContext', () => {
   });
 
   it('produces identical scope on repeated resolution', () => {
-    const first = resolvePaymentSubscriptionProviderContext(read, { environment: 'sandbox' });
-    const second = resolvePaymentSubscriptionProviderContext(read, { environment: 'sandbox' });
+    const first = resolvePaymentSubscriptionProviderContext(read, {
+      environment: 'sandbox',
+      applicationRef: 'trusted-app',
+    });
+    const second = resolvePaymentSubscriptionProviderContext(read, {
+      environment: 'sandbox',
+      applicationRef: 'trusted-app',
+    });
     expect(first).toEqual(second);
   });
 
   it('separates sandbox and live operation scopes derived from context', () => {
     const sandboxContext = resolvePaymentSubscriptionProviderContext(read, {
       environment: 'sandbox',
+      applicationRef: 'trusted-app',
     });
-    const liveContext = resolvePaymentSubscriptionProviderContext(read);
+    const liveContext = resolvePaymentSubscriptionProviderContext(read, {
+      environment: 'live',
+      applicationRef: 'trusted-app',
+    });
     const sandboxScope = buildOperationIdempotencyScope({
       applicationRef: sandboxContext.applicationRef,
       accountRef: sandboxContext.accountRef,
@@ -68,12 +96,16 @@ describe('resolvePaymentSubscriptionProviderContext', () => {
 
   it('changes operation scope when applicationRef or accountRef changes', () => {
     const baseline = buildOperationIdempotencyScope({
-      ...resolvePaymentSubscriptionProviderContext(read, { environment: 'sandbox' }),
+      ...resolvePaymentSubscriptionProviderContext(read, {
+        environment: 'sandbox',
+        applicationRef: 'trusted-app',
+      }),
       kind: 'catalog_product',
     });
     const otherAccount = buildOperationIdempotencyScope({
       ...resolvePaymentSubscriptionProviderContext(read, {
         environment: 'sandbox',
+        applicationRef: 'trusted-app',
         accountRef: 'other-acct',
       }),
       kind: 'catalog_product',

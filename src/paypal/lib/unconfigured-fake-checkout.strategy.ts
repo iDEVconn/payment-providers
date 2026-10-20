@@ -1,12 +1,11 @@
-import {
-  PaymentError,
-  type CaptureResult,
-  type CreateOrderInput,
-  type OrderResult,
-  type PaymentStrategy,
-  type RequestOptions,
+import type {
+  CaptureResult,
+  CreateOrderInput,
+  OrderResult,
+  PaymentStrategy,
+  RequestOptions,
 } from '@idevconn/payment';
-import { UNCONFIGURED_FAKE_SIMULATION } from '../../contracts/index';
+import { PAYMENT_CAPABILITY_UNAVAILABLE, PAYMENT_CAUSE_CODE } from '../../contracts/index';
 
 export class UnconfiguredFakeCheckoutStrategy implements PaymentStrategy {
   constructor(readonly name: string) {}
@@ -19,12 +18,19 @@ export class UnconfiguredFakeCheckoutStrategy implements PaymentStrategy {
     return Promise.reject(this.notConfigured());
   }
 
-  private notConfigured(): PaymentError {
-    return new PaymentError(
-      'PROVIDER_ERROR',
-      503,
-      `Payment provider "${this.name}" is not configured (missing credentials)`,
-      { simulation: UNCONFIGURED_FAKE_SIMULATION },
-    );
+  private notConfigured(): {
+    code: typeof PAYMENT_CAPABILITY_UNAVAILABLE;
+    message: string;
+    causeCode: string;
+    retryable: false;
+    uncertain: false;
+  } {
+    return {
+      code: PAYMENT_CAPABILITY_UNAVAILABLE,
+      causeCode: PAYMENT_CAUSE_CODE.CHECKOUT_CREDENTIALS_MISSING,
+      message: 'Payment capability is unavailable',
+      retryable: false,
+      uncertain: false,
+    };
   }
 }

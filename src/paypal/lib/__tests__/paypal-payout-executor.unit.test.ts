@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { evaluateCapabilities, type ResolvedPaymentRuntime } from '../../../core/index';
+import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
 import { FakePaypalPayoutHttpClient } from '../fake-paypal-payout-http-client';
 import { PaypalPayoutExecutor } from '../paypal-payout-executor';
 
@@ -7,7 +8,7 @@ function runtime(enabled: boolean): ResolvedPaymentRuntime {
   const context = {
     providerCode: 'paypal',
     accountRef: 'default',
-    applicationRef: 'edc',
+    applicationRef: 'test-app',
     environment: 'sandbox' as const,
   };
   return {
@@ -15,11 +16,13 @@ function runtime(enabled: boolean): ResolvedPaymentRuntime {
     context,
     descriptor: {
       ...context,
-      capabilities: evaluateCapabilities((key) => {
-        if (key === 'PAYPAL_CLIENT_ID' || key === 'PAYPAL_CLIENT_SECRET') return 'set';
-        if (key === 'PAYPAL_PAYOUTS_ENABLED') return enabled ? 'true' : undefined;
-        return undefined;
-      }, context),
+      capabilities: evaluateCapabilities(
+        sandboxPaypalProviderConfig({
+          credentials: { clientId: 'set', clientSecret: 'set' },
+          capabilityFlags: { payout: enabled },
+        }),
+        context,
+      ),
     },
     checkoutCredentials: {
       clientId: 'id',
@@ -39,7 +42,7 @@ describe('PaypalPayoutExecutor', () => {
     const result = await executor.submitBatch({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerRequestId: 'req-1',
       senderBatchId: 'batch-1',
@@ -68,7 +71,7 @@ describe('PaypalPayoutExecutor', () => {
       executor.submitBatch({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         providerRequestId: 'req-1',
         senderBatchId: 'batch-1',
@@ -93,7 +96,7 @@ describe('PaypalPayoutExecutor', () => {
     const batch = await executor.getBatch({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerPayoutBatchId: 'batch-lookup',
     });
@@ -102,7 +105,7 @@ describe('PaypalPayoutExecutor', () => {
     const item = await executor.getItem({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerPayoutItemId: 'item-lookup',
     });
@@ -138,7 +141,7 @@ describe('PaypalPayoutExecutor', () => {
     const item = await executor.getItem({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerPayoutItemId: 'L6V2ER6KKB4CS',
     });
@@ -172,7 +175,7 @@ describe('PaypalPayoutExecutor', () => {
       executor.getItem({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         providerPayoutItemId: 'L6V2ER6KKB4CS',
       }),
@@ -197,7 +200,7 @@ describe('PaypalPayoutExecutor', () => {
     await executor.submitBatch({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerRequestId: 'req-stable',
       senderBatchId: 'batch-1',
@@ -223,7 +226,7 @@ describe('PaypalPayoutExecutor', () => {
       executor.submitBatch({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         providerRequestId: 'req-1',
         senderBatchId: 'b'.repeat(300),
@@ -263,7 +266,7 @@ describe('PaypalPayoutExecutor', () => {
       executor.submitBatch({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         providerRequestId: 'req-1',
         senderBatchId: 'batch-1',
@@ -335,7 +338,7 @@ describe('PaypalPayoutExecutor', () => {
     const result = await executor.submitBatch({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerRequestId: 'req-1',
       senderBatchId: 'batch-1',

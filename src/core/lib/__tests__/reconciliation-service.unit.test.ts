@@ -48,7 +48,7 @@ describe('ReconciliationService', () => {
   it('records retryable failure when provider state remains unknown', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const scope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'checkout',
@@ -59,7 +59,7 @@ describe('ReconciliationService', () => {
       commandFingerprint: 'fp',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'checkout',
       providerReferenceId: 'order-1',
@@ -73,7 +73,7 @@ describe('ReconciliationService', () => {
     const evidence = await store.insertEvidence({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       evidenceKind: 'webhook',
       providerEventId: 'evt-1',
@@ -130,7 +130,7 @@ describe('ReconciliationService', () => {
   it('applies provider lookup for uncertain refund operations', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const captureScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'capture',
@@ -141,7 +141,7 @@ describe('ReconciliationService', () => {
       commandFingerprint: 'fp-cap',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'capture',
       providerCaptureId: 'capture-1',
@@ -157,7 +157,7 @@ describe('ReconciliationService', () => {
     });
 
     const refundScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'refund',
@@ -168,7 +168,7 @@ describe('ReconciliationService', () => {
       commandFingerprint: 'fp-ref',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'refund',
       parentOperationId: capture.operationId,
@@ -230,7 +230,7 @@ describe('ReconciliationService', () => {
   it('applies provider lookup for uncertain payout item operations', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const batchScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'payout_batch',
@@ -241,14 +241,14 @@ describe('ReconciliationService', () => {
       commandFingerprint: 'fp-batch',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_batch',
       providerPayoutBatchId: 'batch-provider-1',
       payoutStatus: 'processing',
     });
     const itemScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'payout_item',
@@ -259,7 +259,7 @@ describe('ReconciliationService', () => {
       commandFingerprint: 'fp-item',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_item',
       parentOperationId: batch.operationId,
@@ -318,7 +318,7 @@ describe('ReconciliationService', () => {
   it('reconciles uncertain subscription operations using read-only provider lookup', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const subScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'subscription',
@@ -329,10 +329,11 @@ describe('ReconciliationService', () => {
       commandFingerprint: 'fp-sub',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'subscription',
       providerSubscriptionId: 'SUB-RECON-1',
+      providerPlanId: 'PLAN-1',
       subscriptionStatus: 'approval_pending',
     });
     await store.transitionOperation({
@@ -404,10 +405,286 @@ describe('ReconciliationService', () => {
     expect(updated?.subscriptionStatus).toBe('active');
   });
 
+  it('rejects subscription reconciliation when provider plan id mismatches stored plan', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const subScope = buildOperationIdempotencyScope({
+      applicationRef: 'test-app',
+      accountRef: 'default',
+      environment: 'sandbox',
+      kind: 'subscription',
+    });
+    const subscription = await store.createOperation({
+      idempotencyKey: 'sub-reconcile-plan-mismatch',
+      idempotencyScope: subScope,
+      commandFingerprint: 'fp-sub-plan',
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      kind: 'subscription',
+      providerSubscriptionId: 'SUB-RECON-PLAN',
+      providerPlanId: 'PLAN-STORED',
+      subscriptionStatus: 'approval_pending',
+      startTime: '2026-01-01T00:00:00Z',
+    });
+    await store.transitionOperation({
+      operationId: subscription.operationId,
+      expectedVersion: 1,
+      nextStatus: 'unknown',
+      reason: 'seed uncertain subscription',
+    });
+
+    const getSubscription = vi.fn().mockResolvedValue({
+      providerSubscriptionId: 'SUB-RECON-PLAN',
+      providerPlanId: 'PLAN-PROVIDER',
+      subscriptionStatus: 'active',
+      approvalUrl: null,
+      startTime: '2099-01-01T00:00:00Z',
+      nextBillingTime: '2099-02-01T00:00:00Z',
+    });
+
+    const service = new ReconciliationService(store, {
+      getOrder: async () => ({
+        providerOrderId: 'order-1',
+        checkoutStatus: 'unknown',
+        approvalUrl: null,
+        amount: null,
+        providerCaptureId: null,
+      }),
+      getRefund: async () => ({
+        providerRefundId: 'refund-1',
+        refundStatus: 'unknown',
+        amount: null,
+      }),
+      getPayoutBatch: async () => ({
+        providerPayoutBatchId: 'batch-1',
+        senderBatchId: 'sender-1',
+        batchPayoutStatus: 'unknown',
+        items: [],
+      }),
+      getPayoutItem: async () => ({
+        providerPayoutItemId: 'item-1',
+        providerPayoutBatchId: 'batch-1',
+        senderBatchId: 'sender-1',
+        senderItemId: 'sender-item-1',
+        payoutStatus: 'unknown',
+        amount: null,
+        providerTransactionId: null,
+        providerFee: null,
+        failureCode: null,
+        failureMessage: null,
+      }),
+      getProduct: async () => ({
+        providerProductId: 'PROD-1',
+        productStatus: 'created',
+      }),
+      getPlan: async () => ({
+        providerPlanId: 'PLAN-1',
+        providerProductId: 'PROD-1',
+        planStatus: 'active',
+      }),
+      getSubscription,
+      ...sellerLookup,
+    });
+
+    const result = await service.reconcile(10);
+    expect(result.terminalFailures).toBe(1);
+    expect(result.applied).toBe(0);
+
+    const reloaded = await store.findOperationById(subscription.operationId);
+    expect(reloaded?.providerPlanId).toBe('PLAN-STORED');
+    expect(reloaded?.subscriptionStatus).toBe('approval_pending');
+    expect(reloaded?.startTime).toBe('2026-01-01T00:00:00Z');
+  });
+
+  it('persists subscription billing dates from provider lookup during reconciliation', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const subScope = buildOperationIdempotencyScope({
+      applicationRef: 'test-app',
+      accountRef: 'default',
+      environment: 'sandbox',
+      kind: 'subscription',
+    });
+    const subscription = await store.createOperation({
+      idempotencyKey: 'sub-reconcile-billing',
+      idempotencyScope: subScope,
+      commandFingerprint: 'fp-sub-billing',
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      kind: 'subscription',
+      providerSubscriptionId: 'SUB-RECON-BILLING',
+      subscriptionStatus: 'approval_pending',
+    });
+    await store.transitionOperation({
+      operationId: subscription.operationId,
+      expectedVersion: 1,
+      nextStatus: 'unknown',
+      reason: 'seed uncertain subscription',
+    });
+
+    const providerStart = '2026-01-15T10:00:00Z';
+    const providerNextBilling = '2026-02-15T10:00:00Z';
+    const getSubscription = vi.fn().mockResolvedValue({
+      providerSubscriptionId: 'SUB-RECON-BILLING',
+      providerPlanId: 'PLAN-1',
+      subscriptionStatus: 'active',
+      approvalUrl: null,
+      startTime: providerStart,
+      nextBillingTime: providerNextBilling,
+    });
+
+    const service = new ReconciliationService(store, {
+      getOrder: async () => ({
+        providerOrderId: 'order-1',
+        checkoutStatus: 'unknown',
+        approvalUrl: null,
+        amount: null,
+        providerCaptureId: null,
+      }),
+      getRefund: async () => ({
+        providerRefundId: 'refund-1',
+        refundStatus: 'unknown',
+        amount: null,
+      }),
+      getPayoutBatch: async () => ({
+        providerPayoutBatchId: 'batch-1',
+        senderBatchId: 'sender-1',
+        batchPayoutStatus: 'unknown',
+        items: [],
+      }),
+      getPayoutItem: async () => ({
+        providerPayoutItemId: 'item-1',
+        providerPayoutBatchId: 'batch-1',
+        senderBatchId: 'sender-1',
+        senderItemId: 'sender-item-1',
+        payoutStatus: 'unknown',
+        amount: null,
+        providerTransactionId: null,
+        providerFee: null,
+        failureCode: null,
+        failureMessage: null,
+      }),
+      getProduct: async () => ({
+        providerProductId: 'PROD-1',
+        productStatus: 'created',
+      }),
+      getPlan: async () => ({
+        providerPlanId: 'PLAN-1',
+        providerProductId: 'PROD-1',
+        planStatus: 'active',
+      }),
+      getSubscription,
+      ...sellerLookup,
+    });
+
+    const result = await service.reconcile(10);
+    expect(result.applied).toBe(1);
+
+    const reloaded = await store.findOperationById(subscription.operationId);
+    expect(reloaded?.subscriptionStatus).toBe('active');
+    expect(reloaded?.startTime).toBe(providerStart);
+    expect(reloaded?.nextBillingTime).toBe(providerNextBilling);
+    expect(reloaded?.providerSubscriptionStateAt).toBeNull();
+  });
+
+  it('preserves stored subscription billing dates when provider lookup omits them', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const subScope = buildOperationIdempotencyScope({
+      applicationRef: 'test-app',
+      accountRef: 'default',
+      environment: 'sandbox',
+      kind: 'subscription',
+    });
+    const existingStart = '2026-03-01T00:00:00Z';
+    const existingNextBilling = '2026-04-01T00:00:00Z';
+    const subscription = await store.createOperation({
+      idempotencyKey: 'sub-reconcile-preserve-billing',
+      idempotencyScope: subScope,
+      commandFingerprint: 'fp-sub-preserve-billing',
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      kind: 'subscription',
+      providerSubscriptionId: 'SUB-RECON-PRESERVE',
+      subscriptionStatus: 'approval_pending',
+      startTime: existingStart,
+      nextBillingTime: existingNextBilling,
+    });
+    await store.transitionOperation({
+      operationId: subscription.operationId,
+      expectedVersion: 1,
+      nextStatus: 'unknown',
+      reason: 'seed uncertain subscription',
+    });
+
+    const getSubscription = vi.fn().mockResolvedValue({
+      providerSubscriptionId: 'SUB-RECON-PRESERVE',
+      providerPlanId: 'PLAN-1',
+      subscriptionStatus: 'active',
+      approvalUrl: null,
+      startTime: null,
+      nextBillingTime: null,
+    });
+
+    const service = new ReconciliationService(store, {
+      getOrder: async () => ({
+        providerOrderId: 'order-1',
+        checkoutStatus: 'unknown',
+        approvalUrl: null,
+        amount: null,
+        providerCaptureId: null,
+      }),
+      getRefund: async () => ({
+        providerRefundId: 'refund-1',
+        refundStatus: 'unknown',
+        amount: null,
+      }),
+      getPayoutBatch: async () => ({
+        providerPayoutBatchId: 'batch-1',
+        senderBatchId: 'sender-1',
+        batchPayoutStatus: 'unknown',
+        items: [],
+      }),
+      getPayoutItem: async () => ({
+        providerPayoutItemId: 'item-1',
+        providerPayoutBatchId: 'batch-1',
+        senderBatchId: 'sender-1',
+        senderItemId: 'sender-item-1',
+        payoutStatus: 'unknown',
+        amount: null,
+        providerTransactionId: null,
+        providerFee: null,
+        failureCode: null,
+        failureMessage: null,
+      }),
+      getProduct: async () => ({
+        providerProductId: 'PROD-1',
+        productStatus: 'created',
+      }),
+      getPlan: async () => ({
+        providerPlanId: 'PLAN-1',
+        providerProductId: 'PROD-1',
+        planStatus: 'active',
+      }),
+      getSubscription,
+      ...sellerLookup,
+    });
+
+    await service.reconcile(10);
+
+    const reloaded = await store.findOperationById(subscription.operationId);
+    expect(reloaded?.subscriptionStatus).toBe('active');
+    expect(reloaded?.startTime).toBe(existingStart);
+    expect(reloaded?.nextBillingTime).toBe(existingNextBilling);
+  });
+
   it('uses read-only product and plan lookups without mutation RPCs during reconciliation', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const productScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'catalog_product',
@@ -418,7 +695,7 @@ describe('ReconciliationService', () => {
       commandFingerprint: 'fp-prod',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'catalog_product',
       providerProductId: 'PROD-RECON-1',
@@ -484,7 +761,7 @@ describe('ReconciliationService', () => {
   it('reconciles uncertain seller referrals with GET only and never treats them as orders', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const referralScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'seller_referral',
@@ -495,7 +772,7 @@ describe('ReconciliationService', () => {
       commandFingerprint: 'fp-seller',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'seller_referral',
       providerReferralId: 'REF-RECON-1',
@@ -564,7 +841,7 @@ describe('ReconciliationService', () => {
   it('reconciles seller connections through merchant status GET during generic reconcile', async () => {
     const store = new MemoryPaymentReliabilityStore();
     await store.createSellerConnection({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       providerCode: 'paypal',
       accountRef: 'default',
       environment: 'sandbox',
@@ -628,7 +905,7 @@ describe('ReconciliationService', () => {
     expect(getMerchantStatus).toHaveBeenCalled();
     expect(getReferral).not.toHaveBeenCalled();
     const connection = await store.findSellerConnectionBySellerRef(
-      'edc',
+      'test-app',
       'paypal',
       'default',
       'sandbox',

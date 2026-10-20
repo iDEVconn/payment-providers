@@ -1,12 +1,15 @@
 export * from './lib/token-cache-scope';
 export * from './lib/capability-definitions';
-export * from './lib/env-access';
+export * from './lib/payment-provider-config';
+export * from './lib/payment-configuration-error';
+export * from './lib/public-error-sanitizer';
 export * from './lib/evaluate-capabilities';
 export * from './lib/assert-capability-ready';
 export * from './lib/scoped-token-cache-registry';
 export * from './lib/resolve-payment-runtime';
 export * from './lib/resolve-payment-execution-mode';
 export * from './lib/payment-execution-config-adapter';
+export * from './lib/payment-execution-config-types';
 export * from './lib/payment-execution-context';
 export * from './lib/normalize-execution-request';
 export * from './lib/operation-idempotency';
@@ -16,8 +19,16 @@ export * from './lib/checkout-provider-port';
 export * from './lib/checkout-lifecycle-service';
 export * from './lib/transition-policy';
 export * from './lib/persistence/payment-reliability-store';
-export * from './lib/persistence/memory-payment-reliability-store';
+export * from './lib/checkout-create-execution-lease';
+export {
+  MemoryPaymentReliabilityStore,
+  sha256Payload,
+  toPaymentEvidenceAdminView,
+} from './lib/persistence/memory-payment-reliability-store';
+export * from './lib/webhook-evidence-resume';
 export * from './lib/webhook-processing-service';
+export * from './lib/payment-event-consumer';
+export * from './lib/payment-recovery-service';
 export * from './lib/reconciliation-service';
 export * from './lib/mask-recipient';
 export * from './lib/payout-sender-id';
@@ -30,6 +41,8 @@ export * from './lib/payout-webhook-correlation';
 export * from './lib/mask-subscriber';
 export * from './lib/subscription-billing-cycles';
 export * from './lib/subscription-transition-policy';
+export * from './lib/subscription-provider-snapshot-fields';
+export * from './lib/subscription-provider-plan-consistency';
 export * from './lib/subscription-provider-port';
 export * from './lib/subscription-evidence-application';
 export * from './lib/subscription-lifecycle-service';

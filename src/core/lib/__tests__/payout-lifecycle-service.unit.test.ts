@@ -40,7 +40,7 @@ describe('PayoutLifecycleService', () => {
     const result = await service.submitPayoutBatch({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'batch-idem-1',
       items: [
@@ -67,7 +67,7 @@ describe('PayoutLifecycleService', () => {
     const base = {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox' as const,
       idempotencyKey: 'batch-idem-2',
       items: [
@@ -116,7 +116,7 @@ describe('PayoutLifecycleService', () => {
     const result = await service.submitPayoutBatch({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'batch-capability-off',
       items: [
@@ -153,7 +153,7 @@ describe('PayoutLifecycleService', () => {
     const result = await service.submitPayoutBatch({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       idempotencyKey: 'batch-uncertain',
       items: [

@@ -1,10 +1,10 @@
-import { formatEnvBanner, missingEnv } from '../../core/lib/host-env-banner';
+import { PaymentConfigurationError } from '../../core/lib/payment-configuration-error';
 import type { PaymentExecutionStatus } from '../../contracts/index';
 import type { ResolvedPaymentRuntime } from '../../core/index';
 import {
   blockedHttpClient,
   blockedOAuthGetter,
-  isExecutionModeNetworkBlocked,
+  shouldRejectProviderNetworkCalls,
 } from './build-reject-only-executor';
 import { FakePaypalOrdersHttpClient } from './fake-paypal-orders-http-client';
 import {
@@ -20,39 +20,20 @@ import type { PaypalOrdersHttpClient } from './paypal-orders-http-client';
 
 export type BuildPaypalMarketplaceExecutorInput = {
   runtime: ResolvedPaymentRuntime;
+  partnerConfig: PaypalMarketplacePartnerConfig;
   nodeEnv?: string;
-  envPath: string;
   executionStatus?: PaymentExecutionStatus;
-  get?: (key: string) => string | undefined;
   forceFakeHttp?: boolean;
   httpClient?: PaypalOrdersHttpClient;
 };
 
-const MARKETPLACE_KEYS = [
-  'PAYPAL_CLIENT_ID',
-  'PAYPAL_CLIENT_SECRET',
-  'PAYPAL_PARTNER_MERCHANT_ID',
-  'PAYPAL_PARTNER_ATTRIBUTION_ID',
-];
-
-function readPartnerConfig(
-  get: (key: string) => string | undefined,
-): PaypalMarketplacePartnerConfig {
-  return {
-    partnerAttributionId: get('PAYPAL_PARTNER_ATTRIBUTION_ID')?.trim() || 'unconfigured',
-  };
-}
-
 export function buildPaypalMarketplaceExecutor(
   input: BuildPaypalMarketplaceExecutorInput,
 ): PaypalMarketplaceExecutor {
-  const { runtime, nodeEnv, envPath, forceFakeHttp, httpClient, executionStatus } = input;
+  const { runtime, nodeEnv, forceFakeHttp, httpClient, executionStatus, partnerConfig } = input;
   const isProduction = nodeEnv === 'production';
-  const get = input.get ?? (() => undefined);
-  const enabled = get('PAYPAL_MARKETPLACE_ENABLED')?.trim() === 'true';
-  const partnerConfig = readPartnerConfig(get);
 
-  if (isExecutionModeNetworkBlocked(executionStatus)) {
+  if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
     return new PaypalMarketplaceExecutor(
       runtime,
       blockedHttpClient(),
@@ -61,31 +42,11 @@ export function buildPaypalMarketplaceExecutor(
     );
   }
 
-  if (enabled && isProduction) {
-    const missing = missingEnv(get, MARKETPLACE_KEYS);
-    if (missing.length > 0) {
-      throw new Error(
-        formatEnvBanner({
-          service: 'payment MS',
-          provider: runtime.context.providerCode,
-          missing,
-          envPath,
-          headline: '⚠  payment MS — PayPal marketplace configuration missing (startup aborted)',
-        }),
-      );
-    }
-  }
-
   if (forceFakeHttp) {
     if (isProduction) {
-      throw new Error(
-        formatEnvBanner({
-          service: 'payment MS',
-          provider: runtime.context.providerCode,
-          missing: ['PRODUCTION_FAKE_HTTP_FORBIDDEN'],
-          envPath,
-          headline: '⚠  payment MS — fake PayPal marketplace HTTP is forbidden in production',
-        }),
+      throw new PaymentConfigurationError(
+        'Fake PayPal marketplace HTTP is forbidden in production',
+        ['forceFakeHttp'],
       );
     }
     return new PaypalMarketplaceExecutor(
@@ -103,45 +64,13 @@ export function buildPaypalMarketplaceExecutor(
     );
   }
 
-  if (runtime.mode === 'fake') {
-    if (isProduction) {
-      const missing = missingEnv(get, ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET']);
-      throw new Error(
-        formatEnvBanner({
-          service: 'payment MS',
-          provider: runtime.context.providerCode,
-          missing,
-          envPath,
-          headline: '⚠  payment MS — PayPal credentials missing (startup aborted)',
-        }),
-      );
-    }
-    return new PaypalMarketplaceExecutor(
-      runtime,
-      new FakePaypalOrdersHttpClient(),
-      async () => {
-        throw {
-          code: 'PROVIDER_AUTH_FAILURE',
-          message: 'PayPal marketplace HTTP is unavailable in unconfigured development mode',
-          retryable: false,
-          uncertain: false,
-        };
-      },
-      partnerConfig,
-    );
-  }
-
   const credentials = runtime.checkoutCredentials;
   if (!credentials) {
-    const missing = missingEnv(get, ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET']);
-    throw new Error(
-      formatEnvBanner({
-        service: 'payment MS',
-        provider: runtime.context.providerCode,
-        missing,
-        envPath,
-        headline: '⚠  payment MS — PayPal credentials missing (startup aborted)',
-      }),
+    return new PaypalMarketplaceExecutor(
+      runtime,
+      blockedHttpClient(),
+      blockedOAuthGetter(),
+      partnerConfig,
     );
   }
 

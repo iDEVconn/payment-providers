@@ -4,9 +4,20 @@ export type PaymentDeploymentEnvironment = 'local' | 'ci' | 'staging' | 'live';
 
 export type PaymentRuntimeState = 'configured' | 'unconfigured' | 'conflict' | 'forbidden';
 
-export type PaymentExecutionModeSource = 'explicit' | 'legacy-alias' | 'unconfigured';
+export type PaymentExecutionModeSource =
+  | 'provider-environment'
+  | 'explicit'
+  | 'legacy-alias'
+  | 'unconfigured'
+  | 'test-simulation';
+
+import type { PaymentEnvironment } from './capabilities';
+
+export type { PaymentEnvironment };
 
 export type PaymentExecutionIssueCode =
+  | 'MISSING_PROVIDER_ENVIRONMENT'
+  | 'INVALID_PROVIDER_ENVIRONMENT'
   | 'MISSING_DEPLOYMENT_ENVIRONMENT'
   | 'INVALID_DEPLOYMENT_ENVIRONMENT'
   | 'MISSING_EXECUTION_MODE'
@@ -15,7 +26,22 @@ export type PaymentExecutionIssueCode =
   | 'LEGACY_ALIAS_CONFLICT'
   | 'LEGACY_ALIAS_FORBIDDEN_IN_LIVE'
   | 'PAYPAL_ENVIRONMENT_MISMATCH'
-  | 'EXECUTION_MODE_MISMATCH';
+  | 'EXECUTION_MODE_MISMATCH'
+  | 'SIMULATION_FORBIDDEN_IN_PRODUCTION';
+
+/** Provider-neutral input assembled at the application composition root. */
+export type NormalizedDeployedPaymentConfig = {
+  nodeEnv: string;
+  /** Parsed PayPal sandbox/live; null when missing or invalid. */
+  providerEnvironment: PaymentEnvironment | null;
+  /** Set when PAYPAL_ENVIRONMENT was present but not sandbox|live. */
+  providerEnvironmentInvalid?: boolean;
+  /** Test harness injection only — never from operator deploy env. */
+  financialSimulation?: boolean;
+  legacyPaymentExecutionMode?: string | null;
+  legacyPaymentDeploymentEnvironment?: string | null;
+  legacyFundingSimulation?: string | null;
+};
 
 export type PaymentExecutionIssue = {
   code: PaymentExecutionIssueCode;

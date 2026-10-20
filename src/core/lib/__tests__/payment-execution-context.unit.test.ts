@@ -21,7 +21,7 @@ describe('assertExecutionContextMatchesLocal', () => {
       assertExecutionContextMatchesLocal(localConfigured, {
         executionMode: 'simulation',
         deploymentEnvironment: 'local',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
       }),
     ).not.toThrow();
   });
@@ -31,7 +31,7 @@ describe('assertExecutionContextMatchesLocal', () => {
       assertExecutionContextMatchesLocal(localConfigured, {
         executionMode: 'sandbox',
         deploymentEnvironment: 'local',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
       }),
     ).toThrowError(PaymentExecutionModeError);
 
@@ -39,7 +39,7 @@ describe('assertExecutionContextMatchesLocal', () => {
       assertExecutionContextMatchesLocal(localConfigured, {
         executionMode: 'sandbox',
         deploymentEnvironment: 'local',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
       });
     } catch (error) {
       expect((error as PaymentExecutionModeError).code).toBe(EXECUTION_MODE_MISMATCH);

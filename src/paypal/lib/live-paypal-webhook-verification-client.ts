@@ -1,5 +1,9 @@
 import type { TokenCacheScopeInput } from '../../core/index';
 import type { PaypalOAuthClient } from './paypal-oauth-client';
+import {
+  isRetryablePaypalVerificationHttpStatus,
+  PaypalWebhookVerificationHttpError,
+} from './paypal-webhook-verification-http';
 import type { PaypalWebhookVerificationClient } from './paypal-webhook-verifier';
 
 export class LivePaypalWebhookVerificationClient implements PaypalWebhookVerificationClient {
@@ -42,8 +46,49 @@ export class LivePaypalWebhookVerificationClient implements PaypalWebhookVerific
         }),
         signal: controller.signal,
       });
-      const body = (await response.json()) as { verification_status?: string };
-      return { verification_status: body.verification_status ?? 'FAILURE' };
+      const responseText = await response.text();
+      if (!response.ok) {
+        if (isRetryablePaypalVerificationHttpStatus(response.status)) {
+          throw new PaypalWebhookVerificationHttpError(
+            'verification_unavailable',
+            `PayPal webhook verification HTTP ${response.status}`,
+          );
+        }
+        throw new PaypalWebhookVerificationHttpError(
+          'invalid_payload',
+          `PayPal webhook verification HTTP ${response.status}`,
+        );
+      }
+      let body: { verification_status?: string };
+      try {
+        body = JSON.parse(responseText) as { verification_status?: string };
+      } catch {
+        throw new PaypalWebhookVerificationHttpError(
+          'invalid_payload',
+          'PayPal webhook verification response is not valid JSON',
+        );
+      }
+      if (typeof body.verification_status !== 'string') {
+        throw new PaypalWebhookVerificationHttpError(
+          'invalid_payload',
+          'PayPal webhook verification response missing verification_status',
+        );
+      }
+      return { verification_status: body.verification_status };
+    } catch (error) {
+      if (error instanceof PaypalWebhookVerificationHttpError) {
+        throw error;
+      }
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new PaypalWebhookVerificationHttpError(
+          'verification_unavailable',
+          'PayPal webhook verification timed out',
+        );
+      }
+      throw new PaypalWebhookVerificationHttpError(
+        'verification_unavailable',
+        'PayPal webhook verification failed due to a network error',
+      );
     } finally {
       clearTimeout(timer);
     }

@@ -4,8 +4,103 @@ import { applySubscriptionDomainUpdate } from '../subscription-evidence-applicat
 import { buildOperationIdempotencyScope } from '../operation-idempotency';
 import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
 import { WebhookProcessingService } from '../webhook-processing-service';
+import { readSubscriptionProviderStateWatermark } from '../subscription-transition-policy';
 
 describe('WebhookProcessingService', () => {
+  it('keeps evidence pending and throws when verification is unavailable', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const service = new WebhookProcessingService(store);
+
+    await expect(
+      service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: '{"event_type":"PAYMENT.CAPTURE.COMPLETED"}',
+        providerEventId: 'tx-unavailable',
+        verify: async () => ({
+          verified: false,
+          transmissionId: 'tx-unavailable',
+          eventType: null,
+          resourceId: null,
+          unavailableReason: 'PayPal webhook verification HTTP 503',
+          failureKind: 'verification_unavailable',
+        }),
+      }),
+    ).rejects.toMatchObject({ code: PAYMENT_RELIABILITY_ERROR.VERIFICATION_UNAVAILABLE });
+
+    const evidence = await store.findEvidenceByProviderEvent(
+      'paypal',
+      'default',
+      'sandbox',
+      'tx-unavailable',
+    );
+    expect(evidence?.verificationStatus).toBe('pending');
+    expect(evidence?.errorCode).toBe(PAYMENT_RELIABILITY_ERROR.VERIFICATION_UNAVAILABLE);
+  });
+
+  it('resumes verification for evidence left pending after a prior unavailable attempt', async () => {
+    const store = new MemoryPaymentReliabilityStore();
+    const service = new WebhookProcessingService(store);
+    const scope = buildOperationIdempotencyScope({
+      applicationRef: 'test-app',
+      accountRef: 'default',
+      environment: 'sandbox',
+      kind: 'capture',
+    });
+    await store.createOperation({
+      idempotencyKey: 'idem-resume',
+      idempotencyScope: scope,
+      commandFingerprint: 'fp',
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      kind: 'capture',
+      providerReferenceId: 'capture-resume',
+      providerCaptureId: 'capture-resume',
+      providerOrderId: 'order-resume',
+    });
+
+    await expect(
+      service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: '{"event_type":"PAYMENT.CAPTURE.COMPLETED","resource":{"id":"capture-resume"}}',
+        providerEventId: 'tx-resume',
+        verify: async () => ({
+          verified: false,
+          transmissionId: 'tx-resume',
+          eventType: null,
+          resourceId: null,
+          unavailableReason: 'timeout',
+          failureKind: 'verification_unavailable',
+        }),
+      }),
+    ).rejects.toMatchObject({ code: PAYMENT_RELIABILITY_ERROR.VERIFICATION_UNAVAILABLE });
+
+    const receipt = await service.receiveWebhook({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      rawBody: '{"event_type":"PAYMENT.CAPTURE.COMPLETED","resource":{"id":"capture-resume"}}',
+      providerEventId: 'tx-resume',
+      verify: async () => ({
+        verified: true,
+        transmissionId: 'tx-resume',
+        eventType: 'PAYMENT.CAPTURE.COMPLETED',
+        resourceId: 'capture-resume',
+      }),
+    });
+
+    expect(receipt.processingStatus).toBe('processed');
+    expect(receipt.duplicate).toBe(false);
+  });
+
   it('rejects unverified webhook delivery without mutating operations', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const service = new WebhookProcessingService(store);
@@ -14,7 +109,7 @@ describe('WebhookProcessingService', () => {
       service.receiveWebhook({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         rawBody: '{"event_type":"PAYMENT.CAPTURE.COMPLETED"}',
         providerEventId: 'tx-1',
@@ -42,7 +137,7 @@ describe('WebhookProcessingService', () => {
     const store = new MemoryPaymentReliabilityStore();
     const service = new WebhookProcessingService(store);
     const scope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'capture',
@@ -53,7 +148,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'capture',
       providerReferenceId: 'capture-1',
@@ -64,7 +159,7 @@ describe('WebhookProcessingService', () => {
     const first = await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody: '{"event_type":"PAYMENT.CAPTURE.COMPLETED","resource":{"id":"capture-1"}}',
       providerEventId: 'tx-2',
@@ -75,10 +170,15 @@ describe('WebhookProcessingService', () => {
         resourceId: 'capture-1',
       }),
     });
+    await store.updateEvidence({
+      evidenceId: first.evidenceId,
+      consumerDeliveryStatus: 'confirmed',
+      consumerDeliveredAt: new Date().toISOString(),
+    });
     const second = await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody: '{"event_type":"PAYMENT.CAPTURE.COMPLETED","resource":{"id":"capture-1"}}',
       providerEventId: 'tx-2',
@@ -108,7 +208,7 @@ describe('WebhookProcessingService', () => {
     const store = new MemoryPaymentReliabilityStore();
     const service = new WebhookProcessingService(store);
     const batchScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'payout_batch',
@@ -119,14 +219,14 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-batch',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_batch',
       payoutStatus: 'accepted',
       providerPayoutBatchId: 'batch-provider-1',
     });
     const itemScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'payout_item',
@@ -137,7 +237,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-item',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_item',
       parentOperationId: batch.operationId,
@@ -148,7 +248,7 @@ describe('WebhookProcessingService', () => {
     const receipt = await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody:
         '{"event_type":"PAYMENT.PAYOUTS-ITEM.SUCCEEDED","resource":{"id":"item-provider-1"}}',
@@ -177,7 +277,7 @@ describe('WebhookProcessingService', () => {
     const store = new MemoryPaymentReliabilityStore();
     const service = new WebhookProcessingService(store);
     const scope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'subscription',
@@ -188,7 +288,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-sub',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'subscription',
       subscriptionStatus: 'approval_pending',
@@ -204,7 +304,7 @@ describe('WebhookProcessingService', () => {
     const lifecycleReceipt = await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody: '{"event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"sub-provider-1"}}',
       providerEventId: 'tx-sub-1',
@@ -227,7 +327,7 @@ describe('WebhookProcessingService', () => {
     const paymentReceipt = await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody:
         '{"event_type":"PAYMENT.SALE.COMPLETED","resource":{"id":"sale-1","billing_agreement_id":"sub-provider-1"}}',
@@ -253,7 +353,7 @@ describe('WebhookProcessingService', () => {
     const store = new MemoryPaymentReliabilityStore();
     const service = new WebhookProcessingService(store);
     const subScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'subscription',
@@ -264,7 +364,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-sub',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'subscription',
       subscriptionStatus: 'active',
@@ -280,7 +380,7 @@ describe('WebhookProcessingService', () => {
     await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody: '{"event_type":"BILLING.SUBSCRIPTION.SUSPENDED","resource":{"id":"sub-life-1"}}',
       providerEventId: 'tx-sub-suspend',
@@ -305,7 +405,7 @@ describe('WebhookProcessingService', () => {
     await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody: '{"event_type":"BILLING.SUBSCRIPTION.CANCELLED","resource":{"id":"sub-life-1"}}',
       providerEventId: 'tx-sub-cancel',
@@ -328,7 +428,7 @@ describe('WebhookProcessingService', () => {
     ).toBe('cancelled');
 
     const planScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'billing_plan',
@@ -339,7 +439,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-plan',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'billing_plan',
       planStatus: 'created',
@@ -355,7 +455,7 @@ describe('WebhookProcessingService', () => {
     await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody: '{"event_type":"BILLING.PLAN.ACTIVATED","resource":{"id":"plan-life-1"}}',
       providerEventId: 'tx-plan-active',
@@ -378,7 +478,7 @@ describe('WebhookProcessingService', () => {
 
     async function seedSucceededActiveSubscription(store: MemoryPaymentReliabilityStore) {
       const subScope = buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'subscription',
@@ -389,7 +489,7 @@ describe('WebhookProcessingService', () => {
         commandFingerprint: 'fp-sub-cancel-prop',
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         kind: 'subscription',
         subscriptionStatus: 'active',
@@ -414,7 +514,7 @@ describe('WebhookProcessingService', () => {
       return service.receiveWebhook({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         rawBody: JSON.stringify({
           event_type: 'BILLING.SUBSCRIPTION.CANCELLED',
@@ -469,9 +569,7 @@ describe('WebhookProcessingService', () => {
           subscriptionStatus: 'cancelled',
         }),
       );
-      expect(
-        transitionSpy.mock.calls.some((call) => call[0]?.nextStatus === 'failed'),
-      ).toBe(false);
+      expect(transitionSpy.mock.calls.some((call) => call[0]?.nextStatus === 'failed')).toBe(false);
     });
 
     it('applySubscriptionDomainUpdate passes lifecycleReason through updateOperation', async () => {
@@ -515,6 +613,11 @@ describe('WebhookProcessingService', () => {
 
       const first = await receiveVerifiedCancelledWebhook(service, 'tx-sub-cancel-prop-dup');
       expect(first.duplicate).toBe(false);
+      await store.updateEvidence({
+        evidenceId: first.evidenceId,
+        consumerDeliveryStatus: 'confirmed',
+        consumerDeliveredAt: new Date().toISOString(),
+      });
 
       const duplicate = await receiveVerifiedCancelledWebhook(service, 'tx-sub-cancel-prop-dup');
       expect(duplicate.duplicate).toBe(true);
@@ -537,7 +640,7 @@ describe('WebhookProcessingService', () => {
         service.receiveWebhook({
           providerCode: 'paypal',
           accountRef: 'default',
-          applicationRef: 'edc',
+          applicationRef: 'test-app',
           environment: 'sandbox',
           rawBody: JSON.stringify({
             event_type: 'BILLING.SUBSCRIPTION.CANCELLED',
@@ -561,7 +664,7 @@ describe('WebhookProcessingService', () => {
       await service.receiveWebhook({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         rawBody: JSON.stringify({
           event_type: 'BILLING.SUBSCRIPTION.CANCELLED',
@@ -590,24 +693,433 @@ describe('WebhookProcessingService', () => {
     });
   });
 
-  it('retains unsupported subscription catalog events without mutation', async () => {
-    const store = new MemoryPaymentReliabilityStore();
-    const service = new WebhookProcessingService(store);
-    const receipt = await service.receiveWebhook({
-      providerCode: 'paypal',
-      accountRef: 'default',
-      applicationRef: 'edc',
-      environment: 'sandbox',
-      rawBody: '{"event_type":"BILLING.SUBSCRIPTION.UPDATED","resource":{"id":"sub-1"}}',
-      providerEventId: 'tx-sub-updated',
-      verify: async () => ({
-        verified: true,
-        transmissionId: 'tx-sub-updated',
-        eventType: 'BILLING.SUBSCRIPTION.UPDATED',
-        resourceId: 'sub-1',
-      }),
+  describe('subscription webhook provider refresh', () => {
+    const providerSubId = 'sub-provider-refresh-1';
+    const providerStart = '2026-05-01T12:00:00.000Z';
+    const providerNextBilling = '2026-06-01T12:00:00.000Z';
+    const providerStateAt = '2026-05-01T12:30:00.000Z';
+
+    async function seedSubscription(store: MemoryPaymentReliabilityStore) {
+      const scope = buildOperationIdempotencyScope({
+        applicationRef: 'test-app',
+        accountRef: 'default',
+        environment: 'sandbox',
+        kind: 'subscription',
+      });
+      const operation = await store.createOperation({
+        idempotencyKey: 'sub-refresh',
+        idempotencyScope: scope,
+        commandFingerprint: 'fp-sub-refresh',
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        kind: 'subscription',
+        subscriptionStatus: 'approval_pending',
+        providerSubscriptionId: providerSubId,
+        providerPlanId: 'PLAN-1',
+      });
+      return store.transitionOperation({
+        operationId: operation.operationId,
+        expectedVersion: operation.version,
+        nextStatus: 'submitted',
+        reason: 'seed',
+      });
+    }
+
+    it('ACTIVATED refreshes and persists billing dates from provider GET', async () => {
+      const store = new MemoryPaymentReliabilityStore();
+      const getSubscription = vi.fn().mockResolvedValue({
+        providerSubscriptionId: providerSubId,
+        providerPlanId: 'PLAN-1',
+        subscriptionStatus: 'active',
+        approvalUrl: null,
+        startTime: providerStart,
+        nextBillingTime: providerNextBilling,
+        lifecycleReason: null,
+        providerSubscriptionStateAt: providerStateAt,
+      });
+      const service = new WebhookProcessingService(store, { getSubscription });
+      await seedSubscription(store);
+
+      const receipt = await service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: JSON.stringify({
+          event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resource: { id: providerSubId, update_time: '1999-01-01T00:00:00Z' },
+        }),
+        providerEventId: 'tx-sub-activated-billing',
+        verify: async () => ({
+          verified: true,
+          transmissionId: 'tx-sub-activated-billing',
+          eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resourceId: providerSubId,
+        }),
+      });
+      expect(receipt.processingStatus).toBe('processed');
+      expect(getSubscription).toHaveBeenCalled();
+
+      const reloaded = await store.findOperationByProviderSubscriptionId(
+        'paypal',
+        'default',
+        'sandbox',
+        providerSubId,
+      );
+      expect(reloaded?.subscriptionStatus).toBe('active');
+      expect(reloaded?.startTime).toBe(providerStart);
+      expect(reloaded?.nextBillingTime).toBe(providerNextBilling);
+      expect(reloaded?.providerSubscriptionStateAt).toBe(providerStateAt);
     });
-    expect(receipt.processingStatus).toBe('unsupported');
+
+    it('UPDATED refreshes billing dates without inventing a lifecycle status', async () => {
+      const store = new MemoryPaymentReliabilityStore();
+      const seeded = await seedSubscription(store);
+      await store.transitionOperation({
+        operationId: seeded.operationId,
+        expectedVersion: seeded.version,
+        nextStatus: 'succeeded',
+        subscriptionStatus: 'active',
+        startTime: '2026-01-01T00:00:00.000Z',
+        nextBillingTime: '2026-02-01T00:00:00.000Z',
+        reason: 'activate',
+      });
+
+      const getSubscription = vi.fn().mockResolvedValue({
+        providerSubscriptionId: providerSubId,
+        providerPlanId: 'PLAN-1',
+        subscriptionStatus: 'active',
+        approvalUrl: null,
+        startTime: providerStart,
+        nextBillingTime: providerNextBilling,
+        lifecycleReason: null,
+        providerSubscriptionStateAt: providerStateAt,
+      });
+      const service = new WebhookProcessingService(store, { getSubscription });
+
+      const receipt = await service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: JSON.stringify({
+          event_type: 'BILLING.SUBSCRIPTION.UPDATED',
+          resource: { id: providerSubId },
+        }),
+        providerEventId: 'tx-sub-updated-billing',
+        verify: async () => ({
+          verified: true,
+          transmissionId: 'tx-sub-updated-billing',
+          eventType: 'BILLING.SUBSCRIPTION.UPDATED',
+          resourceId: providerSubId,
+        }),
+      });
+      expect(receipt.processingStatus).toBe('processed');
+
+      const reloaded = await store.findOperationById(seeded.operationId);
+      expect(reloaded?.subscriptionStatus).toBe('active');
+      expect(reloaded?.startTime).toBe(providerStart);
+      expect(reloaded?.nextBillingTime).toBe(providerNextBilling);
+    });
+
+    it('preserves stored billing dates when provider GET omits them', async () => {
+      const store = new MemoryPaymentReliabilityStore();
+      const existingStart = '2026-03-01T00:00:00.000Z';
+      const existingNextBilling = '2026-04-01T00:00:00.000Z';
+      const seeded = await seedSubscription(store);
+      await store.transitionOperation({
+        operationId: seeded.operationId,
+        expectedVersion: seeded.version,
+        nextStatus: 'succeeded',
+        subscriptionStatus: 'active',
+        startTime: existingStart,
+        nextBillingTime: existingNextBilling,
+        reason: 'activate',
+      });
+
+      const getSubscription = vi.fn().mockResolvedValue({
+        providerSubscriptionId: providerSubId,
+        providerPlanId: 'PLAN-1',
+        subscriptionStatus: 'active',
+        approvalUrl: null,
+        startTime: null,
+        nextBillingTime: null,
+        lifecycleReason: null,
+        providerSubscriptionStateAt: providerStateAt,
+      });
+      const service = new WebhookProcessingService(store, { getSubscription });
+
+      await service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: JSON.stringify({
+          event_type: 'BILLING.SUBSCRIPTION.UPDATED',
+          resource: { id: providerSubId },
+        }),
+        providerEventId: 'tx-sub-updated-preserve',
+        verify: async () => ({
+          verified: true,
+          transmissionId: 'tx-sub-updated-preserve',
+          eventType: 'BILLING.SUBSCRIPTION.UPDATED',
+          resourceId: providerSubId,
+        }),
+      });
+
+      const reloaded = await store.findOperationById(seeded.operationId);
+      expect(reloaded?.startTime).toBe(existingStart);
+      expect(reloaded?.nextBillingTime).toBe(existingNextBilling);
+    });
+
+    it('leaves evidence recoverable when provider GET fails', async () => {
+      const store = new MemoryPaymentReliabilityStore();
+      const seeded = await seedSubscription(store);
+      const before = await store.findOperationById(seeded.operationId);
+
+      const getSubscription = vi
+        .fn()
+        .mockRejectedValue(
+          new PaymentReliabilityError(
+            PAYMENT_RELIABILITY_ERROR.PROVIDER_RETRYABLE,
+            'PayPal subscription lookup unavailable',
+          ),
+        );
+      const service = new WebhookProcessingService(store, { getSubscription });
+
+      const receipt = await service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: JSON.stringify({
+          event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resource: { id: providerSubId },
+        }),
+        providerEventId: 'tx-sub-get-fail',
+        verify: async () => ({
+          verified: true,
+          transmissionId: 'tx-sub-get-fail',
+          eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resourceId: providerSubId,
+        }),
+      });
+      expect(receipt.processingStatus).toBe('pending');
+
+      const after = await store.findOperationById(seeded.operationId);
+      expect(after?.subscriptionStatus).toBe(before?.subscriptionStatus);
+      expect(after?.startTime).toBe(before?.startTime);
+      expect(after?.version).toBe(before?.version);
+    });
+
+    it('ignores stale provider snapshots using GET state timestamps, not event timestamps', async () => {
+      const store = new MemoryPaymentReliabilityStore();
+      const seeded = await seedSubscription(store);
+      const tNew = '2026-06-02T12:00:00.000Z';
+      const tOld = '2026-06-01T12:00:00.000Z';
+      await store.transitionOperation({
+        operationId: seeded.operationId,
+        expectedVersion: seeded.version,
+        nextStatus: 'succeeded',
+        subscriptionStatus: 'active',
+        providerSubscriptionStateAt: tNew,
+        reason: 'seed active watermark',
+      });
+
+      const getSubscription = vi.fn().mockResolvedValue({
+        providerSubscriptionId: providerSubId,
+        providerPlanId: 'PLAN-1',
+        subscriptionStatus: 'suspended',
+        approvalUrl: null,
+        startTime: null,
+        nextBillingTime: null,
+        lifecycleReason: null,
+        providerSubscriptionStateAt: tOld,
+      });
+      const service = new WebhookProcessingService(store, { getSubscription });
+
+      await service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: JSON.stringify({
+          event_type: 'BILLING.SUBSCRIPTION.SUSPENDED',
+          resource: { id: providerSubId, update_time: '2099-01-01T00:00:00Z' },
+        }),
+        providerEventId: 'tx-sub-stale-get',
+        verify: async () => ({
+          verified: true,
+          transmissionId: 'tx-sub-stale-get',
+          eventType: 'BILLING.SUBSCRIPTION.SUSPENDED',
+          resourceId: providerSubId,
+        }),
+      });
+
+      const reloaded = await store.findOperationById(seeded.operationId);
+      expect(reloaded?.subscriptionStatus).toBe('active');
+      expect(readSubscriptionProviderStateWatermark(reloaded)).toBe(tNew);
+    });
+
+    it('rejects provider snapshots with a mismatched plan id and keeps evidence recoverable', async () => {
+      const store = new MemoryPaymentReliabilityStore();
+      const seeded = await seedSubscription(store);
+      const before = await store.findOperationById(seeded.operationId);
+
+      const getSubscription = vi.fn().mockResolvedValue({
+        providerSubscriptionId: providerSubId,
+        providerPlanId: 'PLAN-OTHER',
+        subscriptionStatus: 'active',
+        approvalUrl: null,
+        startTime: providerStart,
+        nextBillingTime: providerNextBilling,
+        lifecycleReason: null,
+        providerSubscriptionStateAt: providerStateAt,
+      });
+      const service = new WebhookProcessingService(store, { getSubscription });
+
+      const receipt = await service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: JSON.stringify({
+          event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resource: { id: providerSubId },
+        }),
+        providerEventId: 'tx-sub-plan-mismatch',
+        verify: async () => ({
+          verified: true,
+          transmissionId: 'tx-sub-plan-mismatch',
+          eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resourceId: providerSubId,
+        }),
+      });
+
+      expect(receipt.processingStatus).toBe('pending');
+      const evidence = await store.findEvidenceByProviderEvent(
+        'paypal',
+        'default',
+        'sandbox',
+        'tx-sub-plan-mismatch',
+      );
+      expect(evidence?.errorCode).toBe(PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH);
+
+      const after = await store.findOperationById(seeded.operationId);
+      expect(after?.providerPlanId).toBe(before?.providerPlanId);
+      expect(after?.subscriptionStatus).toBe(before?.subscriptionStatus);
+      expect(after?.startTime).toBe(before?.startTime);
+      expect(after?.nextBillingTime).toBe(before?.nextBillingTime);
+      expect(after?.version).toBe(before?.version);
+    });
+
+    it('preserves stored plan id when provider GET omits plan id', async () => {
+      const store = new MemoryPaymentReliabilityStore();
+      const seeded = await seedSubscription(store);
+
+      const getSubscription = vi.fn().mockResolvedValue({
+        providerSubscriptionId: providerSubId,
+        providerPlanId: null,
+        subscriptionStatus: 'active',
+        approvalUrl: null,
+        startTime: providerStart,
+        nextBillingTime: providerNextBilling,
+        lifecycleReason: null,
+        providerSubscriptionStateAt: providerStateAt,
+      });
+      const service = new WebhookProcessingService(store, { getSubscription });
+
+      await service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody: JSON.stringify({
+          event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resource: { id: providerSubId },
+        }),
+        providerEventId: 'tx-sub-missing-plan',
+        verify: async () => ({
+          verified: true,
+          transmissionId: 'tx-sub-missing-plan',
+          eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resourceId: providerSubId,
+        }),
+      });
+
+      const reloaded = await store.findOperationById(seeded.operationId);
+      expect(reloaded?.providerPlanId).toBe('PLAN-1');
+      expect(reloaded?.startTime).toBe(providerStart);
+    });
+
+    it('does not reactivate cancelled subscriptions when provider GET reports active', async () => {
+      const store = new MemoryPaymentReliabilityStore();
+      const subScope = buildOperationIdempotencyScope({
+        applicationRef: 'test-app',
+        accountRef: 'default',
+        environment: 'sandbox',
+        kind: 'subscription',
+      });
+      const subscription = await store.createOperation({
+        idempotencyKey: 'sub-terminal-get',
+        idempotencyScope: subScope,
+        commandFingerprint: 'fp-sub',
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        kind: 'subscription',
+        subscriptionStatus: 'cancelled',
+        providerSubscriptionId: 'sub-terminal-get-1',
+      });
+      await store.transitionOperation({
+        operationId: subscription.operationId,
+        expectedVersion: 1,
+        nextStatus: 'failed',
+        reason: 'seed cancelled',
+      });
+
+      const getSubscription = vi.fn().mockResolvedValue({
+        providerSubscriptionId: 'sub-terminal-get-1',
+        providerPlanId: 'PLAN-1',
+        subscriptionStatus: 'active',
+        approvalUrl: null,
+        startTime: null,
+        nextBillingTime: null,
+        lifecycleReason: null,
+        providerSubscriptionStateAt: '2026-08-01T00:00:00.000Z',
+      });
+      const service = new WebhookProcessingService(store, { getSubscription });
+
+      await service.receiveWebhook({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        rawBody:
+          '{"event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"sub-terminal-get-1"}}',
+        providerEventId: 'tx-sub-terminal-get',
+        verify: async () => ({
+          verified: true,
+          transmissionId: 'tx-sub-terminal-get',
+          eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
+          resourceId: 'sub-terminal-get-1',
+        }),
+      });
+
+      expect(
+        (
+          await store.findOperationByProviderSubscriptionId(
+            'paypal',
+            'default',
+            'sandbox',
+            'sub-terminal-get-1',
+          )
+        )?.subscriptionStatus,
+      ).toBe('cancelled');
+    });
   });
 
   it('correlates PayPal payout webhooks when resource.id is a WH envelope id', async () => {
@@ -616,7 +1128,7 @@ describe('WebhookProcessingService', () => {
     const batch = await store.createOperation({
       idempotencyKey: 'batch-paypal',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_batch',
@@ -624,7 +1136,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-batch',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_batch',
       payoutStatus: 'accepted',
@@ -634,7 +1146,7 @@ describe('WebhookProcessingService', () => {
     const item = await store.createOperation({
       idempotencyKey: 'item-paypal',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_item',
@@ -642,7 +1154,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-item',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_item',
       parentOperationId: batch.operationId,
@@ -671,7 +1183,7 @@ describe('WebhookProcessingService', () => {
     const receipt = await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody: unclaimedPayload,
       providerEventId: 'tx-unclaimed',
@@ -696,7 +1208,7 @@ describe('WebhookProcessingService', () => {
     const batch = await store.createOperation({
       idempotencyKey: 'batch-stale',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_batch',
@@ -704,7 +1216,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-batch',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_batch',
       providerPayoutBatchId: 'QJBZAQ9NCX6X4',
@@ -712,7 +1224,7 @@ describe('WebhookProcessingService', () => {
     const item = await store.createOperation({
       idempotencyKey: 'item-stale',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_item',
@@ -720,7 +1232,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-item',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_item',
       parentOperationId: batch.operationId,
@@ -750,7 +1262,7 @@ describe('WebhookProcessingService', () => {
     const receipt = await service.receiveWebhook({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       rawBody: stalePayload,
       providerEventId: 'tx-stale',
@@ -773,7 +1285,7 @@ describe('WebhookProcessingService', () => {
     const batch = await store.createOperation({
       idempotencyKey: 'batch-replay',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_batch',
@@ -781,7 +1293,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-batch',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_batch',
       providerPayoutBatchId: 'QJBZAQ9NCX6X4',
@@ -789,7 +1301,7 @@ describe('WebhookProcessingService', () => {
     const evidence = await store.insertEvidence({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       evidenceKind: 'webhook',
       providerEventId: 'tx-replay',
@@ -827,7 +1339,7 @@ describe('WebhookProcessingService', () => {
     const store = new MemoryPaymentReliabilityStore();
     const service = new WebhookProcessingService(store);
     const subScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'subscription',
@@ -838,7 +1350,7 @@ describe('WebhookProcessingService', () => {
       commandFingerprint: 'fp-sub',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'subscription',
       subscriptionStatus: 'cancelled',
@@ -851,23 +1363,21 @@ describe('WebhookProcessingService', () => {
       reason: 'seed cancelled',
     });
 
-    await expect(
-      service.receiveWebhook({
-        providerCode: 'paypal',
-        accountRef: 'default',
-        applicationRef: 'edc',
-        environment: 'sandbox',
-        rawBody:
-          '{"event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"sub-terminal-1"}}',
-        providerEventId: 'tx-sub-reactivate',
-        verify: async () => ({
-          verified: true,
-          transmissionId: 'tx-sub-reactivate',
-          eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
-          resourceId: 'sub-terminal-1',
-        }),
+    const result = await service.receiveWebhook({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      rawBody: '{"event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"sub-terminal-1"}}',
+      providerEventId: 'tx-sub-reactivate',
+      verify: async () => ({
+        verified: true,
+        transmissionId: 'tx-sub-reactivate',
+        eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
+        resourceId: 'sub-terminal-1',
       }),
-    ).rejects.toThrow(/cannot reactivate/);
+    });
+    expect(result.duplicate).toBe(false);
 
     expect(
       (

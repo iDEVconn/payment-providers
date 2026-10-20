@@ -6,6 +6,8 @@ import {
 } from '@idevconn/payment';
 import {
   assertCapabilityReady,
+  resolvePaymentRuntime,
+  type PaymentProviderConfig,
   type ResolvedPaymentRuntime,
   ScopedTokenCacheRegistry,
 } from '../../core/index';
@@ -15,6 +17,19 @@ import type {
   PaymentProviderDescriptor,
 } from '../../contracts/index';
 import { UnconfiguredFakeCheckoutStrategy } from './unconfigured-fake-checkout.strategy';
+
+export function createPaypalPaymentProvider(input: {
+  config: PaymentProviderConfig;
+  nodeEnv?: string;
+  executionStatus?: PaymentExecutionStatus;
+}): PaypalPaymentProvider {
+  const runtime = resolvePaymentRuntime({
+    config: input.config,
+    nodeEnv: input.nodeEnv,
+    executionStatus: input.executionStatus,
+  });
+  return new PaypalPaymentProvider(runtime, input.executionStatus);
+}
 
 export class PaypalPaymentProvider {
   private readonly checkoutStrategies = new ScopedTokenCacheRegistry<PaymentStrategy>();

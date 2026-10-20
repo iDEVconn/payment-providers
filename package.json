@@ -13,7 +13,7 @@
   "homepage": "https://github.com/iDEVconn/payment-providers#readme",
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": ">=22.12.0"
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",

@@ -1,13 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import { evaluateCapabilities } from '../../../core/index';
+import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
 import { buildPaypalSellerOnboardingExecutor } from '../paypal-seller-onboarding-executor.factory';
 import type { ResolvedPaymentRuntime } from '../../../core/index';
 
 const context = {
   providerCode: 'paypal',
   accountRef: 'default',
-  applicationRef: 'edc',
+  applicationRef: 'test-app',
   environment: 'sandbox' as const,
+};
+
+const partnerConfig = {
+  partnerMerchantId: 'partner',
+  partnerAttributionId: 'bn',
+  returnUrl: 'https://example.com/return',
+  products: ['EXPRESS_CHECKOUT'],
+  features: ['PAYMENT', 'REFUND'],
 };
 
 function runtime(mode: 'fake' | 'live-provider'): ResolvedPaymentRuntime {
@@ -20,7 +29,7 @@ function runtime(mode: 'fake' | 'live-provider'): ResolvedPaymentRuntime {
         : undefined,
     descriptor: {
       ...context,
-      capabilities: evaluateCapabilities(() => undefined, context),
+      capabilities: evaluateCapabilities(sandboxPaypalProviderConfig({}), context),
     },
   } as ResolvedPaymentRuntime;
 }
@@ -30,21 +39,24 @@ describe('buildPaypalSellerOnboardingExecutor', () => {
     expect(() =>
       buildPaypalSellerOnboardingExecutor({
         runtime: runtime('fake'),
+        partnerConfig,
         nodeEnv: 'development',
-        envPath: 'apps/microservices/payment/.env',
-        get: () => undefined,
       }),
     ).not.toThrow();
   });
 
-  it('fails closed in production when enabled without partner configuration', () => {
-    expect(() =>
-      buildPaypalSellerOnboardingExecutor({
-        runtime: runtime('live-provider'),
-        nodeEnv: 'production',
-        envPath: 'apps/microservices/payment/.env',
-        get: (key) => (key === 'PAYPAL_SELLER_ONBOARDING_ENABLED' ? 'true' : undefined),
-      }),
-    ).toThrow(/seller onboarding configuration missing/);
+  it('returns a blocked executor in production when enabled without partner configuration', () => {
+    const executor = buildPaypalSellerOnboardingExecutor({
+      runtime: runtime('live-provider'),
+      partnerConfig: {
+        partnerMerchantId: 'unconfigured',
+        partnerAttributionId: 'unconfigured',
+        returnUrl: 'https://invalid.local',
+        products: ['EXPRESS_CHECKOUT'],
+        features: ['PAYMENT'],
+      },
+      nodeEnv: 'production',
+    });
+    expect(executor).toBeDefined();
   });
 });

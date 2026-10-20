@@ -1,11 +1,9 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const packageRoot = join(dirname(fileURLToPath(import.meta.url)), '../../../..');
+const moduleRoot = join(__dirname, '../../../..');
 
-/** Package-local marketplace sources (gateway service stays in the host app). */
 const marketplaceSources = [
   'src/core/lib/marketplace-lifecycle-service.ts',
   'src/core/lib/marketplace-seller-precondition.ts',
@@ -26,10 +24,8 @@ const forbiddenImportPatterns = [
 ];
 
 describe('marketplace import boundary', () => {
-  it.each(marketplaceSources)('keeps %s isolated from EDC funding modules', (relativePath) => {
-    const absolutePath = join(packageRoot, relativePath);
-    expect(existsSync(absolutePath), `missing ${relativePath}`).toBe(true);
-    const source = readFileSync(absolutePath, 'utf8');
+  it.each(marketplaceSources)('keeps %s isolated from application domain modules', (relativePath) => {
+    const source = readFileSync(join(moduleRoot, relativePath), 'utf8');
     for (const pattern of forbiddenImportPatterns) {
       expect(source).not.toMatch(pattern);
     }

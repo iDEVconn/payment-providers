@@ -3,7 +3,7 @@ import { buildOperationIdempotencyScope } from '../operation-idempotency';
 import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
 
 const scope = buildOperationIdempotencyScope({
-  applicationRef: 'edc',
+  applicationRef: 'test-app',
   accountRef: 'default',
   environment: 'sandbox',
   kind: 'checkout',
@@ -18,7 +18,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-1',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'checkout',
     });
@@ -28,7 +28,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-1',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'checkout',
     });
@@ -43,7 +43,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-1',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'checkout',
     });
@@ -54,7 +54,7 @@ describe('MemoryPaymentReliabilityStore', () => {
         commandFingerprint: 'fp-2',
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         kind: 'checkout',
       }),
@@ -66,7 +66,7 @@ describe('MemoryPaymentReliabilityStore', () => {
     await store.insertEvidence({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       evidenceKind: 'webhook',
       providerEventId: 'evt-1',
@@ -77,7 +77,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       store.insertEvidence({
         providerCode: 'paypal',
         accountRef: 'default',
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         environment: 'sandbox',
         evidenceKind: 'webhook',
         providerEventId: 'evt-1',
@@ -92,7 +92,7 @@ describe('MemoryPaymentReliabilityStore', () => {
     const evidence = await store.insertEvidence({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       evidenceKind: 'webhook',
       providerEventId: 'evt-claim',
@@ -140,7 +140,7 @@ describe('MemoryPaymentReliabilityStore', () => {
   it('finds subscription operations by provider product, plan, and subscription ids with environment isolation', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const productScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'catalog_product',
@@ -151,13 +151,13 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-prod',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'catalog_product',
       providerProductId: 'PROD-LOOKUP-1',
     });
     const planScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'billing_plan',
@@ -168,7 +168,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-plan',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'billing_plan',
       parentOperationId: product.operationId,
@@ -176,7 +176,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       providerPlanId: 'PLAN-LOOKUP-1',
     });
     const subScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'subscription',
@@ -187,7 +187,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-sub',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'subscription',
       parentOperationId: plan.operationId,
@@ -227,12 +227,12 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-a',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'subscription',
     });
     const planScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'billing_plan',
@@ -243,7 +243,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-b',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'billing_plan',
     });
@@ -270,7 +270,7 @@ describe('MemoryPaymentReliabilityStore', () => {
   it('lists uncertain subscription operations for reconciliation', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const subScope = buildOperationIdempotencyScope({
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       accountRef: 'default',
       environment: 'sandbox',
       kind: 'subscription',
@@ -281,7 +281,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-sub',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'subscription',
       providerSubscriptionId: 'SUB-UNCERTAIN-1',
@@ -305,7 +305,7 @@ describe('MemoryPaymentReliabilityStore', () => {
       commandFingerprint: 'fp-1',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'checkout',
       providerReferenceId: 'order-1',
@@ -331,7 +331,7 @@ describe('MemoryPaymentReliabilityStore', () => {
     const evidence = await store.insertEvidence({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       evidenceKind: 'webhook',
       providerEventId: 'evt-error-clear',

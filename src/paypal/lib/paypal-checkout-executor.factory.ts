@@ -1,11 +1,11 @@
-import { formatEnvBanner, missingEnv } from '../../core/lib/host-env-banner';
+import { PaymentConfigurationError } from '../../core/lib/payment-configuration-error';
 import type { PaymentStrategy } from '@idevconn/payment';
 import type { PaymentExecutionStatus } from '../../contracts/index';
 import type { ResolvedPaymentRuntime } from '../../core/index';
 import {
   blockedHttpClient,
   blockedOAuthGetter,
-  isExecutionModeNetworkBlocked,
+  shouldRejectProviderNetworkCalls,
 } from './build-reject-only-executor';
 import { FakePaypalOrdersHttpClient } from './fake-paypal-orders-http-client';
 import {
@@ -19,7 +19,6 @@ export type BuildPaypalCheckoutExecutorInput = {
   runtime: ResolvedPaymentRuntime;
   strategyFactory: () => PaymentStrategy;
   nodeEnv?: string;
-  envPath: string;
   executionStatus?: PaymentExecutionStatus;
   /** Explicit test/dev simulation only. Never set in production composition. */
   forceFakeHttp?: boolean;
@@ -28,10 +27,10 @@ export type BuildPaypalCheckoutExecutorInput = {
 export function buildPaypalCheckoutExecutor(
   input: BuildPaypalCheckoutExecutorInput,
 ): PaypalCheckoutExecutor {
-  const { runtime, strategyFactory, nodeEnv, envPath, forceFakeHttp, executionStatus } = input;
+  const { runtime, strategyFactory, nodeEnv, forceFakeHttp, executionStatus } = input;
   const isProduction = nodeEnv === 'production';
 
-  if (isExecutionModeNetworkBlocked(executionStatus)) {
+  if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
     return new PaypalCheckoutExecutor(
       runtime,
       strategyFactory,
@@ -42,14 +41,9 @@ export function buildPaypalCheckoutExecutor(
 
   if (forceFakeHttp) {
     if (isProduction) {
-      throw new Error(
-        formatEnvBanner({
-          service: 'payment MS',
-          provider: runtime.context.providerCode,
-          missing: ['PRODUCTION_FAKE_HTTP_FORBIDDEN'],
-          envPath,
-          headline: '⚠  payment MS — fake PayPal HTTP is forbidden in production',
-        }),
+      throw new PaymentConfigurationError(
+        'Fake PayPal HTTP is forbidden in production',
+        ['forceFakeHttp'],
       );
     }
     return new PaypalCheckoutExecutor(
@@ -67,45 +61,13 @@ export function buildPaypalCheckoutExecutor(
     );
   }
 
-  if (runtime.mode === 'fake') {
-    if (isProduction) {
-      const missing = missingEnv(() => undefined, ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET']);
-      throw new Error(
-        formatEnvBanner({
-          service: 'payment MS',
-          provider: runtime.context.providerCode,
-          missing,
-          envPath,
-          headline: '⚠  payment MS — PayPal credentials missing (startup aborted)',
-        }),
-      );
-    }
+  const credentials = runtime.checkoutCredentials;
+  if (!credentials) {
     return new PaypalCheckoutExecutor(
       runtime,
       strategyFactory,
-      new FakePaypalOrdersHttpClient(),
-      async () => {
-        throw {
-          code: 'PROVIDER_AUTH_FAILURE',
-          message: 'PayPal direct HTTP is unavailable in unconfigured development mode',
-          retryable: false,
-          uncertain: false,
-        };
-      },
-    );
-  }
-
-  const credentials = runtime.checkoutCredentials;
-  if (!credentials) {
-    const missing = missingEnv(() => undefined, ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET']);
-    throw new Error(
-      formatEnvBanner({
-        service: 'payment MS',
-        provider: runtime.context.providerCode,
-        missing,
-        envPath,
-        headline: '⚠  payment MS — PayPal credentials missing (startup aborted)',
-      }),
+      blockedHttpClient(),
+      blockedOAuthGetter(),
     );
   }
 

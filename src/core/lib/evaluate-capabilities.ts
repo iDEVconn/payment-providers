@@ -1,7 +1,6 @@
-import { missingEnv } from './host-env-banner';
 import type { CapabilityAvailability, PaymentAccountContext } from '../../contracts/index';
 import { CAPABILITY_DEFINITIONS, type CapabilityDefinition } from './capability-definitions';
-import { type EnvGetter, readEnvEnabled } from './env-access';
+import type { PaymentProviderConfig } from './payment-provider-config';
 
 function unavailableReasonFor(
   definition: CapabilityDefinition,
@@ -33,28 +32,82 @@ function evaluateEligible(
   return 'unknown';
 }
 
-function evaluateConfigured(
+function flagKeyForCapability(
+  capability: CapabilityDefinition['capability'],
+): keyof NonNullable<PaymentProviderConfig['capabilityFlags']> | null {
+  if (capability === 'marketplace_checkout') {
+    return 'marketplace_checkout';
+  }
+  if (
+    capability === 'checkout' ||
+    capability === 'refund' ||
+    capability === 'payout' ||
+    capability === 'subscription' ||
+    capability === 'seller_onboarding'
+  ) {
+    return capability;
+  }
+  return null;
+}
+
+function isCapabilityEnabled(
   definition: CapabilityDefinition,
-  enabled: boolean,
-  get: EnvGetter,
+  config: PaymentProviderConfig,
 ): boolean {
-  if (!enabled) {
+  const key = flagKeyForCapability(definition.capability);
+  if (key && config.capabilityFlags?.[key] !== undefined) {
+    return config.capabilityFlags[key] === true;
+  }
+  return definition.defaultEnabled;
+}
+
+function hasCheckoutCredentials(config: PaymentProviderConfig): boolean {
+  return Boolean(
+    config.credentials?.clientId?.trim() && config.credentials?.clientSecret?.trim(),
+  );
+}
+
+function evaluateConfigured(definition: CapabilityDefinition, config: PaymentProviderConfig): boolean {
+  if (!isCapabilityEnabled(definition, config)) {
     return true;
   }
   if (definition.requiredEnvKeys.length === 0) {
     return true;
   }
-  return missingEnv(get, definition.requiredEnvKeys).length === 0;
+
+  switch (definition.capability) {
+    case 'checkout':
+    case 'refund':
+    case 'payout':
+    case 'subscription':
+      return hasCheckoutCredentials(config);
+    case 'seller_onboarding':
+      return (
+        hasCheckoutCredentials(config) &&
+        Boolean(
+          config.partner?.merchantId?.trim() &&
+            config.partner?.attributionId?.trim() &&
+            config.partner?.sellerOnboardingReturnUrl?.trim(),
+        )
+      );
+    case 'marketplace_checkout':
+      return (
+        hasCheckoutCredentials(config) &&
+        Boolean(config.partner?.merchantId?.trim() && config.partner?.attributionId?.trim())
+      );
+    default:
+      return true;
+  }
 }
 
 export function evaluateCapabilities(
-  get: EnvGetter,
+  config: PaymentProviderConfig,
   context: PaymentAccountContext,
 ): CapabilityAvailability[] {
   void context;
   return CAPABILITY_DEFINITIONS.map((definition) => {
-    const enabled = readEnvEnabled(get, definition.enabledEnvKey, definition.defaultEnabled);
-    const configured = evaluateConfigured(definition, enabled, get);
+    const enabled = isCapabilityEnabled(definition, config);
+    const configured = evaluateConfigured(definition, config);
     const implemented = definition.implemented;
     const eligible = evaluateEligible(definition, enabled, configured);
     const ready = implemented && enabled && configured && eligible !== false;

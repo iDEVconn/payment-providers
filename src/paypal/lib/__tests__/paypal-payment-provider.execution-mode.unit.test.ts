@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { resolvePaymentRuntime } from '../../../core/index';
+import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
 import { PaypalPaymentProvider } from '../paypal-payment-provider';
 
 describe('PaypalPaymentProvider execution mode readiness', () => {
   it('does not report PayPal capabilities ready during simulation', () => {
     const runtime = resolvePaymentRuntime({
-      get: (key) =>
-        key === 'PAYPAL_CLIENT_ID' || key === 'PAYPAL_CLIENT_SECRET' ? 'set' : undefined,
+      config: sandboxPaypalProviderConfig({
+        credentials: { clientId: 'set', clientSecret: 'set' },
+      }),
       nodeEnv: 'development',
       executionStatus: {
         executionMode: 'simulation',

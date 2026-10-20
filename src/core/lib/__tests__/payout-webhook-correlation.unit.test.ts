@@ -63,7 +63,7 @@ describe('payout-webhook-correlation', () => {
     const batch = await store.createOperation({
       idempotencyKey: 'batch-1',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_batch',
@@ -71,7 +71,7 @@ describe('payout-webhook-correlation', () => {
       commandFingerprint: 'fp',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_batch',
       providerPayoutBatchId: 'QJBZAQ9NCX6X4',
@@ -81,7 +81,7 @@ describe('payout-webhook-correlation', () => {
     const correlation = await correlatePayoutOperation(store, {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       eventType: 'PAYMENT.PAYOUTSBATCH.SUCCESS',
       resourceId: 'WH-BATCH',
@@ -135,7 +135,7 @@ describe('payout-webhook-correlation', () => {
     const batch = await store.createOperation({
       idempotencyKey: 'batch-hosted',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_batch',
@@ -143,7 +143,7 @@ describe('payout-webhook-correlation', () => {
       commandFingerprint: 'fp',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_batch',
       providerPayoutBatchId: 'QJBZAQ9NCX6X4',
@@ -152,7 +152,7 @@ describe('payout-webhook-correlation', () => {
     const item = await store.createOperation({
       idempotencyKey: 'item-hosted',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_item',
@@ -160,7 +160,7 @@ describe('payout-webhook-correlation', () => {
       commandFingerprint: 'fp-item',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_item',
       parentOperationId: batch.operationId,
@@ -173,7 +173,7 @@ describe('payout-webhook-correlation', () => {
     const correlation = await correlatePayoutOperation(store, {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       eventType: 'PAYMENT.PAYOUTS-ITEM.UNCLAIMED',
       resourceId: 'WH-UNCLAIMED',
@@ -201,7 +201,7 @@ describe('payout-webhook-correlation', () => {
     const batch = await store.createOperation({
       idempotencyKey: 'batch-2',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_batch',
@@ -209,7 +209,7 @@ describe('payout-webhook-correlation', () => {
       commandFingerprint: 'fp',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_batch',
       providerPayoutBatchId: 'QJBZAQ9NCX6X4',
@@ -217,7 +217,7 @@ describe('payout-webhook-correlation', () => {
     const item = await store.createOperation({
       idempotencyKey: 'item-1',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_item',
@@ -225,7 +225,7 @@ describe('payout-webhook-correlation', () => {
       commandFingerprint: 'fp-item',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_item',
       parentOperationId: batch.operationId,
@@ -238,7 +238,7 @@ describe('payout-webhook-correlation', () => {
     const correlation = await correlatePayoutOperation(store, {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       eventType: 'PAYMENT.PAYOUTS-ITEM.UNCLAIMED',
       resourceId: 'WH-ITEM',
@@ -265,7 +265,7 @@ describe('payout-webhook-correlation', () => {
     await store.createOperation({
       idempotencyKey: 'item-bad',
       idempotencyScope: buildOperationIdempotencyScope({
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
         accountRef: 'default',
         environment: 'sandbox',
         kind: 'payout_item',
@@ -273,7 +273,7 @@ describe('payout-webhook-correlation', () => {
       commandFingerprint: 'fp-item',
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       kind: 'payout_item',
       senderItemId: 'sender_item_1',
@@ -305,7 +305,7 @@ describe('payout-webhook-correlation', () => {
     }
     expect(
       await validatePayoutEvidenceMatch(store, operation, parsed, {
-        applicationRef: 'edc',
+        applicationRef: 'test-app',
       }),
     ).toBe(false);
   });

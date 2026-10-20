@@ -9,13 +9,13 @@ function runtime(): ResolvedPaymentRuntime {
     context: {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
     },
     descriptor: {
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       capabilities: [
         {
@@ -64,7 +64,7 @@ describe('PaypalCheckoutExecutor', () => {
     const created = await executor.createOrder({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerRequestId: 'advertiser-funding-create:fund-1',
       amount: { currency: 'USD', amountMinor: '10700' },
@@ -131,7 +131,7 @@ describe('PaypalCheckoutExecutor', () => {
     await executor.getOrder({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerOrderId: 'ORDER-GET',
     });
@@ -175,7 +175,7 @@ describe('PaypalCheckoutExecutor', () => {
     const order = await executor.getOrder({
       providerCode: 'paypal',
       accountRef: 'default',
-      applicationRef: 'edc',
+      applicationRef: 'test-app',
       environment: 'sandbox',
       providerOrderId: 'ORDER-CAPTURE-AMOUNT',
     });

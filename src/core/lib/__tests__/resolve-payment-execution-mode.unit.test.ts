@@ -1,123 +1,109 @@
 import { describe, expect, it } from 'vitest';
+import type { NormalizedDeployedPaymentConfig } from '../../../contracts/index';
 import { resolvePaymentExecutionMode } from '../resolve-payment-execution-mode';
 
+function base(
+  overrides: Partial<NormalizedDeployedPaymentConfig> = {},
+): NormalizedDeployedPaymentConfig {
+  return {
+    nodeEnv: 'development',
+    providerEnvironment: null,
+    providerEnvironmentInvalid: false,
+    financialSimulation: false,
+    legacyPaymentExecutionMode: null,
+    legacyPaymentDeploymentEnvironment: null,
+    legacyFundingSimulation: null,
+    ...overrides,
+  };
+}
+
 describe('resolvePaymentExecutionMode', () => {
-  it('allows simulation on local', () => {
-    const status = resolvePaymentExecutionMode({
-      paymentExecutionMode: 'simulation',
-      paymentDeploymentEnvironment: 'local',
-    });
+  it('configures sandbox from PAYPAL_ENVIRONMENT', () => {
+    const status = resolvePaymentExecutionMode(base({ providerEnvironment: 'sandbox' }));
     expect(status.runtimeState).toBe('configured');
-    expect(status.executionMode).toBe('simulation');
-    expect(status.simulatedExecutionEnabled).toBe(true);
-    expect(status.providerCallsEnabled).toBe(false);
-  });
-
-  it('forbids live on local', () => {
-    const status = resolvePaymentExecutionMode({
-      paymentExecutionMode: 'live',
-      paymentDeploymentEnvironment: 'local',
-    });
-    expect(status.runtimeState).toBe('forbidden');
-    expect(status.issues[0]?.code).toBe('DEPLOYMENT_MODE_FORBIDDEN');
-  });
-
-  it('allows only simulation on ci', () => {
-    expect(
-      resolvePaymentExecutionMode({
-        paymentExecutionMode: 'simulation',
-        paymentDeploymentEnvironment: 'ci',
-      }).runtimeState,
-    ).toBe('configured');
-    expect(
-      resolvePaymentExecutionMode({
-        paymentExecutionMode: 'sandbox',
-        paymentDeploymentEnvironment: 'ci',
-      }).runtimeState,
-    ).toBe('forbidden');
-  });
-
-  it('allows only live on live deployment', () => {
-    const status = resolvePaymentExecutionMode({
-      paymentExecutionMode: 'live',
-      paymentDeploymentEnvironment: 'live',
-    });
-    expect(status.runtimeState).toBe('configured');
+    expect(status.executionMode).toBe('sandbox');
+    expect(status.deploymentEnvironment).toBe('local');
     expect(status.providerCallsEnabled).toBe(true);
+    expect(status.source).toBe('provider-environment');
   });
 
-  it('fails closed when only the legacy alias is present', () => {
-    const status = resolvePaymentExecutionMode({
-      fundingSimulation: 'true',
-      paymentDeploymentEnvironment: 'local',
-    });
-    expect(status.runtimeState).toBe('unconfigured');
-    expect(status.source).toBe('unconfigured');
-    expect(status.executionMode).toBe(null);
-    expect(status.issues[0]?.code).toBe('MISSING_EXECUTION_MODE');
+  it('configures live in production with staging deployment for sandbox', () => {
+    const status = resolvePaymentExecutionMode(
+      base({ nodeEnv: 'production', providerEnvironment: 'live' }),
+    );
+    expect(status.runtimeState).toBe('configured');
+    expect(status.executionMode).toBe('live');
+    expect(status.deploymentEnvironment).toBe('live');
   });
 
-  it('ignores leftover legacy alias when explicit mode is set', () => {
-    const sandbox = resolvePaymentExecutionMode({
-      paymentExecutionMode: 'sandbox',
-      paymentDeploymentEnvironment: 'local',
-      fundingSimulation: 'true',
-    });
-    expect(sandbox.runtimeState).toBe('configured');
-    expect(sandbox.executionMode).toBe('sandbox');
-    expect(sandbox.issues).toEqual([]);
-
-    const simulation = resolvePaymentExecutionMode({
-      paymentExecutionMode: 'simulation',
-      paymentDeploymentEnvironment: 'local',
-      fundingSimulation: 'true',
-    });
-    expect(simulation.runtimeState).toBe('configured');
-    expect(simulation.executionMode).toBe('simulation');
-    expect(simulation.simulatedExecutionEnabled).toBe(true);
-    expect(simulation.issues).toEqual([]);
+  it('forbids missing provider environment', () => {
+    const status = resolvePaymentExecutionMode(base());
+    expect(status.runtimeState).toBe('forbidden');
+    expect(status.issues[0]?.code).toBe('MISSING_PROVIDER_ENVIRONMENT');
   });
 
-  it('does not treat alias false as overriding explicit mode', () => {
-    const status = resolvePaymentExecutionMode({
-      paymentExecutionMode: 'simulation',
-      paymentDeploymentEnvironment: 'local',
-      fundingSimulation: 'false',
-    });
+  it('forbids invalid provider environment', () => {
+    const status = resolvePaymentExecutionMode(
+      base({ providerEnvironment: null, providerEnvironmentInvalid: true }),
+    );
+    expect(status.issues[0]?.code).toBe('INVALID_PROVIDER_ENVIRONMENT');
+  });
+
+  it('allows explicit test simulation outside production', () => {
+    const status = resolvePaymentExecutionMode(base({ financialSimulation: true }));
     expect(status.runtimeState).toBe('configured');
     expect(status.executionMode).toBe('simulation');
+    expect(status.deploymentEnvironment).toBe('ci');
+    expect(status.simulatedExecutionEnabled).toBe(true);
+    expect(status.source).toBe('test-simulation');
   });
 
-  it('returns unconfigured when mode and alias are absent', () => {
-    const status = resolvePaymentExecutionMode({
-      paymentDeploymentEnvironment: 'local',
-    });
-    expect(status.runtimeState).toBe('unconfigured');
-    expect(status.source).toBe('unconfigured');
-    expect(status.issues[0]?.code).toBe('MISSING_EXECUTION_MODE');
+  it('forbids test simulation in production', () => {
+    const status = resolvePaymentExecutionMode(
+      base({ nodeEnv: 'production', financialSimulation: true }),
+    );
+    expect(status.runtimeState).toBe('forbidden');
+    expect(status.issues[0]?.code).toBe('SIMULATION_FORBIDDEN_IN_PRODUCTION');
   });
 
-  it('ignores credentials for mode selection', () => {
-    const status = resolvePaymentExecutionMode({
-      paymentDeploymentEnvironment: 'local',
-      paymentExecutionMode: 'simulation',
-      fundingSimulation: undefined,
-    });
-    expect(status.executionMode).toBe('simulation');
+  it('reports legacy alias conflict when PAYMENT_EXECUTION_MODE=simulation is set', () => {
+    const status = resolvePaymentExecutionMode(
+      base({
+        providerEnvironment: 'sandbox',
+        legacyPaymentExecutionMode: 'simulation',
+      }),
+    );
+    expect(status.runtimeState).toBe('conflict');
+    expect(status.issues.some((i) => i.code === 'LEGACY_ALIAS_CONFLICT')).toBe(true);
   });
 
-  it('fails closed on invalid deployment and mode strings', () => {
-    expect(
-      resolvePaymentExecutionMode({
-        paymentDeploymentEnvironment: 'prod',
-        paymentExecutionMode: 'simulation',
-      }).runtimeState,
-    ).toBe('forbidden');
-    expect(
-      resolvePaymentExecutionMode({
-        paymentDeploymentEnvironment: 'local',
-        paymentExecutionMode: 'fake',
-      }).runtimeState,
-    ).toBe('conflict');
+  it('reports mismatch when legacy mode disagrees with PAYPAL_ENVIRONMENT', () => {
+    const status = resolvePaymentExecutionMode(
+      base({
+        providerEnvironment: 'sandbox',
+        legacyPaymentExecutionMode: 'live',
+      }),
+    );
+    expect(status.runtimeState).toBe('conflict');
+    expect(status.issues.some((i) => i.code === 'PAYPAL_ENVIRONMENT_MISMATCH')).toBe(true);
+  });
+
+  it('reports legacy conflict when FUNDING_SIMULATION is set', () => {
+    const status = resolvePaymentExecutionMode(
+      base({
+        providerEnvironment: 'sandbox',
+        legacyFundingSimulation: 'true',
+      }),
+    );
+    expect(status.runtimeState).toBe('conflict');
+    expect(status.issues.some((i) => i.code === 'LEGACY_ALIAS_CONFLICT')).toBe(true);
+  });
+
+  it('reports legacy conflict for test simulation when FUNDING_SIMULATION is set', () => {
+    const status = resolvePaymentExecutionMode(
+      base({ financialSimulation: true, legacyFundingSimulation: 'true' }),
+    );
+    expect(status.runtimeState).toBe('conflict');
+    expect(status.issues.some((i) => i.code === 'LEGACY_ALIAS_CONFLICT')).toBe(true);
   });
 });

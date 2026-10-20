@@ -1,5 +1,6 @@
 import { PaymentError, type OrderResult, type PaymentStrategy } from '@idevconn/payment';
 import {
+  PAYMENT_CAPABILITY_UNAVAILABLE,
   PAYMENT_RELIABILITY_ERROR,
   type ExecuteCaptureCheckoutOrderRequest,
   type ExecuteCaptureCheckoutOrderResult,
@@ -28,6 +29,10 @@ import {
 } from './paypal-checkout-order-parsing';
 import type { PaypalOrdersHttpClient } from './paypal-orders-http-client';
 import { UnconfiguredFakeCheckoutStrategy } from './unconfigured-fake-checkout.strategy';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
 
 function majorToMinor(value: string, currency: string): string {
   const [whole = '0', fraction = ''] = value.split('.');
@@ -461,10 +466,14 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
       await promise;
       throw new Error('Unexpected success from unconfigured fake');
     } catch (error) {
+      if (isRecord(error) && error['code'] === PAYMENT_CAPABILITY_UNAVAILABLE) {
+        throw error;
+      }
       if (error instanceof PaymentError) {
         throw {
           code: PAYMENT_RELIABILITY_ERROR.PROVIDER_AUTH_FAILURE,
-          message: error.message,
+          message: 'Payment provider rejected authentication',
+          causeCode: 'PROVIDER_AUTH_REJECTED',
           retryable: false,
           uncertain: false,
         };

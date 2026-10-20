@@ -6,6 +6,8 @@ import type {
 
 /** Test/dev boundary. Never treat as Sandbox or Live provider evidence. */
 export class FakePaypalSubscriptionHttpClient implements PaypalSubscriptionHttpClient {
+  private subscriptionStatusById = new Map<string, string>();
+
   async request(input: PaypalSubscriptionHttpRequest): Promise<PaypalSubscriptionHttpResponse> {
     if (input.method === 'POST' && input.path.endsWith('/products')) {
       return {
@@ -64,10 +66,12 @@ export class FakePaypalSubscriptionHttpClient implements PaypalSubscriptionHttpC
       };
     }
     if (input.method === 'POST' && input.path.endsWith('/subscriptions')) {
+      const subscriptionId = 'FAKE-SUB-1';
+      this.subscriptionStatusById.set(subscriptionId, 'APPROVAL_PENDING');
       return {
         status: 201,
         body: {
-          id: 'FAKE-SUB-1',
+          id: subscriptionId,
           plan_id: 'FAKE-PLAN-1',
           status: 'APPROVAL_PENDING',
           links: [{ rel: 'approve', href: 'https://example.test/approve' }],
@@ -76,12 +80,15 @@ export class FakePaypalSubscriptionHttpClient implements PaypalSubscriptionHttpC
       };
     }
     if (input.method === 'GET' && input.path.includes('/subscriptions/')) {
+      const subscriptionId = input.path.split('/').pop() ?? 'FAKE-SUB-1';
+      const status = this.subscriptionStatusById.get(subscriptionId) ?? 'ACTIVE';
       return {
         status: 200,
         body: {
-          id: input.path.split('/').pop(),
+          id: subscriptionId,
           plan_id: 'FAKE-PLAN-1',
-          status: 'ACTIVE',
+          status,
+          update_time: '2026-10-20T12:00:00.000Z',
           billing_info: { next_billing_time: '2026-10-24T00:00:00Z' },
         },
         debugId: 'fake-debug',
@@ -93,14 +100,19 @@ export class FakePaypalSubscriptionHttpClient implements PaypalSubscriptionHttpC
         input.path.includes('/suspend') ||
         input.path.includes('/activate'))
     ) {
+      const lifecycleMatch = input.path.match(
+        /\/subscriptions\/([^/]+)\/(cancel|suspend|activate)/,
+      );
+      const subscriptionId = lifecycleMatch?.[1] ?? 'FAKE-SUB-1';
       const status = input.path.includes('/cancel')
         ? 'CANCELLED'
         : input.path.includes('/suspend')
           ? 'SUSPENDED'
           : 'ACTIVE';
+      this.subscriptionStatusById.set(subscriptionId, status);
       return {
-        status: 200,
-        body: { id: 'FAKE-SUB-1', status },
+        status: 204,
+        body: {},
         debugId: 'fake-debug',
       };
     }
