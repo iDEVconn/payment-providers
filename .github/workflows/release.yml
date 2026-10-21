@@ -69,12 +69,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"
 
-      - name: Push git tag on HEAD when changeset publish created one
-        run: |
-          TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
-          if [ -n "$TAG" ]; then
-            git push origin "refs/tags/$TAG"
-          fi
+      - name: Push any git tags created by changeset publish
+        run: git push origin --tags
 
       - name: Create GitHub Release for tag on HEAD when missing
         run: |
