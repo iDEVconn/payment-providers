@@ -1,6 +1,6 @@
 {
   "name": "@idevconn/payment-providers",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Provider-neutral payment capabilities and PayPal adapter extracted from EmployeeDrivenContent",
   "license": "Apache-2.0",
   "repository": {
