@@ -98,13 +98,18 @@ describe('ReconciliationService on the pure core', () => {
       processingStatus: 'unmatched',
       relatedOperationId: operation.operationId,
     });
-    const service = new ReconciliationService(
-      store,
-      lookupOf(async () => snapshot()),
+    const getSubscription = vi.fn<ReconciliationProviderLookup['getSubscription']>(async () =>
+      snapshot(),
     );
+    const service = new ReconciliationService(store, lookupOf(getSubscription));
 
     await service.reconcile(10);
 
+    // Final review F13: the lookup uses the subscription id, never the sale id of the evidence.
+    expect(getSubscription).toHaveBeenCalled();
+    for (const [request] of getSubscription.mock.calls) {
+      expect(request.providerSubscriptionId).toBe('I-1');
+    }
     const after = await store.findOperationById(operation.operationId);
     expect(after?.providerSubscriptionId).toBe('I-1');
     expect(after?.providerReferenceId).toBe('I-1');

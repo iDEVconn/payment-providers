@@ -1117,6 +1117,7 @@ export class SubscriptionLifecycleService {
         heldKey: effectsKey,
         planMismatchToNotify: null,
         heldOverflow: false,
+        equalTimestampConflict: false,
       },
       kind,
     );

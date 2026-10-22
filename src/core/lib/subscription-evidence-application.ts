@@ -14,6 +14,7 @@ import {
   type NormalizedSubscriptionEvent,
   type ReduceSubscriptionNoopReason,
   type ReduceSubscriptionOptions,
+  type ReduceSubscriptionResult,
   type SubscriptionEffect,
   type SubscriptionLastPayment,
   type SubscriptionMoney,
@@ -207,6 +208,14 @@ export const HELD_EFFECTS_OVERFLOW = 'HELD_EFFECTS_OVERFLOW';
  * `onSubscriptionEffects` hook (give `WebhookProcessingService` the same hook as reconciliation).
  */
 export const SUBSCRIPTION_EFFECTS_HOOK_MISSING = 'SUBSCRIPTION_EFFECTS_HOOK_MISSING';
+
+/**
+ * Code on webhook evidence whose status conflicts with the stored one at the same provider state
+ * time (PayPal times have second precision). The row is left `unmatched` (a reconciliation
+ * candidate, retried by recovery) until a provider lookup settles the status.
+ */
+export const SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP =
+  'SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP';
 
 export type SubscriptionEffectsContext = {
   /** Evidence row the effects come from; null for a lifecycle command (`cancelSubscription`, ...). */
@@ -576,6 +585,12 @@ export async function resolveExpectedSubscriptionPayment(
 export type SubscriptionEventStep = {
   event: NormalizedSubscriptionEvent;
   options: ReduceSubscriptionOptions;
+  /**
+   * The event is a fresh provider snapshot ordered as a webhook: when the pure rule finds the same
+   * state time with another status (`equal_conflict`), the snapshot is applied as `source: 'lookup'`
+   * (it is the provider's current truth). The reducer itself keeps the rule.
+   */
+  lookupOnEqualConflict?: boolean;
 };
 
 export type ApplySubscriptionEventsInput = {
@@ -608,6 +623,11 @@ export type ApplySubscriptionEventsResult = {
   planMismatchToNotify: PlanMismatchRow | null;
   /** Nothing was applied: the subscription already holds the maximum of undelivered batches. */
   heldOverflow: boolean;
+  /**
+   * Nothing was applied because the event has the stored state time but another status
+   * (`equal_conflict`, second precision at PayPal). Only a provider lookup can settle it.
+   */
+  equalTimestampConflict: boolean;
 };
 
 /** Noop reasons after which the execution status is still synced to the stored subscription status. */
@@ -639,8 +659,14 @@ type ReducedSteps = {
   applied: boolean;
   reason: ReduceSubscriptionNoopReason | null;
   planMismatch: boolean;
+  equalConflict: boolean;
   effects: SubscriptionEffect[];
 };
+
+function isEqualConflict(result: ReduceSubscriptionResult): boolean {
+  const noopReason = result.decision === 'noop' ? result.reason : null;
+  return noopReason === 'equal_conflict';
+}
 
 function reduceSteps(before: SubscriptionState, steps: SubscriptionEventStep[]): ReducedSteps {
   const reduced: ReducedSteps = {
@@ -648,10 +674,14 @@ function reduceSteps(before: SubscriptionState, steps: SubscriptionEventStep[]):
     applied: false,
     reason: null,
     planMismatch: false,
+    equalConflict: false,
     effects: [],
   };
   for (const step of steps) {
-    const result = reduceSubscription(reduced.state, step.event, step.options);
+    let result = reduceSubscription(reduced.state, step.event, step.options);
+    if (step.lookupOnEqualConflict && isEqualConflict(result)) {
+      result = reduceSubscription(reduced.state, step.event, { ...step.options, source: 'lookup' });
+    }
     reduced.effects.push(...result.effects);
     if (result.decision === 'applied') {
       reduced.state = result.state;
@@ -661,6 +691,7 @@ function reduceSteps(before: SubscriptionState, steps: SubscriptionEventStep[]):
       const noopReason = result.reason;
       reduced.reason ??= noopReason;
       reduced.planMismatch ||= noopReason === 'plan_mismatch';
+      reduced.equalConflict ||= noopReason === 'equal_conflict';
     }
   }
   if (!reduced.state.providerSubscriptionId) {
@@ -729,6 +760,7 @@ async function applySubscriptionEventsOnce(
     heldKey: holdNow || held ? (effectsKey ?? null) : null,
     planMismatchToNotify,
     heldOverflow: false,
+    equalTimestampConflict: !applied && reduced.equalConflict,
   };
   if (holdNow && otherHeld.length >= MAX_PENDING_EFFECT_BATCHES) {
     // Never evict a held batch: leave this event unapplied until the hook drains the backlog.

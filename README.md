@@ -311,7 +311,7 @@ Optional `PaymentExecutionStatus` (passed to `createPaypalPaymentProvider` / exe
 
 Pass `nodeEnv: process.env.NODE_ENV` (your code reads it; the package does not) to `resolvePaymentRuntime` and to every factory. With `nodeEnv === 'production'` a misconfigured deployment must not boot "healthy":
 
-- `resolvePaymentRuntime` throws `PaymentConfigurationError` (names of the missing settings only, never values) when credentials are absent (`credentials.clientId`, `credentials.clientSecret`), or when `executionStatus` is unconfigured, in simulation mode, or has provider calls turned off. Forbidden or conflicting execution modes throw in every environment.
+- `resolvePaymentRuntime` throws `PaymentConfigurationError` (names of the missing settings only, never values) when `executionStatus` is unconfigured, in simulation mode, or has provider calls turned off (except the kill switch below), and when credentials (`credentials.clientId`, `credentials.clientSecret`) are missing and the checkout capability is enabled or an `executionStatus` was passed: a configured `executionStatus` with checkout disabled does not excuse missing credentials. Forbidden or conflicting execution modes throw in production and for a `live` deployment environment.
 - The six factories (`buildPaypalCheckoutExecutor`, `buildPaypalSubscriptionExecutor`, `buildPaypalPayoutExecutor`, `buildPaypalSellerOnboardingExecutor`, `buildPaypalMarketplaceExecutor`, `buildPaypalWebhookVerifier`) throw in production whenever they would build a blocked (reject-only) client.
 - **`allowRejectOnlyInProduction: true`** (on `resolvePaymentRuntime` and on all six factory inputs) opts a deployment into the reject-only composition on purpose, for example a service that intentionally runs without payments. Forbidden and conflicting modes still throw.
 - **Kill switch:** an `executionStatus` with `runtimeState: 'configured'`, an `executionMode` other than `'simulation'` and `providerCallsEnabled: false` is the documented, temporary switch that stops PayPal traffic. `resolvePaymentRuntime` and `buildPaypalWebhookVerifier` accept it in production without `allowRejectOnlyInProduction` (`isProviderCallsKillSwitch(status)` tells you whether a status is one): PayPal calls are rejected, and webhooks that arrive meanwhile are stored `pending` with `VERIFICATION_UNAVAILABLE` and are verified by a PayPal redelivery once the switch is lifted (recovery never verifies a `pending` row). The five executor factories still throw on a kill switch unless you pass `allowRejectOnlyInProduction`.
@@ -474,13 +474,13 @@ runStoreConformance({
 
 The engine computes `nextAttemptAt` with the service clock and the store compares it with its own clock; a skew of a few seconds only shifts a retry by that much.
 
-**Retry backoff and giving up.** `ReconciliationService` (fourth constructor argument) and `PaymentRecoveryService` (dependencies) take `retryBaseDelayMs` (default 60000), `retryMaxDelayMs` (default 3600000, at most 7 days) and `maxAttempts` (default 100, at most 1000000); `ReconciliationService` also `submittedStaleAfterMs` (default 300000). Invalid values throw `PaymentConfigurationError` at construction. **Give both services the same retry options:** recovery and reconciliation share one `attempts`/`nextAttemptAt` on `unmatched` evidence, so with different options the smaller cap wins and one service's deferral also holds back the other. A candidate that is still unresolved after its attempt (an `unknown` operation whose lookup failed, `unmatched` evidence, a row that stays `pending` such as `SUBSCRIPTION_PLAN_MISMATCH`, `HELD_EFFECTS_OVERFLOW` or `SUBSCRIPTION_EFFECTS_HOOK_MISSING`) gets `attempts + 1` and `nextAttemptAt = now + min(retryMaxDelayMs, retryBaseDelayMs * 2^(attempts - 1))`; after `maxAttempts` it gets `retryStatus: 'gave_up'`. With the defaults (1, 2, 4, 8, 16, 32 min, then hourly) that is about 94 h after the first failure, longer than PayPal's own redelivery window of about 3 days. A row that gave up keeps its status (`unknown`, `unmatched`, `pending`) and its data, but **nothing processes it any more** until a host resets it: alert on `retry_status = 'gave_up'`, fix the cause, and reset the row with `retry_status = NULL, attempts = NULL, next_attempt_at = NULL` (the next run picks it up). Exceptions: a PayPal redelivery of the same event is still processed, and a create that binds the subscription id revives its `unmatched` events (`reviveUnmatchedEvidence`). When a row resolves (evidence `processed`, an operation no longer uncertain) the engine clears the three columns, so a later uncertain episode starts a fresh schedule. A failed consumer delivery is deferred the same way but keeps its own cap (`maxConsumerDeliveryAttempts`, `failed_terminal`). `reconcile(limit)` spends `limit` on rows that correlate to an operation; rows that correlate to none (foreign events on the same PayPal account) are deferred without using the budget, and one run scans at most `10 * limit` of them, so they no longer hide a matchable event behind them.
+**Retry backoff and giving up.** `ReconciliationService` (fourth constructor argument) and `PaymentRecoveryService` (dependencies) take `retryBaseDelayMs` (default 60000), `retryMaxDelayMs` (default 3600000, at most 7 days) and `maxAttempts` (default 100, at most 1000000); `ReconciliationService` also `submittedStaleAfterMs` (default 300000). Invalid values throw `PaymentConfigurationError` at construction. **Give both services the same retry options:** recovery and reconciliation share one `attempts`/`nextAttemptAt` on `unmatched` evidence, so with different options the smaller cap wins and one service's deferral also holds back the other. A candidate that is still unresolved after its attempt (an `unknown` operation whose lookup failed, `unmatched` evidence, a row that stays `pending` such as `SUBSCRIPTION_PLAN_MISMATCH`, `HELD_EFFECTS_OVERFLOW` or `SUBSCRIPTION_EFFECTS_HOOK_MISSING`) gets `attempts + 1` and `nextAttemptAt = now + min(retryMaxDelayMs, retryBaseDelayMs * 2^(attempts - 1))`; after `maxAttempts` it gets `retryStatus: 'gave_up'`. With the defaults (1, 2, 4, 8, 16, 32 min, then hourly) that is about 94 h after the first failure, longer than the redelivery window of about 3 days that PayPal's documentation describes (not observed here). A row that gave up keeps its status (`unknown`, `unmatched`, `pending`) and its data, but **nothing processes it any more** until a host resets it: alert on `retry_status = 'gave_up'`, fix the cause, and reset the row with `retry_status = NULL, attempts = NULL, next_attempt_at = NULL` (the next run picks it up). Exceptions: a PayPal redelivery of the same event is still processed, and a create that binds the subscription id revives its `unmatched` events (`reviveUnmatchedEvidence`). When a row resolves (evidence `processed`, an operation no longer uncertain) the engine clears the three columns, so a later uncertain episode starts a fresh schedule. A failed consumer delivery is deferred the same way but keeps its own cap (`maxConsumerDeliveryAttempts`, `failed_terminal`). `reconcile(limit)` spends `limit` on rows that correlate to an operation; rows that correlate to none (foreign events on the same PayPal account) are deferred without using the budget, and one run scans at most `10 * limit` of them, so they no longer hide a matchable event behind them.
 
 The kit includes concurrent cases (two claims, two transitions, two evidence inserts, two recovery workers), so run it against a real database, not a mock, and with a pool of at least two connections: `Promise.all` over one client runs the calls one after another, and the cases then pass without testing any locking. The lease cases use a 1 s lease by default (`leaseMs`, `leaseExpiryWaitMs`); raise it when a store round trip plus the clock skew between the database and the test process gets close to that. `MemoryPaymentReliabilityStore` passes it and is the reference behaviour, but it is for **tests and local experiments only**: it is not durable production storage.
 
 #### Worked example: Postgres schema for a subscriptions-only host
 
-The package ships no migrations; this is a schema that satisfies the `SubscriptionStore` contract (it was run against Postgres 16). Names are yours to choose. A subscriptions-only host needs the operation kinds `catalog_product`, `billing_plan`, `plan_lifecycle`, `subscription`, `subscription_cancel`, `subscription_suspend` and `subscription_activate`; add the other columns of `PaymentOperation` and the checkout, payout, seller and marketplace tables only for the families you use.
+The package ships no migrations; this is a schema that satisfies the `SubscriptionStore` contract. It was run against Postgres 16, and `runStoreConformance` passed all 41 cases (including the insert-time delivery-status case) against a store written for it (a throwaway `pg` implementation of the 20 `SubscriptionStore` methods plus `reviveUnmatchedEvidence`, about 250 lines, not shipped); your own store still has to pass the kit. Names are yours to choose. A subscriptions-only host needs the operation kinds `catalog_product`, `billing_plan`, `plan_lifecycle`, `subscription`, `subscription_cancel`, `subscription_suspend` and `subscription_activate`. The columns below are every `PaymentOperation` and `ProviderEvidenceRecord` field the subscription flows write or read; the remaining operation fields (`providerOrderId`, `providerCaptureId`, `providerRefundId`, `senderBatchId`, `senderItemId`, `providerPayoutBatchId`, `providerPayoutItemId`, `payoutStatus`, `recipientType`, `maskedDestination`, `recipientValue`, `providerFeeMinor`, `providerFeeCurrency`, `sellerRef`, `providerReferralId`) belong to checkout, payout and seller flows: add columns and tables for the families you use, and until then return them as `null`. Every non-optional `PaymentOperation` field must come back, `null` when unused (for example `item_ref` is the product or plan name that `createCatalogProduct` and `createBillingPlan` return as `name`).
 
 ```sql
 -- Operations: one row per command (create product/plan/subscription, cancel, suspend, activate).
@@ -493,10 +493,10 @@ CREATE TABLE payment_operations (
   account_ref text NOT NULL,
   application_ref text NOT NULL,
   environment text NOT NULL CHECK (environment IN ('sandbox', 'live')),
-  kind text NOT NULL CHECK (kind IN (
-    'catalog_product', 'billing_plan', 'plan_lifecycle', 'subscription',
-    'subscription_cancel', 'subscription_suspend', 'subscription_activate'
-  )),
+  -- catalog_product, billing_plan, plan_lifecycle, subscription, subscription_cancel,
+  -- subscription_suspend, subscription_activate. No CHECK: the conformance kit also creates a
+  -- 'checkout' operation (a create kind the stale-submitted listing covers).
+  kind text NOT NULL,
   status text NOT NULL DEFAULT 'prepared'
     CHECK (status IN ('prepared', 'submitted', 'unknown', 'succeeded', 'failed')),
   correlation_id text,
@@ -504,6 +504,7 @@ CREATE TABLE payment_operations (
   failure_code text,
   failure_message text,
   approval_url text,
+  item_ref text,                     -- product / plan name (written by createCatalogProduct and createBillingPlan)
   amount_minor text,                 -- decimal string, e.g. '999'; never a float
   currency_code text,
   provider_reference_id text,
@@ -592,10 +593,12 @@ CREATE TABLE payment_provider_evidence (
   claim_lease_expires_at timestamptz,
   claim_worker_id text,
   processed_at timestamptz,
-  consumer_delivery_status text NOT NULL DEFAULT 'pending'
+  -- NULL = "not a delivery": no default! The engine sets 'pending' itself on processed webhook rows;
+  -- a default would make reconciliation's own rows deliveries to your consumer. Map NULL to undefined.
+  consumer_delivery_status text
     CHECK (consumer_delivery_status IN ('pending', 'confirmed', 'failed', 'failed_terminal')),
   consumer_delivered_at timestamptz,
-  consumer_delivery_attempts integer NOT NULL DEFAULT 0,
+  consumer_delivery_attempts integer,
   consumer_delivery_last_error text,
   attempts integer,
   next_attempt_at timestamptz,
@@ -630,22 +633,30 @@ CREATE TABLE payment_reconciliation_attempts (
 
 `subscription_state_json` may be `text` or `jsonb`; with `jsonb` the driver may return an object, which the engine reads. `listUncertainOperations` and `listReconciliationCandidates` filter `retry_status IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= now())` and use the order shown by the two indexes; `listReconciliationCandidates` adds `evidence_kind = 'webhook'`, `verification_status = 'verified'` and `processing_status = 'unmatched'` (or a related operation in `unknown`).
 
-**Lease claim.** `claimPendingEvidence` must hand a row to one worker only. With `FOR UPDATE SKIP LOCKED`, and sorted after `RETURNING` (an `UPDATE ... RETURNING` does not keep the subquery's `ORDER BY`):
+**Lease claim.** `claimPendingEvidence` must hand a row to one worker only, honour every field of `ClaimPendingEvidenceInput` (the scope filters are optional, `evidenceIds` skips the backoff test, `includeConsumerDelivery` and `includePendingVerification` are flags that can be `true` or `false`) and return the rows in retry order. With `FOR UPDATE SKIP LOCKED`, sorted after `RETURNING` (an `UPDATE ... RETURNING` does not keep the subquery's `ORDER BY`):
 
 ```sql
--- $1 provider_code, $2 account_ref, $3 environment, $4 worker id, $5 lease ms, $6 limit,
--- $7 includeConsumerDelivery. Rows named by `evidenceIds` skip the next_attempt_at test.
+-- $1 provider_code, $2 account_ref, $3 environment (NULL = any), $4 worker id, $5 lease ms, $6 limit,
+-- $7 includeConsumerDelivery, $8 includePendingVerification, $9 evidenceIds (NULL = not given).
 WITH due AS (
   SELECT evidence_id
   FROM payment_provider_evidence
-  WHERE provider_code = $1 AND account_ref = $2 AND environment = $3
-    AND verification_status = 'verified'               -- includePendingVerification: false
+  WHERE ($1::text IS NULL OR provider_code = $1)
+    AND ($2::text IS NULL OR account_ref = $2)
+    AND ($3::text IS NULL OR environment = $3)
+    AND ($9::uuid[] IS NULL OR evidence_id = ANY($9))
+    AND ($8::boolean OR verification_status <> 'pending')    -- includePendingVerification
     AND (
-      (processing_status IN ('pending', 'unmatched') AND retry_status IS NULL)
-      OR (processing_status = 'processed' AND consumer_delivery_status IN ('pending', 'failed')
-          AND $7::boolean)                              -- includeConsumerDelivery
+      -- rows that still need processing (a row that gave up is not claimed again) ...
+      (retry_status IS NULL AND (
+        verification_status = 'pending'
+        OR (verification_status = 'verified' AND processing_status IN ('pending', 'unmatched'))
+      ))
+      -- ... and processed rows whose consumer delivery is open (its own cap, so retry_status is ignored)
+      OR (verification_status = 'verified' AND processing_status = 'processed'
+          AND consumer_delivery_status IN ('pending', 'failed') AND $7::boolean)
     )
-    AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+    AND ($9::uuid[] IS NOT NULL OR next_attempt_at IS NULL OR next_attempt_at <= now())
     AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at <= now() OR claim_worker_id = $4)
   ORDER BY COALESCE(next_attempt_at, received_at), evidence_id
   LIMIT $6
@@ -663,7 +674,9 @@ SELECT * FROM claimed
 ORDER BY COALESCE(next_attempt_at, received_at), evidence_id;
 ```
 
-(The `processed` branch is deliberately not limited by `retry_status`: a row that gave up keeps its consumer delivery, which has its own cap.) The same query without locking works as a conditional per-row update, which may return fewer rows than `limit` under contention.
+The `processed` branch is deliberately not limited by `retry_status`: a row that gave up keeps its consumer delivery, which has its own cap. Without locking, the same query works as a conditional per-row update, which may return fewer rows than `limit` under contention. **Do not trust a query by reading it: the conformance kit must pass against the finished store** (a variant that hard-coded `includePendingVerification: false` failed three kit cases).
+
+**What the engine writes at insert time.** `insertEvidence` leaves every delivery field empty: `consumer_delivery_status` stays `NULL` for every new row, and your store returns it as `undefined` (the engine reads `NULL` the same way, but the type does not allow `null`). The engine sets `consumerDeliveryStatus: 'pending'` itself, on a **processed webhook row**, when it marks the row processed. Reconciliation rows (`evidence_kind = 'reconciliation'`) never get a status and are never delivered to your consumer. A column default of `'pending'` would turn every reconciliation lookup into an event for your consumer; the conformance kit pins the insert-time value. A row read back without a status counts as delivered (legacy rows).
 
 **Moving a 0.2.x store to 0.3.** On tables that already hold the 0.2 columns:
 
@@ -685,6 +698,7 @@ ALTER TABLE payment_provider_evidence
   DROP CONSTRAINT payment_provider_evidence_consumer_delivery_status_check,
   ADD CONSTRAINT payment_provider_evidence_consumer_delivery_status_check
     CHECK (consumer_delivery_status IN ('pending', 'confirmed', 'failed', 'failed_terminal'));
+-- Do not add a DEFAULT to consumer_delivery_status, and leave existing rows as they are.
 
 ALTER TABLE payment_operation_transitions
   ADD COLUMN transition_kind text CHECK (transition_kind IN ('claim_execution', 'claim_retry'));
@@ -713,7 +727,7 @@ WHERE evidence_id = $1;   -- same three columns on payment_operations
 
 The event carries `evidenceId`, `providerEventId`, `providerCode`, `accountRef`, `applicationRef`, `environment`, `eventType`, `resourceId`, `relatedOperationId`, `processingStatus` and `verificationStatus`. The raw provider body is included as `rawPayload` only with `new PaymentRecoveryService({ ..., includeRawPayload: true })`.
 
-The module sets `consumerDeliveryStatus` to `pending` when business delivery is still required. **`PaymentRecoveryService`** invokes `consumer.deliver` during recovery when delivery is not finished. A throw records a sanitized error, increments `consumerDeliveryAttempts` and sets `failed`; after `maxConsumerDeliveryAttempts` failures (default 10, `DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS`) the row becomes `failed_terminal` and is no longer claimed. Find such rows with `listProviderEvidenceForRecovery` or your own query on `consumer_delivery_status = 'failed_terminal'`; set the status back to `failed` (and the attempts below the cap) to retry them.
+The module sets `consumerDeliveryStatus` to `pending` on every webhook row it marks processed, whether or not you wired a consumer (reconciliation rows get no status and are never delivered). **`PaymentRecoveryService`** invokes `consumer.deliver` during recovery when delivery is not finished. A throw records a sanitized error, increments `consumerDeliveryAttempts` and sets `failed`; after `maxConsumerDeliveryAttempts` failures (default 10, `DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS`) the row becomes `failed_terminal` and is no longer claimed. Find such rows with `listProviderEvidenceForRecovery` or your own query on `consumer_delivery_status = 'failed_terminal'`; set the status back to `failed` (and the attempts below the cap) to retry them.
 
 If you do not use consumer delivery tracking, understand that `isConsumerDeliveryComplete()` treats **undefined** `consumerDeliveryStatus` as complete — set `pending` when you rely on delivery semantics (see `AGENTS.md`).
 
@@ -770,6 +784,7 @@ Consumer HTTP endpoint (raw body + the five PayPal-Transmission headers)
 **Module behavior:**
 
 - Duplicate deliveries with the same `providerEventId` are idempotent (unique evidence key); a known id with a different body is `WebhookEventPayloadMismatchError`.
+- **`receipt.duplicate` is `true` only once nothing is left to do.** A redelivery of a processed event is acknowledged as a duplicate only when its consumer delivery is complete (`confirmed` or `failed_terminal`, or a legacy row without a status). The engine marks every processed webhook row `pending` for delivery, so a host **without** a `PaymentEventConsumer` (or whose recovery has not delivered yet) sees `duplicate: false` on a redelivery; the redelivery is still harmless (it resumes the row and changes nothing). Do not use `duplicate` as your own dedupe flag; dedupe on `providerEventId`.
 - Incomplete duplicates may resume via `classifyWebhookEvidenceResume` / `reprocessStoredWebhookEvidence` (see tests).
 - Verification failures classify into retryable unavailable vs terminal rejection (`VerifyWebhookResult.failureKind`). Only a 2xx answer from PayPal with `verification_status: 'FAILURE'` is a rejection; any non-2xx answer (400, 401, 403, 5xx), non-JSON body, timeout or a 2xx without `verification_status` is `verification_unavailable`: the evidence stays `pending` and a redelivery verifies it.
 - The verify request carries the **original raw event text** as `webhook_event` (the outer JSON is built around it, never re-serialised), as PayPal requires.
@@ -843,7 +858,7 @@ export async function handlePaypalWebhook(req: IncomingMessage, res: ServerRespo
     });
     res.writeHead(200).end(JSON.stringify({ duplicate: receipt.duplicate }));
   } catch (error) {
-    // 5xx makes PayPal redeliver (it retries for about 3 days); 4xx tells it to stop.
+    // A 5xx makes PayPal redeliver (its documentation describes retries for about 3 days); a 4xx tells it to stop.
     const code = error instanceof PaymentReliabilityError ? error.code : null;
     const retry =
       code === null ||
@@ -860,7 +875,7 @@ Intake options (`WebhookIntakeOptions`, third constructor argument; invalid valu
 |--------|---------|--------|
 | `maxBodyBytes` | `DEFAULT_WEBHOOK_MAX_BODY_BYTES` (262144) | Larger bodies are rejected with `INVALID_REQUEST` before any store call |
 | `requireTransmissionHeaders` | `false` | Without `headers` the request is rejected. When headers are passed, all five must be non-blank either way |
-| `maxTransmissionAgeMs` | `null` (off) | An event id never seen before whose `transmissionTime` is older is rejected. Use at least 72 h (259200000): PayPal redelivers for about 3 days with the original time. A stored event always resumes, whatever its time |
+| `maxTransmissionAgeMs` | `null` (off) | An event id never seen before whose `transmissionTime` is older is rejected. Per PayPal's documentation a failed delivery is retried for about 3 days; the retry's `transmissionTime` is assumed to be the original one, which has not been observed here, so verify a sandbox redelivery before you enable this option, and use at least 72 h (259200000). A stored event always resumes, whatever its time |
 | `maxTransmissionFutureMs` | `DEFAULT_WEBHOOK_MAX_TRANSMISSION_FUTURE_MS` (300000) | Largest accepted future skew; used only when the age window is on |
 | `maxTransmissionSkewMs` | off | Deprecated alias that sets both directions |
 
@@ -922,7 +937,8 @@ It updates the subscription operation's plan (and expected price) in one compare
 - **Batch recovery** — `recover({ workerId, environment, limit?, leaseMs?, evidenceIds?, providerCode?, accountRef? })`
 - **Single evidence** — `recoverEvidence({ evidenceId, workerId, environment, leaseMs? })`
 - **Claim/lease** — uses `store.claimPendingEvidence` before work; lease cleared in `finally`
-- **Summary counters** — `claimed`, `verified`, `processed`, `delivered`, `skipped`, `failed`. `delivered` counts only events the consumer received and that were acknowledged.
+- **Summary counters** — `claimed`, `verified`, `processed`, `delivered`, `skipped`, `failed` and `deliveryFailed`. `delivered` counts only events the consumer received and that were acknowledged.
+- **Consumer errors** — `failed` counts rows whose processing or delivery-only retry failed. `deliveryFailed` (optional field of the `recover()` result, always set by the service) counts rows that were processed **in this run** and whose consumer delivery then failed; those rows are also counted in `processed`, not in `failed`. A consumer failure on a row that was already processed in an **earlier** run (the delivery-only retry) is still counted as `failed`. In both cases the failure is stored on the row (`consumer_delivery_status = 'failed'`, `consumer_delivery_attempts`, `consumer_delivery_last_error`) and the delivery is retried with backoff until `failed_terminal`.
 - **No consumer** — with `consumer: null`, rows that only await delivery are not claimed (`includeConsumerDelivery: false`) and `delivered` stays 0; a store must honour that flag (see [Implementing a store](#implementing-a-store)): rows it returns anyway are counted as `skipped` and released, but they fill the batch and starve newer rows.
 - **Backoff** — a claimed row that still needs work afterwards (skipped, still `pending` or `unmatched`, failed) is released with `attempts`/`nextAttemptAt` and gives up after `maxAttempts` (see [retry backoff](#implementing-a-store)); the next run reaches the rows behind it. `recoverEvidence` (explicit `evidenceIds`) ignores the backoff of the row it names, not `gave_up`.
 
@@ -986,6 +1002,7 @@ Type-level breaks for hosts that construct or switch over these types: `Verified
 - **No lease around reconciliation of evidence.** `ReconciliationService` takes no lease on evidence rows; two `reconcile()` workers can process one row twice and lose an `attempts` increment (the cap is reached a little later). Run one reconcile worker per scope, or accept the duplicate lookup.
 - **Rows rejected by 0.2.x stay rejected.** Evidence that 0.2.x stored as `rejected` after a verification answer of 400, 401 or 403 is terminal; from 0.3 such answers are retryable, but the old rows are not re-verified. Reset them by hand if you know the cause was ours (`verification_status = 'pending'`, clear `error_code`) and let PayPal redeliver.
 - **Price rule.** The expected amount of a sale is the lowest positive cycle price or setup fee stored by `createBillingPlan`: a priced trial or a setup fee below the regular price weakens underpayment detection, and after a price drop at PayPal every renewal is `amount_mismatch` until you store the new price (`adoptSubscriptionPlan` or the operation's own amount). Subscriptions created from a `providerPlanId` without a plan operation get only the plan-id check.
+- **Same-second status conflicts.** PayPal's `update_time` has second precision. When a webhook's status differs from the stored one at the **same** timestamp, the provider decides: with a lookup (the second argument of `WebhookProcessingService`) the provider's snapshot is applied and wins; reconciliation does the same with its lookup. Without a lookup the event is not applied and not marked processed: the evidence becomes `unmatched` with the code `SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP` and its `relatedOperationId` set, and the next `reconcile()` run repairs it with its lookup (a failed lookup records a retryable attempt and leaves the row). The pure reducer alone still reports `equal_conflict` as a noop; there the host decides.
 - **Pending by design.** Rows that wait for the host (`SUBSCRIPTION_PLAN_MISMATCH`, `HELD_EFFECTS_OVERFLOW`, `SUBSCRIPTION_EFFECTS_HOOK_MISSING`) are retried with backoff and give up like any other row.
 - **One OAuth client per factory call**, and the OAuth base URL follows `credentials.environment`; build each executor once and reuse it.
 - **Providers.** Only PayPal is implemented.
@@ -993,7 +1010,7 @@ Type-level breaks for hosts that construct or switch over these types: `Verified
 ---
 ## Errors and security
 
-- Branch on **structured codes** (`PAYMENT_RELIABILITY_ERROR`, `PaymentReliabilityError`, `classifyPaymentFailure`, `toPublicFailure`, `resolveProviderFailure`) — not substring matching on error messages.
+- Branch on **structured codes** (`PAYMENT_RELIABILITY_ERROR`, `PaymentReliabilityError`, `classifyPaymentFailure`, `toPublicFailure`, `resolveProviderFailure`) — do not match error message text in your own code. (One internal check does exactly that: `ReconciliationService.recordReconciliationFailure` recognises a terminal-status failure by the fragment `Terminal operation status` of its message; this is pre-existing, not a contract, and may change.)
 - Provider and consumer-facing messages go through sanitization helpers (`sanitizePublicErrorMessage`, `sanitizeOperationalErrorMessage`).
 - Raw provider HTTP bodies and internal stack traces are **not** a public contract.
 - Enforce idempotency and unique constraints in **your** store implementation.

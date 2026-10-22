@@ -41,6 +41,12 @@ export type RecoverPaymentReliabilityResult = {
   delivered: number;
   skipped: number;
   failed: number;
+  /**
+   * Rows processed in this run whose consumer delivery then failed (also counted in `processed`;
+   * the delivery is retried with its own attempts and backoff). Always set by
+   * `PaymentRecoveryService`; optional only so results built by hosts keep compiling.
+   */
+  deliveryFailed?: number;
 };
 
 export type RecoverPaymentEvidenceInput = {

@@ -1,0 +1,3545 @@
+diff --color -ruN .superpowers/snap-after-t2/src/core/lib/resolve-payment-runtime.ts src/core/lib/resolve-payment-runtime.ts
+--- .superpowers/snap-after-t2/src/core/lib/resolve-payment-runtime.ts	2026-10-22 12:01:28.817053077 +0300
++++ src/core/lib/resolve-payment-runtime.ts	2026-10-22 12:16:36.780601704 +0300
+@@ -1,5 +1,6 @@
+ import {
+   formatConfigurationIssue,
++  PaymentConfigurationError,
+   requireApplicationRef,
+ } from './payment-configuration-error';
+ import type {
+@@ -115,7 +116,10 @@
+       missingFields: executionStatus.issues.map((row) => row.code),
+     });
+     if (isProduction || executionStatus.deploymentEnvironment === 'live') {
+-      throw new Error(banner);
++      throw new PaymentConfigurationError(banner, [
++        'executionStatus.runtimeState',
++        ...executionStatus.issues.map((row) => row.code),
++      ]);
+     }
+     return {
+       mode: 'fake',
+@@ -136,6 +140,17 @@
+             missingFields: executionStatus?.issues.map((row) => row.code) ?? [],
+           })
+         : undefined;
++    if (isProduction) {
++      const missingFields = rejectOnlyExecutionFields(executionStatus);
++      throw new PaymentConfigurationError(
++        banner ??
++          formatConfigurationIssue({
++            headline: 'Payment execution rejects provider calls; production requires live execution',
++            missingFields,
++          }),
++        missingFields,
++      );
++    }
+     return {
+       mode: 'fake',
+       context,
+@@ -147,12 +162,18 @@
+     };
+   }
+ 
++  const clientId = config.credentials?.clientId?.trim();
++  const clientSecret = config.credentials?.clientSecret?.trim();
++  const missingCredentialFields = missingCheckoutCredentialFields(clientId, clientSecret);
++
++  if (isProduction && missingCredentialFields.length > 0 && !executionStatus) {
++    throw productionCredentialsError(providerCode, [...missingCredentialFields, 'executionStatus']);
++  }
++
+   if (!checkoutEnabled(config)) {
+     return { mode: 'live-provider', context, descriptor };
+   }
+ 
+-  const clientId = config.credentials?.clientId?.trim();
+-  const clientSecret = config.credentials?.clientSecret?.trim();
+   if (clientId && clientSecret) {
+     return {
+       mode: 'live-provider',
+@@ -167,6 +188,10 @@
+     };
+   }
+ 
++  if (isProduction) {
++    throw productionCredentialsError(providerCode, missingCredentialFields);
++  }
++
+   const banner = buildConfigBanner(providerCode, [...CHECKOUT_CREDENTIAL_FIELDS]);
+   return {
+     mode: 'fake',
+@@ -179,6 +204,45 @@
+   };
+ }
+ 
++function rejectOnlyExecutionFields(status: PaymentExecutionStatus | undefined): string[] {
++  const fields: string[] = [];
++  if (status?.runtimeState !== 'configured') {
++    fields.push('executionStatus.runtimeState');
++  }
++  if (!status?.providerCallsEnabled) {
++    fields.push('executionStatus.providerCallsEnabled');
++  }
++  return [...fields, ...(status?.issues.map((row) => row.code) ?? [])];
++}
++
++function missingCheckoutCredentialFields(
++  clientId: string | undefined,
++  clientSecret: string | undefined,
++): string[] {
++  const fields: string[] = [];
++  if (!clientId) {
++    fields.push('credentials.clientId');
++  }
++  if (!clientSecret) {
++    fields.push('credentials.clientSecret');
++  }
++  return fields;
++}
++
++/** Production never boots reject-only: missing setting names are listed, values never are. */
++function productionCredentialsError(
++  providerCode: string,
++  missingFields: string[],
++): PaymentConfigurationError {
++  return new PaymentConfigurationError(
++    formatConfigurationIssue({
++      headline: `Payment provider "${providerCode}" is not configured for production`,
++      missingFields,
++    }),
++    missingFields,
++  );
++}
++
+ function reinforceMissingCredentialReadiness(
+   capabilities: PaymentProviderDescriptor['capabilities'],
+ ): PaymentProviderDescriptor['capabilities'] {
+diff --color -ruN .superpowers/snap-after-t2/src/core/lib/__tests__/resolve-payment-runtime.unit.test.ts src/core/lib/__tests__/resolve-payment-runtime.unit.test.ts
+--- .superpowers/snap-after-t2/src/core/lib/__tests__/resolve-payment-runtime.unit.test.ts	2026-10-22 12:01:28.814757293 +0300
++++ src/core/lib/__tests__/resolve-payment-runtime.unit.test.ts	2026-10-22 12:13:30.124730067 +0300
+@@ -2,6 +2,7 @@
+ import { PaymentConfigurationError } from '../payment-configuration-error';
+ import { resolvePaymentRuntime } from '../resolve-payment-runtime';
+ import type { PaymentProviderConfig } from '../payment-provider-config';
++import type { PaymentExecutionStatus } from '../../../contracts/index';
+ 
+ describe('resolvePaymentRuntime', () => {
+   it('requires applicationRef on provider config', () => {
+@@ -26,25 +27,19 @@
+     expect(refund?.ready).toBe(false);
+   });
+ 
+-  it('starts in production with missing credentials using reject mode and a banner', () => {
+-    const runtime = resolvePaymentRuntime({
+-      config: { environment: 'sandbox', applicationRef: 'test-app' },
+-      nodeEnv: 'production',
+-      executionStatus: {
+-        executionMode: 'sandbox',
+-        deploymentEnvironment: 'staging',
+-        runtimeState: 'configured',
+-        providerCallsEnabled: true,
+-        simulatedExecutionEnabled: false,
+-        source: 'provider-environment',
+-        issues: [],
+-      },
+-    });
+-    expect(runtime.mode).toBe('fake');
+-    expect(runtime.configBanner).toContain('credentials.clientId');
+-    expect(runtime.descriptor.capabilities.find((c) => c.capability === 'checkout')?.ready).toBe(
+-      false,
++  it('throws in production when credentials are missing (no reject-only boot)', () => {
++    const error = captureError(() =>
++      resolvePaymentRuntime({
++        config: { environment: 'sandbox', applicationRef: 'test-app' },
++        nodeEnv: 'production',
++        executionStatus: configuredStatus,
++      }),
+     );
++    expect(error).toBeInstanceOf(PaymentConfigurationError);
++    expect((error as PaymentConfigurationError).missingFields).toEqual([
++      'credentials.clientId',
++      'credentials.clientSecret',
++    ]);
+   });
+ 
+   it('returns live-provider mode when checkout credentials exist', () => {
+@@ -117,3 +112,137 @@
+     expect(live.descriptor.environment).toBe('live');
+   });
+ });
++
++const configuredStatus: PaymentExecutionStatus = {
++  executionMode: 'live',
++  deploymentEnvironment: 'live',
++  runtimeState: 'configured',
++  providerCallsEnabled: true,
++  simulatedExecutionEnabled: false,
++  source: 'provider-environment',
++  issues: [],
++};
++
++function captureError(run: () => unknown): unknown {
++  try {
++    run();
++  } catch (error) {
++    return error;
++  }
++  throw new Error('expected a throw');
++}
++
++describe('resolvePaymentRuntime in production (#7)', () => {
++  const credentials = { clientId: 'client-id-value', clientSecret: 'client-secret-value' };
++
++  it('throws when no credentials and no executionStatus are given', () => {
++    const error = captureError(() =>
++      resolvePaymentRuntime({
++        config: { environment: 'live', applicationRef: 'app' },
++        nodeEnv: 'production',
++      }),
++    );
++    expect(error).toBeInstanceOf(PaymentConfigurationError);
++    expect((error as PaymentConfigurationError).missingFields).toEqual(
++      expect.arrayContaining(['credentials.clientId', 'credentials.clientSecret', 'executionStatus']),
++    );
++  });
++
++  it('throws when credentials are absent even if checkout is disabled and executionStatus is missing', () => {
++    expect(() =>
++      resolvePaymentRuntime({
++        config: { environment: 'live', applicationRef: 'app', capabilityFlags: { checkout: false } },
++        nodeEnv: 'production',
++      }),
++    ).toThrow(PaymentConfigurationError);
++  });
++
++  it('throws when executionStatus is unconfigured', () => {
++    const error = captureError(() =>
++      resolvePaymentRuntime({
++        config: { environment: 'live', applicationRef: 'app', credentials },
++        nodeEnv: 'production',
++        executionStatus: {
++          runtimeState: 'unconfigured',
++          deploymentEnvironment: 'live',
++          executionMode: null,
++          providerCallsEnabled: false,
++          simulatedExecutionEnabled: false,
++          source: 'unconfigured',
++          issues: [{ code: 'PAYMENT_PROVIDER_ENVIRONMENT_MISSING' } as never],
++        },
++      }),
++    );
++    expect(error).toBeInstanceOf(PaymentConfigurationError);
++    expect((error as PaymentConfigurationError).missingFields).toEqual(
++      expect.arrayContaining(['executionStatus.runtimeState']),
++    );
++    expect(String((error as Error).message)).not.toContain('client-secret-value');
++  });
++
++  it('throws when executionStatus disables provider calls (simulation)', () => {
++    expect(() =>
++      resolvePaymentRuntime({
++        config: { environment: 'live', applicationRef: 'app', credentials },
++        nodeEnv: 'production',
++        executionStatus: {
++          ...configuredStatus,
++          executionMode: 'simulation',
++          providerCallsEnabled: false,
++          simulatedExecutionEnabled: true,
++        },
++      }),
++    ).toThrow(PaymentConfigurationError);
++  });
++
++  it('throws a PaymentConfigurationError for forbidden and conflict states', () => {
++    for (const runtimeState of ['forbidden', 'conflict'] as const) {
++      expect(() =>
++        resolvePaymentRuntime({
++          config: { environment: 'live', applicationRef: 'app', credentials },
++          nodeEnv: 'production',
++          executionStatus: { ...configuredStatus, runtimeState, providerCallsEnabled: false },
++        }),
++      ).toThrow(PaymentConfigurationError);
++    }
++  });
++
++  it('never prints credential values in the thrown message', () => {
++    const error = captureError(() =>
++      resolvePaymentRuntime({
++        config: {
++          environment: 'live',
++          applicationRef: 'app',
++          credentials: { clientId: 'client-id-value', clientSecret: '' },
++        },
++        nodeEnv: 'production',
++      }),
++    );
++    expect((error as PaymentConfigurationError).missingFields).toEqual(
++      expect.arrayContaining(['credentials.clientSecret']),
++    );
++    expect((error as PaymentConfigurationError).missingFields).not.toContain(
++      'credentials.clientId',
++    );
++    expect(String((error as Error).message)).not.toContain('client-id-value');
++  });
++
++  it('returns live-provider with credentials and without executionStatus', () => {
++    const runtime = resolvePaymentRuntime({
++      config: { environment: 'live', applicationRef: 'app', credentials },
++      nodeEnv: 'production',
++    });
++    expect(runtime.mode).toBe('live-provider');
++  });
++
++  it('keeps the non-production behaviour (fake runtime with a banner)', () => {
++    for (const nodeEnv of [undefined, 'development', 'test', 'prod']) {
++      const runtime = resolvePaymentRuntime({
++        config: { environment: 'live', applicationRef: 'app' },
++        nodeEnv,
++      });
++      expect(runtime.mode).toBe('fake');
++      expect(runtime.configBanner).toContain('credentials.clientId');
++    }
++  });
++});
+diff --color -ruN .superpowers/snap-after-t2/src/core/lib/__tests__/token-cache-scope.unit.test.ts src/core/lib/__tests__/token-cache-scope.unit.test.ts
+--- .superpowers/snap-after-t2/src/core/lib/__tests__/token-cache-scope.unit.test.ts	2026-10-22 12:01:28.815440708 +0300
++++ src/core/lib/__tests__/token-cache-scope.unit.test.ts	2026-10-22 12:14:46.928318642 +0300
+@@ -23,3 +23,14 @@
+     expect(registry.size()).toBe(2);
+   });
+ });
++
++describe('token cache scope client id', () => {
++  it('uses distinct keys for different OAuth client ids and keeps the legacy key without one', () => {
++    const scope = { accountRef: 'default', environment: 'sandbox' as const };
++    expect(tokenCacheScope({ ...scope, clientId: 'client-a' })).not.toBe(
++      tokenCacheScope({ ...scope, clientId: 'client-b' }),
++    );
++    expect(tokenCacheScope({ ...scope, clientId: 'client-a' })).not.toBe(tokenCacheScope(scope));
++    expect(tokenCacheScope(scope)).toBe('default::sandbox');
++  });
++});
+diff --color -ruN .superpowers/snap-after-t2/src/core/lib/__tests__/webhook-intake-guards.unit.test.ts src/core/lib/__tests__/webhook-intake-guards.unit.test.ts
+--- .superpowers/snap-after-t2/src/core/lib/__tests__/webhook-intake-guards.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/core/lib/__tests__/webhook-intake-guards.unit.test.ts	2026-10-22 12:24:45.231480226 +0300
+@@ -0,0 +1,215 @@
++import { describe, expect, it, vi } from 'vitest';
++import { PaymentReliabilityError } from '../../../contracts/index';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import { WebhookProcessingService } from '../webhook-processing-service';
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'test-app',
++  environment: 'sandbox' as const,
++};
++
++const NOW = new Date('2026-10-22T12:00:00.000Z');
++
++const headers = {
++  transmissionId: 'tx-1',
++  transmissionTime: '2026-10-22T11:59:00Z',
++  certUrl: 'https://api.paypal.com/cert',
++  authAlgo: 'SHA256withRSA',
++  transmissionSig: 'sig',
++};
++
++function body(id: string | null, extra: Record<string, unknown> = {}): string {
++  return JSON.stringify({
++    ...(id === null ? {} : { id }),
++    event_type: 'PAYMENT.CAPTURE.COMPLETED',
++    resource: { id: 'cap-1' },
++    ...extra,
++  });
++}
++
++function verified() {
++  return vi.fn(async () => ({
++    verified: true,
++    transmissionId: 'tx-1',
++    eventType: 'PAYMENT.CAPTURE.COMPLETED',
++    resourceId: 'cap-1',
++  }));
++}
++
++function setup(options?: ConstructorParameters<typeof WebhookProcessingService>[2]) {
++  const store = new MemoryPaymentReliabilityStore();
++  const insertEvidence = vi.spyOn(store, 'insertEvidence');
++  const service = new WebhookProcessingService(store, undefined, { now: () => NOW, ...options });
++  return { store, insertEvidence, service };
++}
++
++async function expectIntakeRejection(promise: Promise<unknown>, pattern: RegExp) {
++  const error = await promise.catch((caught: unknown) => caught);
++  expect(error).toBeInstanceOf(PaymentReliabilityError);
++  expect((error as PaymentReliabilityError).code).toBe('INVALID_REQUEST');
++  expect((error as PaymentReliabilityError).message).toMatch(pattern);
++}
++
++describe('WebhookProcessingService intake guards (#15)', () => {
++  it('rejects missing transmission headers before inserting evidence', async () => {
++    const { service, insertEvidence } = setup();
++    for (const missing of Object.keys(headers)) {
++      const verify = verified();
++      await expectIntakeRejection(
++        service.receiveWebhook({
++          ...ctx,
++          rawBody: body('WH-1'),
++          providerEventId: 'WH-1',
++          headers: { ...headers, [missing]: '  ' },
++          verify,
++        }),
++        /header/i,
++      );
++      expect(verify).not.toHaveBeenCalled();
++    }
++    expect(insertEvidence).not.toHaveBeenCalled();
++  });
++
++  it('requires headers when requireTransmissionHeaders is set', async () => {
++    const { service, insertEvidence } = setup({ requireTransmissionHeaders: true });
++    await expectIntakeRejection(
++      service.receiveWebhook({ ...ctx, rawBody: body('WH-1'), verify: verified() }),
++      /header/i,
++    );
++    expect(insertEvidence).not.toHaveBeenCalled();
++  });
++
++  it('rejects a body larger than the default 256 KiB cap', async () => {
++    const { service, insertEvidence } = setup();
++    const raw = body('WH-1', { padding: 'x'.repeat(262_144) });
++    await expectIntakeRejection(
++      service.receiveWebhook({ ...ctx, rawBody: raw, headers, verify: verified() }),
++      /too large/i,
++    );
++    expect(insertEvidence).not.toHaveBeenCalled();
++  });
++
++  it('counts the cap in UTF-8 bytes and honours a configured maxBodyBytes', async () => {
++    const { service, insertEvidence } = setup({ maxBodyBytes: 200 });
++    const raw = body('WH-1', { note: 'é'.repeat(60) });
++    expect(raw.length).toBeLessThanOrEqual(200);
++    await expectIntakeRejection(
++      service.receiveWebhook({ ...ctx, rawBody: raw, headers, verify: verified() }),
++      /too large/i,
++    );
++    expect(insertEvidence).not.toHaveBeenCalled();
++
++    const small = body('WH-2');
++    const receipt = await service.receiveWebhook({
++      ...ctx,
++      rawBody: small,
++      headers,
++      verify: verified(),
++    });
++    expect(receipt.duplicate).toBe(false);
++  });
++
++  it('rejects a transmissionTime outside the default 15 minute skew', async () => {
++    const { service, insertEvidence } = setup();
++    for (const transmissionTime of ['2026-10-22T11:44:59Z', '2026-10-22T12:15:01Z', 'not-a-date']) {
++      await expectIntakeRejection(
++        service.receiveWebhook({
++          ...ctx,
++          rawBody: body('WH-1'),
++          headers: { ...headers, transmissionTime },
++          verify: verified(),
++        }),
++        /transmission/i,
++      );
++    }
++    expect(insertEvidence).not.toHaveBeenCalled();
++  });
++
++  it('honours a configured skew and accepts a fresh transmission', async () => {
++    const { service, insertEvidence } = setup({ maxTransmissionSkewMs: 30_000 });
++    await expectIntakeRejection(
++      service.receiveWebhook({ ...ctx, rawBody: body('WH-1'), headers, verify: verified() }),
++      /transmission/i,
++    );
++    const receipt = await service.receiveWebhook({
++      ...ctx,
++      rawBody: body('WH-2'),
++      headers: { ...headers, transmissionTime: '2026-10-22T11:59:45Z' },
++      verify: verified(),
++    });
++    expect(receipt.processingStatus).toBeDefined();
++    expect(insertEvidence).toHaveBeenCalledTimes(1);
++  });
++
++  it('derives providerEventId from the body id when the host does not pass one', async () => {
++    const { service, store } = setup();
++    await service.receiveWebhook({
++      ...ctx,
++      rawBody: body('WH-DERIVED'),
++      headers,
++      verify: verified(),
++    });
++    const evidence = await store.findEvidenceByProviderEvent(
++      'paypal',
++      'default',
++      'sandbox',
++      'WH-DERIVED',
++    );
++    expect(evidence?.providerEventId).toBe('WH-DERIVED');
++  });
++
++  it('rejects a host providerEventId that differs from the body id (replay under a new id)', async () => {
++    const { service, insertEvidence } = setup();
++    await expectIntakeRejection(
++      service.receiveWebhook({
++        ...ctx,
++        rawBody: body('WH-ORIGINAL'),
++        providerEventId: 'WH-REPLAYED',
++        headers,
++        verify: verified(),
++      }),
++      /does not match/i,
++    );
++    expect(insertEvidence).not.toHaveBeenCalled();
++  });
++
++  it('rejects a body without an id when the host passes no providerEventId', async () => {
++    const { service, insertEvidence } = setup();
++    for (const raw of [body(null), 'not json', '[]']) {
++      await expectIntakeRejection(
++        service.receiveWebhook({ ...ctx, rawBody: raw, headers, verify: verified() }),
++        /event id/i,
++      );
++    }
++    expect(insertEvidence).not.toHaveBeenCalled();
++  });
++
++  it('keeps accepting a host providerEventId when the body has no id', async () => {
++    const { service, store } = setup();
++    await service.receiveWebhook({
++      ...ctx,
++      rawBody: body(null),
++      providerEventId: 'host-id',
++      verify: verified(),
++    });
++    expect(
++      await store.findEvidenceByProviderEvent('paypal', 'default', 'sandbox', 'host-id'),
++    ).not.toBeNull();
++  });
++
++  it('does not echo the body or header values in intake errors', async () => {
++    const { service } = setup();
++    const error = (await service
++      .receiveWebhook({
++        ...ctx,
++        rawBody: body('WH-SECRET-ID'),
++        providerEventId: 'HOST-SECRET-ID',
++        headers: { ...headers, transmissionSig: 'SIG-SECRET' },
++        verify: verified(),
++      })
++      .catch((caught: unknown) => caught)) as Error;
++    expect(error.message).not.toContain('SECRET');
++  });
++});
+diff --color -ruN .superpowers/snap-after-t2/src/core/lib/token-cache-scope.ts src/core/lib/token-cache-scope.ts
+--- .superpowers/snap-after-t2/src/core/lib/token-cache-scope.ts	2026-10-22 12:01:28.817724705 +0300
++++ src/core/lib/token-cache-scope.ts	2026-10-22 12:14:46.921318697 +0300
+@@ -3,9 +3,12 @@
+ export type TokenCacheScopeInput = {
+   accountRef: string;
+   environment: PaymentEnvironment;
++  /** OAuth client id; rotated credentials must never reuse a token cached for another client. */
++  clientId?: string;
+ };
+ 
+-/** Stable cache identity for OAuth tokens — never share across accounts or environments. */
++/** Stable cache identity for OAuth tokens — never share across accounts, environments or client ids. */
+ export function tokenCacheScope(input: TokenCacheScopeInput): string {
+-  return `${input.accountRef}::${input.environment}`;
++  const base = `${input.accountRef}::${input.environment}`;
++  return input.clientId ? `${base}::${input.clientId}` : base;
+ }
+diff --color -ruN .superpowers/snap-after-t2/src/core/lib/webhook-processing-service.ts src/core/lib/webhook-processing-service.ts
+--- .superpowers/snap-after-t2/src/core/lib/webhook-processing-service.ts	2026-10-22 12:01:28.817826799 +0300
++++ src/core/lib/webhook-processing-service.ts	2026-10-22 12:24:33.731244495 +0300
+@@ -2,6 +2,7 @@
+   PAYMENT_RELIABILITY_ERROR,
+   PaymentReliabilityError,
+   type PaymentOperationStatus,
++  type PaypalWebhookTransmissionHeaders,
+   type ProviderEvidenceRecord,
+   type SubscriptionStatus,
+   type VerifyWebhookResult,
+@@ -47,6 +48,8 @@
+ } from './marketplace-transition-policy';
+ import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
+ import { sha256Payload } from './sha256-payload';
++import { deriveProviderEventId } from '../../subscription-core/lib/normalize-paypal-subscription-event';
++import { isFreshTransmission } from '../../subscription-core/lib/subscription-status-rules';
+ import {
+   classifyWebhookEvidenceResume,
+   isConsumerDeliveryComplete,
+@@ -59,10 +62,58 @@
+   applicationRef: string;
+   environment: 'sandbox' | 'live';
+   rawBody: string;
+-  providerEventId: string;
++  /**
++   * Provider event id. Derived from the body `id` when omitted; a value that differs from the body
++   * `id` is rejected, so a captured body cannot be replayed under a new id.
++   */
++  providerEventId?: string;
++  /** Transmission headers. When passed, every header must be set and `transmissionTime` fresh. */
++  headers?: PaypalWebhookTransmissionHeaders;
+   verify: () => Promise<VerifyWebhookResult>;
+ };
+ 
++/** Default intake cap for a webhook body (256 KiB of UTF-8). */
++export const DEFAULT_WEBHOOK_MAX_BODY_BYTES = 262_144;
++/** Default allowed distance between `transmissionTime` and now (15 minutes). */
++export const DEFAULT_WEBHOOK_MAX_TRANSMISSION_SKEW_MS = 900_000;
++
++/** Checks that run before any evidence is stored or any provider verify call is made. */
++export type WebhookIntakeOptions = {
++  /** Largest accepted body in UTF-8 bytes. Default `DEFAULT_WEBHOOK_MAX_BODY_BYTES`. */
++  maxBodyBytes?: number;
++  /**
++   * Largest accepted distance of a passed `headers.transmissionTime` from now. Default
++   * `DEFAULT_WEBHOOK_MAX_TRANSMISSION_SKEW_MS`; `null` turns the freshness check off.
++   */
++  maxTransmissionSkewMs?: number | null;
++  /** Reject requests without `headers`. Default false: headers are checked whenever they are passed. */
++  requireTransmissionHeaders?: boolean;
++  /** Clock for the freshness check (tests). */
++  now?: () => Date;
++};
++
++type AcceptedWebhookInput = ReceiveWebhookInput & { providerEventId: string };
++
++const TRANSMISSION_HEADER_FIELDS = [
++  'transmissionId',
++  'transmissionTime',
++  'certUrl',
++  'authAlgo',
++  'transmissionSig',
++] as const satisfies ReadonlyArray<keyof PaypalWebhookTransmissionHeaders>;
++
++function rejectAtIntake(message: string): PaymentReliabilityError {
++  return new PaymentReliabilityError(PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST, message);
++}
++
++function utf8ByteLengthExceeds(text: string, maxBytes: number): boolean {
++  // Every UTF-16 code unit encodes to at least one UTF-8 byte: skip encoding oversized strings.
++  if (text.length > maxBytes) {
++    return true;
++  }
++  return new TextEncoder().encode(text).byteLength > maxBytes;
++}
++
+ export type WebhookSubscriptionProviderLookup = Pick<
+   ReconciliationProviderLookup,
+   'getSubscription'
+@@ -72,9 +123,11 @@
+   constructor(
+     private readonly store: PaymentReliabilityStore,
+     private readonly subscriptionProviderLookup?: WebhookSubscriptionProviderLookup,
++    private readonly intakeOptions: WebhookIntakeOptions = {},
+   ) {}
+ 
+-  async receiveWebhook(input: ReceiveWebhookInput): Promise<WebhookReceiptResponse> {
++  async receiveWebhook(webhook: ReceiveWebhookInput): Promise<WebhookReceiptResponse> {
++    const input = this.acceptWebhookAtIntake(webhook);
+     const existing = await this.store.findEvidenceByProviderEvent(
+       input.providerCode,
+       input.accountRef,
+@@ -110,6 +163,57 @@
+     return this.driveWebhookLifecycle(evidence, input);
+   }
+ 
++  /**
++   * Cheap checks before anything is stored or sent to the provider: required headers, body size,
++   * transmission freshness and the event id. Throws `INVALID_REQUEST`; messages never echo values.
++   */
++  private acceptWebhookAtIntake(input: ReceiveWebhookInput): AcceptedWebhookInput {
++    const options = this.intakeOptions;
++    if (input.headers) {
++      const headers = input.headers;
++      const missing = TRANSMISSION_HEADER_FIELDS.filter((field) => {
++        const value: unknown = headers[field];
++        return typeof value !== 'string' || value.trim().length === 0;
++      });
++      if (missing.length > 0) {
++        throw rejectAtIntake(`Webhook transmission header is missing: ${missing.join(', ')}`);
++      }
++    } else if (options.requireTransmissionHeaders) {
++      throw rejectAtIntake('Webhook transmission headers are required');
++    }
++
++    if (typeof input.rawBody !== 'string') {
++      throw rejectAtIntake('Webhook body must be the raw request text');
++    }
++    const maxBodyBytes = options.maxBodyBytes ?? DEFAULT_WEBHOOK_MAX_BODY_BYTES;
++    if (utf8ByteLengthExceeds(input.rawBody, maxBodyBytes)) {
++      throw rejectAtIntake(`Webhook body is too large (limit ${maxBodyBytes} bytes)`);
++    }
++
++    const maxSkewMs =
++      options.maxTransmissionSkewMs === undefined
++        ? DEFAULT_WEBHOOK_MAX_TRANSMISSION_SKEW_MS
++        : options.maxTransmissionSkewMs;
++    if (
++      input.headers &&
++      maxSkewMs !== null &&
++      !isFreshTransmission(input.headers.transmissionTime, options.now?.() ?? new Date(), maxSkewMs)
++    ) {
++      throw rejectAtIntake('Webhook transmission time is invalid or outside the allowed window');
++    }
++
++    const bodyEventId = deriveProviderEventId(input.rawBody);
++    const hostEventId = input.providerEventId?.trim() ? input.providerEventId : undefined;
++    if (hostEventId !== undefined && bodyEventId !== null && hostEventId !== bodyEventId) {
++      throw rejectAtIntake('Webhook providerEventId does not match the event body id');
++    }
++    const providerEventId = hostEventId ?? bodyEventId;
++    if (!providerEventId) {
++      throw rejectAtIntake('Webhook event id is missing');
++    }
++    return { ...input, providerEventId };
++  }
++
+   async reprocessStoredWebhookEvidence(evidenceId: string): Promise<WebhookReceiptResponse> {
+     const evidence = await this.store.findEvidenceById(evidenceId);
+     if (!evidence) {
+@@ -127,7 +231,7 @@
+ 
+   private handleExistingEvidence(
+     evidence: ProviderEvidenceRecord,
+-    input: ReceiveWebhookInput,
++    input: AcceptedWebhookInput,
+   ): Promise<WebhookReceiptResponse> {
+     const action = classifyWebhookEvidenceResume(evidence);
+     if (action === 'ack_duplicate') {
+@@ -144,7 +248,7 @@
+ 
+   private async driveWebhookLifecycle(
+     evidence: ProviderEvidenceRecord,
+-    input: ReceiveWebhookInput,
++    input: AcceptedWebhookInput,
+   ): Promise<WebhookReceiptResponse> {
+     if (
+       evidence.verificationStatus === 'pending' ||
+@@ -216,7 +320,9 @@
+     });
+   }
+ 
+-  private async insertWebhookEvidence(input: ReceiveWebhookInput): Promise<ProviderEvidenceRecord> {
++  private async insertWebhookEvidence(
++    input: AcceptedWebhookInput,
++  ): Promise<ProviderEvidenceRecord> {
+     let parsedEventType: string | null = null;
+     let parsedResourceId: string | null = null;
+     try {
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/index.ts src/paypal/index.ts
+--- .superpowers/snap-after-t2/src/paypal/index.ts	2026-10-22 12:01:28.818063113 +0300
++++ src/paypal/index.ts	2026-10-22 12:24:08.606345374 +0300
+@@ -8,6 +8,7 @@
+ export * from './lib/fake-paypal-webhook-verification-client';
+ export * from './lib/live-paypal-webhook-verification-client';
+ export * from './lib/paypal-oauth-client';
++export * from './lib/paypal-access-token-retry';
+ export * from './lib/live-paypal-http-clients';
+ export * from './lib/paypal-orders-http-client';
+ export * from './lib/fake-paypal-orders-http-client';
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/build-reject-only-executor.ts src/paypal/lib/build-reject-only-executor.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/build-reject-only-executor.ts	2026-10-22 12:01:28.819028053 +0300
++++ src/paypal/lib/build-reject-only-executor.ts	2026-10-22 12:17:02.478064623 +0300
+@@ -1,5 +1,6 @@
+ import type { PaymentExecutionStatus } from '../../contracts/index';
+ import type { ResolvedPaymentRuntime } from '../../core/index';
++import { PaymentConfigurationError } from '../../core/lib/payment-configuration-error';
+ import { createBlockedHttpClient, createBlockedOAuthClient } from './blocked-provider-network';
+ import { shouldBlockProviderNetwork } from './provider-network-policy';
+ 
+@@ -18,6 +19,38 @@
+   );
+ }
+ 
++/**
++ * Production must not compose a reject-only (blocked) PayPal client: it would accept traffic and
++ * fail every call. Throws a `PaymentConfigurationError` that names the settings, never their values.
++ */
++export function assertProviderNetworkAllowedInProduction(input: {
++  runtime: ResolvedPaymentRuntime;
++  executionStatus?: PaymentExecutionStatus;
++  nodeEnv?: string;
++  component: string;
++}): void {
++  const { runtime, executionStatus, nodeEnv, component } = input;
++  if (nodeEnv !== 'production' || !shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
++    return;
++  }
++  const missingFields: string[] = [];
++  if (executionStatus && executionStatus.runtimeState !== 'configured') {
++    missingFields.push('executionStatus.runtimeState');
++  }
++  if (executionStatus && !executionStatus.providerCallsEnabled) {
++    missingFields.push('executionStatus.providerCallsEnabled');
++  }
++  if (!runtime.checkoutCredentials) {
++    missingFields.push('credentials.clientId', 'credentials.clientSecret');
++  } else if (runtime.mode === 'fake') {
++    missingFields.push('runtime.mode');
++  }
++  throw new PaymentConfigurationError(
++    `${component} would reject every PayPal call in production (check: ${missingFields.join(', ')})`,
++    missingFields,
++  );
++}
++
+ export function blockedOAuthGetter(): () => Promise<string> {
+   return createBlockedOAuthClient();
+ }
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/live-paypal-http-clients.ts src/paypal/lib/live-paypal-http-clients.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/live-paypal-http-clients.ts	2026-10-22 12:01:28.819241236 +0300
++++ src/paypal/lib/live-paypal-http-clients.ts	2026-10-22 12:20:16.754027319 +0300
+@@ -29,6 +29,9 @@
+   PaypalSellerOnboardingHttpResponse,
+ } from './paypal-seller-onboarding-http-client';
+ 
++// Every client passes `redirect: 'error'`: PayPal APIs never redirect, and a followed redirect could
++// replay the bearer token or Basic credentials to another URL. A refusal is a sanitized transport failure.
++
+ function extractDebugId(headers: Headers): string | null {
+   return headers.get('paypal-debug-id') ?? headers.get('Paypal-Debug-Id');
+ }
+@@ -59,6 +62,7 @@
+         method: 'POST',
+         headers,
+         body,
++        redirect: 'error',
+         signal: controller.signal,
+       });
+       return {
+@@ -92,6 +96,7 @@
+         method: input.method,
+         headers,
+         body: input.body != null ? JSON.stringify(input.body) : undefined,
++        redirect: 'error',
+         signal: controller.signal,
+       });
+       return {
+@@ -125,6 +130,7 @@
+         method: input.method,
+         headers,
+         body: input.body != null ? JSON.stringify(input.body) : undefined,
++        redirect: 'error',
+         signal: controller.signal,
+       });
+       return {
+@@ -164,6 +170,7 @@
+         method: input.method,
+         headers,
+         body: input.body != null ? JSON.stringify(input.body) : undefined,
++        redirect: 'error',
+         signal: controller.signal,
+       });
+       return {
+@@ -200,6 +207,7 @@
+         method: input.method,
+         headers,
+         body: input.body != null ? JSON.stringify(input.body) : undefined,
++        redirect: 'error',
+         signal: controller.signal,
+       });
+       return {
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/live-paypal-webhook-verification-client.ts src/paypal/lib/live-paypal-webhook-verification-client.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/live-paypal-webhook-verification-client.ts	2026-10-22 12:01:28.819276170 +0300
++++ src/paypal/lib/live-paypal-webhook-verification-client.ts	2026-10-22 12:19:47.734628459 +0300
+@@ -1,11 +1,56 @@
++import { PAYMENT_RELIABILITY_ERROR } from '../../contracts/index';
+ import type { TokenCacheScopeInput } from '../../core/index';
++import { sendWithPaypalAccessToken } from './paypal-access-token-retry';
+ import type { PaypalOAuthClient } from './paypal-oauth-client';
+-import {
+-  isRetryablePaypalVerificationHttpStatus,
+-  PaypalWebhookVerificationHttpError,
+-} from './paypal-webhook-verification-http';
++import { PaypalWebhookVerificationHttpError } from './paypal-webhook-verification-http';
+ import type { PaypalWebhookVerificationClient } from './paypal-webhook-verifier';
+ 
++type VerifyWebhookSignatureInput = Parameters<
++  PaypalWebhookVerificationClient['verifyWebhookSignature']
++>[0];
++
++/**
++ * Builds the verify-webhook-signature body. PayPal checks the signature against the event exactly as
++ * delivered, so `webhook_event` is the original raw text spliced in, never a re-serialisation (which
++ * can change escaped unicode, number formatting or key order). The raw text must parse as one JSON
++ * object, so the splice cannot add or override outer fields.
++ */
++function buildVerifyRequestBody(input: VerifyWebhookSignatureInput): string {
++  const fields = {
++    auth_algo: input.authAlgo,
++    cert_url: input.certUrl,
++    transmission_id: input.transmissionId,
++    transmission_sig: input.transmissionSig,
++    transmission_time: input.transmissionTime,
++    webhook_id: input.webhookId,
++  };
++  if (input.rawWebhookEvent === undefined) {
++    return JSON.stringify({ ...fields, webhook_event: input.webhookEvent });
++  }
++
++  let event: unknown;
++  try {
++    event = JSON.parse(input.rawWebhookEvent);
++  } catch {
++    event = null;
++  }
++  if (typeof event !== 'object' || event === null || Array.isArray(event)) {
++    throw new PaypalWebhookVerificationHttpError(
++      'invalid_payload',
++      'Webhook body is not a valid JSON object',
++    );
++  }
++  return `${JSON.stringify(fields).slice(0, -1)},"webhook_event":${input.rawWebhookEvent}}`;
++}
++
++function isProviderAuthFailure(error: unknown): boolean {
++  return (
++    typeof error === 'object' &&
++    error !== null &&
++    (error as { code?: unknown }).code === PAYMENT_RELIABILITY_ERROR.PROVIDER_AUTH_FAILURE
++  );
++}
++
+ export class LivePaypalWebhookVerificationClient implements PaypalWebhookVerificationClient {
+   constructor(
+     private readonly oauthClient: PaypalOAuthClient,
+@@ -14,63 +59,39 @@
+     private readonly timeoutMs: number,
+   ) {}
+ 
+-  async verifyWebhookSignature(input: {
+-    webhookId: string;
+-    transmissionId: string;
+-    transmissionTime: string;
+-    certUrl: string;
+-    authAlgo: string;
+-    transmissionSig: string;
+-    webhookEvent: unknown;
+-  }): Promise<{ verification_status: string }> {
+-    const token = await this.oauthClient.getAccessToken(this.scope);
++  async verifyWebhookSignature(
++    input: VerifyWebhookSignatureInput,
++  ): Promise<{ verification_status: string }> {
++    const requestBody = buildVerifyRequestBody(input);
+     const baseUrl =
+       this.environment === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+-    const controller = new AbortController();
+-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+     try {
+-      const response = await fetch(`${baseUrl}/v1/notifications/verify-webhook-signature`, {
+-        method: 'POST',
+-        headers: {
+-          Authorization: `Bearer ${token}`,
+-          'Content-Type': 'application/json',
+-        },
+-        body: JSON.stringify({
+-          auth_algo: input.authAlgo,
+-          cert_url: input.certUrl,
+-          transmission_id: input.transmissionId,
+-          transmission_sig: input.transmissionSig,
+-          transmission_time: input.transmissionTime,
+-          webhook_id: input.webhookId,
+-          webhook_event: input.webhookEvent,
+-        }),
+-        signal: controller.signal,
+-      });
+-      const responseText = await response.text();
++      const response = await sendWithPaypalAccessToken(
++        (_scope, options) => this.oauthClient.getAccessToken(this.scope, options),
++        this.scope,
++        (token) =>
++          this.post(`${baseUrl}/v1/notifications/verify-webhook-signature`, token, requestBody),
++      );
++      // Any non-2xx (401/403 after the token retry, 400, 5xx) is our or PayPal's failure, not a
++      // signature verdict: keep the evidence pending so a redelivery or recovery can verify it.
+       if (!response.ok) {
+-        if (isRetryablePaypalVerificationHttpStatus(response.status)) {
+-          throw new PaypalWebhookVerificationHttpError(
+-            'verification_unavailable',
+-            `PayPal webhook verification HTTP ${response.status}`,
+-          );
+-        }
+         throw new PaypalWebhookVerificationHttpError(
+-          'invalid_payload',
++          'verification_unavailable',
+           `PayPal webhook verification HTTP ${response.status}`,
+         );
+       }
+-      let body: { verification_status?: string };
++      let body: { verification_status?: unknown };
+       try {
+-        body = JSON.parse(responseText) as { verification_status?: string };
++        body = JSON.parse(response.text) as { verification_status?: unknown };
+       } catch {
+         throw new PaypalWebhookVerificationHttpError(
+-          'invalid_payload',
++          'verification_unavailable',
+           'PayPal webhook verification response is not valid JSON',
+         );
+       }
+-      if (typeof body.verification_status !== 'string') {
++      if (typeof body?.verification_status !== 'string') {
+         throw new PaypalWebhookVerificationHttpError(
+-          'invalid_payload',
++          'verification_unavailable',
+           'PayPal webhook verification response missing verification_status',
+         );
+       }
+@@ -85,10 +106,38 @@
+           'PayPal webhook verification timed out',
+         );
+       }
++      if (isProviderAuthFailure(error)) {
++        throw new PaypalWebhookVerificationHttpError(
++          'verification_unavailable',
++          'PayPal webhook verification could not authenticate',
++        );
++      }
+       throw new PaypalWebhookVerificationHttpError(
+         'verification_unavailable',
+         'PayPal webhook verification failed due to a network error',
+       );
++    }
++  }
++
++  private async post(
++    url: string,
++    token: string,
++    body: string,
++  ): Promise<{ status: number; ok: boolean; text: string }> {
++    const controller = new AbortController();
++    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
++    try {
++      const response = await fetch(url, {
++        method: 'POST',
++        headers: {
++          Authorization: `Bearer ${token}`,
++          'Content-Type': 'application/json',
++        },
++        body,
++        redirect: 'error',
++        signal: controller.signal,
++      });
++      return { status: response.status, ok: response.ok, text: await response.text() };
+     } finally {
+       clearTimeout(timer);
+     }
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-access-token-retry.ts src/paypal/lib/paypal-access-token-retry.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-access-token-retry.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/paypal/lib/paypal-access-token-retry.ts	2026-10-22 12:24:45.250480123 +0300
+@@ -0,0 +1,64 @@
++import { PAYMENT_RELIABILITY_ERROR, type PaymentEnvironment } from '../../contracts/index';
++import type { PaypalAccessTokenRequestOptions } from './paypal-oauth-client';
++
++export type PaypalAccessTokenScope = {
++  accountRef: string;
++  environment: PaymentEnvironment;
++};
++
++export type PaypalAccessTokenProvider = (
++  scope: PaypalAccessTokenScope,
++  options?: PaypalAccessTokenRequestOptions,
++) => Promise<string>;
++
++/**
++ * Sends one PayPal call with `token`. On HTTP 401 the token is reported as rejected (the OAuth client
++ * evicts it; concurrent callers share one refresh) and the call is sent once more with the fresh
++ * token. A second 401 is a non-retryable `PROVIDER_AUTH_FAILURE`. PayPal rejects a bad token before it
++ * processes the request, and every mutating call carries `PayPal-Request-Id`, so the single resend is
++ * safe. Tokens never appear in the thrown error.
++ */
++export async function resendWithFreshPaypalTokenOn401<
++  T extends { status: number; debugId?: string | null },
++>(
++  tokenProvider: PaypalAccessTokenProvider,
++  scope: PaypalAccessTokenScope,
++  token: string,
++  send: (accessToken: string) => Promise<T>,
++): Promise<T> {
++  const first = await send(token);
++  if (first.status !== 401) {
++    return first;
++  }
++
++  const freshToken = await tokenProvider(
++    { accountRef: scope.accountRef, environment: scope.environment },
++    { rejectedToken: token },
++  );
++  const second = await send(freshToken);
++  if (second.status === 401) {
++    throw {
++      code: PAYMENT_RELIABILITY_ERROR.PROVIDER_AUTH_FAILURE,
++      message: 'PayPal rejected the access token',
++      retryable: false,
++      uncertain: false,
++      providerDebugId: second.debugId ?? null,
++    };
++  }
++  return second;
++}
++
++/** Fetches a token, then sends the call with {@link resendWithFreshPaypalTokenOn401}. */
++export async function sendWithPaypalAccessToken<
++  T extends { status: number; debugId?: string | null },
++>(
++  tokenProvider: PaypalAccessTokenProvider,
++  scope: PaypalAccessTokenScope,
++  send: (accessToken: string) => Promise<T>,
++): Promise<T> {
++  const token = await tokenProvider({
++    accountRef: scope.accountRef,
++    environment: scope.environment,
++  });
++  return resendWithFreshPaypalTokenOn401(tokenProvider, scope, token, send);
++}
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-checkout-executor.factory.ts src/paypal/lib/paypal-checkout-executor.factory.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-checkout-executor.factory.ts	2026-10-22 12:01:28.819370491 +0300
++++ src/paypal/lib/paypal-checkout-executor.factory.ts	2026-10-22 12:18:07.243024398 +0300
+@@ -3,6 +3,7 @@
+ import type { PaymentExecutionStatus } from '../../contracts/index';
+ import type { ResolvedPaymentRuntime } from '../../core/index';
+ import {
++  assertProviderNetworkAllowedInProduction,
+   blockedHttpClient,
+   blockedOAuthGetter,
+   shouldRejectProviderNetworkCalls,
+@@ -30,6 +31,13 @@
+   const { runtime, strategyFactory, nodeEnv, forceFakeHttp, executionStatus } = input;
+   const isProduction = nodeEnv === 'production';
+ 
++  assertProviderNetworkAllowedInProduction({
++    runtime,
++    executionStatus,
++    nodeEnv,
++    component: 'PayPal checkout executor',
++  });
++
+   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
+     return new PaypalCheckoutExecutor(
+       runtime,
+@@ -83,10 +91,13 @@
+   );
+   const ordersHttp = new FetchPaypalOrdersHttpClient(credentials.requestTimeoutMs ?? 10_000);
+ 
+-  return new PaypalCheckoutExecutor(runtime, strategyFactory, ordersHttp, (scope) =>
+-    oauthClient.getAccessToken({
+-      accountRef: scope.accountRef,
+-      environment: scope.environment,
+-    }),
++  return new PaypalCheckoutExecutor(runtime, strategyFactory, ordersHttp, (scope, options) =>
++    oauthClient.getAccessToken(
++      {
++        accountRef: scope.accountRef,
++        environment: scope.environment,
++      },
++      options,
++    ),
+   );
+ }
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-checkout-executor.ts src/paypal/lib/paypal-checkout-executor.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-checkout-executor.ts	2026-10-22 12:01:28.820221299 +0300
++++ src/paypal/lib/paypal-checkout-executor.ts	2026-10-22 12:22:30.405367960 +0300
+@@ -21,6 +21,11 @@
+   type CheckoutProviderPort,
+   type ResolvedPaymentRuntime,
+ } from '../../core/index';
++import {
++  resendWithFreshPaypalTokenOn401,
++  type PaypalAccessTokenScope,
++} from './paypal-access-token-retry';
++import type { PaypalAccessTokenRequestOptions } from './paypal-oauth-client';
+ import { extractPaypalCheckoutApprovalUrl } from './paypal-checkout-approval-url';
+ import {
+   extractPaypalIssueCodes,
+@@ -28,7 +33,11 @@
+   parsePurchaseUnitCaptures,
+   resolveCheckoutStatusFromOrder,
+ } from './paypal-checkout-order-parsing';
+-import type { PaypalOrdersHttpClient } from './paypal-orders-http-client';
++import type {
++  PaypalOrdersHttpClient,
++  PaypalOrdersHttpRequest,
++  PaypalOrdersHttpResponse,
++} from './paypal-orders-http-client';
+ import { UnconfiguredFakeCheckoutStrategy } from './unconfigured-fake-checkout.strategy';
+ 
+ function isRecord(value: unknown): value is Record<string, unknown> {
+@@ -79,10 +88,13 @@
+   };
+ }
+ 
+-export type PaypalCheckoutTokenProvider = (scope: {
+-  accountRef: string;
+-  environment: PaymentEnvironment;
+-}) => Promise<string>;
++export type PaypalCheckoutTokenProvider = (
++  scope: {
++    accountRef: string;
++    environment: PaymentEnvironment;
++  },
++  options?: PaypalAccessTokenRequestOptions,
++) => Promise<string>;
+ 
+ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
+   constructor(
+@@ -92,6 +104,16 @@
+     private readonly tokenProvider: PaypalCheckoutTokenProvider,
+   ) {}
+ 
++  private authorizedRequest(
++    scope: PaypalAccessTokenScope,
++    token: string,
++    request: Omit<PaypalOrdersHttpRequest, 'accessToken'>,
++  ): Promise<PaypalOrdersHttpResponse> {
++    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
++      this.httpClient.request({ ...request, accessToken }),
++    );
++  }
++
+   async createOrder(
+     input: ExecuteCreateCheckoutOrderRequest,
+   ): Promise<ExecuteCreateCheckoutOrderResult> {
+@@ -134,18 +156,15 @@
+ 
+   async getOrder(input: ExecuteGetCheckoutOrderRequest): Promise<ExecuteGetCheckoutOrderResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'checkout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+         : 'https://api-m.sandbox.paypal.com';
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl}/v2/checkout/orders/${pathSegment(input.providerOrderId, 'providerOrderId')}`,
+-      accessToken: token,
+     });
+ 
+     if (response.status === 404) {
+@@ -201,18 +220,15 @@
+       await this.rejectUnconfigured(strategy.captureOrder(input.providerOrderId));
+     }
+ 
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+         : 'https://api-m.sandbox.paypal.com';
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl}/v2/checkout/orders/${pathSegment(input.providerOrderId, 'providerOrderId')}/capture`,
+-      accessToken: token,
+       requestId: input.providerRequestId,
+       preferRepresentation: true,
+     });
+@@ -270,18 +286,15 @@
+   private async createOrderWithExperienceContext(
+     input: ExecuteCreateCheckoutOrderRequest,
+   ): Promise<ExecuteCreateCheckoutOrderResult> {
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+         : 'https://api-m.sandbox.paypal.com';
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl}/v2/checkout/orders`,
+-      accessToken: token,
+       requestId: input.providerRequestId,
+       preferRepresentation: true,
+       body: {
+@@ -334,10 +347,8 @@
+ 
+   async refundCapture(input: ExecuteRefundCaptureRequest): Promise<ExecuteRefundCaptureResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'refund');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+@@ -352,10 +363,9 @@
+           }
+         : undefined;
+ 
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl}/v2/payments/captures/${pathSegment(input.providerCaptureId, 'providerCaptureId')}/refund`,
+-      accessToken: token,
+       body,
+       requestId: input.providerRequestId,
+     });
+@@ -405,18 +415,15 @@
+ 
+   async getRefund(input: ExecuteGetRefundRequest): Promise<ExecuteGetRefundResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'refund');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+         : 'https://api-m.sandbox.paypal.com';
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl}/v2/payments/refunds/${pathSegment(input.providerRefundId, 'providerRefundId')}`,
+-      accessToken: token,
+     });
+ 
+     if (response.status === 404) {
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-marketplace-executor.factory.ts src/paypal/lib/paypal-marketplace-executor.factory.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-marketplace-executor.factory.ts	2026-10-22 12:01:28.819550077 +0300
++++ src/paypal/lib/paypal-marketplace-executor.factory.ts	2026-10-22 12:17:42.290031155 +0300
+@@ -2,6 +2,7 @@
+ import type { PaymentExecutionStatus } from '../../contracts/index';
+ import type { ResolvedPaymentRuntime } from '../../core/index';
+ import {
++  assertProviderNetworkAllowedInProduction,
+   blockedHttpClient,
+   blockedOAuthGetter,
+   shouldRejectProviderNetworkCalls,
+@@ -33,6 +34,13 @@
+   const { runtime, nodeEnv, forceFakeHttp, httpClient, executionStatus, partnerConfig } = input;
+   const isProduction = nodeEnv === 'production';
+ 
++  assertProviderNetworkAllowedInProduction({
++    runtime,
++    executionStatus,
++    nodeEnv,
++    component: 'PayPal marketplace executor',
++  });
++
+   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
+     return new PaypalMarketplaceExecutor(
+       runtime,
+@@ -89,11 +97,14 @@
+   return new PaypalMarketplaceExecutor(
+     runtime,
+     ordersHttp,
+-    (scope) =>
+-      oauthClient.getAccessToken({
+-        accountRef: scope.accountRef,
+-        environment: scope.environment,
+-      }),
++    (scope, options) =>
++      oauthClient.getAccessToken(
++        {
++          accountRef: scope.accountRef,
++          environment: scope.environment,
++        },
++        options,
++      ),
+     partnerConfig,
+   );
+ }
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-marketplace-executor.ts src/paypal/lib/paypal-marketplace-executor.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-marketplace-executor.ts	2026-10-22 12:01:28.819427085 +0300
++++ src/paypal/lib/paypal-marketplace-executor.ts	2026-10-22 12:22:30.405581403 +0300
+@@ -20,9 +20,17 @@
+   type MarketplaceProviderPort,
+   type ResolvedPaymentRuntime,
+ } from '../../core/index';
++import {
++  resendWithFreshPaypalTokenOn401,
++  type PaypalAccessTokenScope,
++} from './paypal-access-token-retry';
+ import type { PaypalCheckoutTokenProvider } from './paypal-checkout-executor';
+ import { classifyPaypalMarketplaceCapture422 } from './paypal-marketplace-capture-policy';
+-import type { PaypalOrdersHttpClient } from './paypal-orders-http-client';
++import type {
++  PaypalOrdersHttpClient,
++  PaypalOrdersHttpRequest,
++  PaypalOrdersHttpResponse,
++} from './paypal-orders-http-client';
+ 
+ export type PaypalMarketplacePartnerConfig = {
+   partnerAttributionId: string;
+@@ -175,18 +183,25 @@
+     private readonly partnerConfig: PaypalMarketplacePartnerConfig,
+   ) {}
+ 
++  private authorizedRequest(
++    scope: PaypalAccessTokenScope,
++    token: string,
++    request: Omit<PaypalOrdersHttpRequest, 'accessToken'>,
++  ): Promise<PaypalOrdersHttpResponse> {
++    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
++      this.httpClient.request({ ...request, accessToken }),
++    );
++  }
++
+   async createOrder(
+     input: ExecuteCreateMarketplaceOrderRequest,
+   ): Promise<ExecuteCreateMarketplaceOrderResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v2/checkout/orders`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+       requestId: input.providerRequestId,
+       body: {
+@@ -221,14 +236,11 @@
+     input: ExecuteGetMarketplaceOrderRequest,
+   ): Promise<ExecuteGetMarketplaceOrderResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl(input.environment)}/v2/checkout/orders/${pathSegment(input.providerOrderId, 'providerOrderId')}`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+     });
+     if (response.status === 404) {
+@@ -260,14 +272,11 @@
+     input: ExecuteCaptureMarketplaceOrderRequest,
+   ): Promise<ExecuteCaptureMarketplaceOrderResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v2/checkout/orders/${pathSegment(input.providerOrderId, 'providerOrderId')}/capture`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+       requestId: input.providerRequestId,
+       body: {},
+@@ -319,10 +328,8 @@
+     input: ExecuteRefundMarketplaceUnitRequest,
+   ): Promise<ExecuteRefundMarketplaceUnitResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const body: Record<string, unknown> = {};
+     if (input.amount) {
+       body['amount'] = {
+@@ -345,10 +352,9 @@
+         ],
+       };
+     }
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v2/payments/captures/${pathSegment(input.providerCaptureId, 'providerCaptureId')}/refund`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+       requestId: input.providerRequestId,
+       body: Object.keys(body).length > 0 ? body : undefined,
+@@ -391,14 +397,11 @@
+ 
+   async getRefund(input: ExecuteGetRefundRequest): Promise<ExecuteGetRefundResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl(input.environment)}/v2/payments/refunds/${pathSegment(input.providerRefundId, 'providerRefundId')}`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+     });
+     if (response.status === 404) {
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-oauth-client.ts src/paypal/lib/paypal-oauth-client.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-oauth-client.ts	2026-10-22 12:01:28.819623754 +0300
++++ src/paypal/lib/paypal-oauth-client.ts	2026-10-22 12:15:02.824328458 +0300
+@@ -29,6 +29,14 @@
+   inflight: Promise<string> | null;
+ };
+ 
++export type PaypalAccessTokenRequestOptions = {
++  /**
++   * Token that PayPal just answered with HTTP 401. It is evicted from the cache (only if it is still
++   * the cached one) so the next call fetches a fresh token; concurrent callers share one refresh.
++   */
++  rejectedToken?: string;
++};
++
+ export class PaypalOAuthClient {
+   private readonly registry = new ScopedTokenCacheRegistry<ScopeState>();
+ 
+@@ -40,8 +48,27 @@
+     private readonly safetyMarginMs = DEFAULT_SAFETY_MARGIN_MS,
+   ) {}
+ 
+-  async getAccessToken(scope: TokenCacheScopeInput): Promise<string> {
+-    const state = this.registry.get(scope, () => ({ cached: null, inflight: null }));
++  async getAccessToken(
++    scope: TokenCacheScopeInput,
++    options?: PaypalAccessTokenRequestOptions,
++  ): Promise<string> {
++    const credentials = this.credentialsByScope(scope);
++    if (!credentials) {
++      throw {
++        code: PAYMENT_RELIABILITY_ERROR.PROVIDER_AUTH_FAILURE,
++        message: 'PayPal OAuth credentials are not configured',
++        retryable: false,
++        uncertain: false,
++      };
++    }
++
++    const state = this.registry.get({ ...scope, clientId: credentials.clientId }, () => ({
++      cached: null,
++      inflight: null,
++    }));
++    if (options?.rejectedToken !== undefined && state.cached?.token === options.rejectedToken) {
++      state.cached = null;
++    }
+     if (state.cached && state.cached.expiresAt > Date.now()) {
+       return state.cached.token;
+     }
+@@ -49,7 +76,7 @@
+       return state.inflight;
+     }
+ 
+-    state.inflight = this.refresh(scope, state);
++    state.inflight = this.refresh(credentials, state);
+     try {
+       return await state.inflight;
+     } finally {
+@@ -57,17 +84,7 @@
+     }
+   }
+ 
+-  private async refresh(scope: TokenCacheScopeInput, state: ScopeState): Promise<string> {
+-    const credentials = this.credentialsByScope(scope);
+-    if (!credentials) {
+-      throw {
+-        code: PAYMENT_RELIABILITY_ERROR.PROVIDER_AUTH_FAILURE,
+-        message: 'PayPal OAuth credentials are not configured',
+-        retryable: false,
+-        uncertain: false,
+-      };
+-    }
+-
++  private async refresh(credentials: PaypalOAuthCredentials, state: ScopeState): Promise<string> {
+     const baseUrl =
+       credentials.environment === 'live'
+         ? 'https://api-m.paypal.com'
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-payout-executor.factory.ts src/paypal/lib/paypal-payout-executor.factory.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-payout-executor.factory.ts	2026-10-22 12:01:28.819715706 +0300
++++ src/paypal/lib/paypal-payout-executor.factory.ts	2026-10-22 12:18:07.243183161 +0300
+@@ -2,6 +2,7 @@
+ import type { PaymentExecutionStatus } from '../../contracts/index';
+ import type { ResolvedPaymentRuntime } from '../../core/index';
+ import {
++  assertProviderNetworkAllowedInProduction,
+   blockedHttpClient,
+   blockedOAuthGetter,
+   shouldRejectProviderNetworkCalls,
+@@ -29,6 +30,13 @@
+   const { runtime, nodeEnv, forceFakeHttp, httpClient, executionStatus } = input;
+   const isProduction = nodeEnv === 'production';
+ 
++  assertProviderNetworkAllowedInProduction({
++    runtime,
++    executionStatus,
++    nodeEnv,
++    component: 'PayPal payout executor',
++  });
++
+   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
+     return new PaypalPayoutExecutor(runtime, blockedHttpClient(), blockedOAuthGetter());
+   }
+@@ -71,10 +79,13 @@
+   const payoutHttp =
+     httpClient ?? new FetchPaypalPayoutHttpClient(credentials.requestTimeoutMs ?? 10_000);
+ 
+-  return new PaypalPayoutExecutor(runtime, payoutHttp, (scope) =>
+-    oauthClient.getAccessToken({
+-      accountRef: scope.accountRef,
+-      environment: scope.environment,
+-    }),
++  return new PaypalPayoutExecutor(runtime, payoutHttp, (scope, options) =>
++    oauthClient.getAccessToken(
++      {
++        accountRef: scope.accountRef,
++        environment: scope.environment,
++      },
++      options,
++    ),
+   );
+ }
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-payout-executor.ts src/paypal/lib/paypal-payout-executor.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-payout-executor.ts	2026-10-22 12:01:28.819582100 +0300
++++ src/paypal/lib/paypal-payout-executor.ts	2026-10-22 12:22:30.405767234 +0300
+@@ -20,9 +20,17 @@
+   type ResolvedPaymentRuntime,
+ } from '../../core/index';
+ import { mapPaypalBatchStatus, mapPaypalItemTransactionStatus } from '../../core/index';
++import {
++  resendWithFreshPaypalTokenOn401,
++  type PaypalAccessTokenScope,
++} from './paypal-access-token-retry';
+ import { extractPaypalIssueCodes } from './paypal-checkout-order-parsing';
+ import type { PaypalCheckoutTokenProvider } from './paypal-checkout-executor';
+-import type { PaypalPayoutHttpClient } from './paypal-payout-http-client';
++import type {
++  PaypalPayoutHttpClient,
++  PaypalPayoutHttpRequest,
++  PaypalPayoutHttpResponse,
++} from './paypal-payout-http-client';
+ 
+ function majorToMinor(value: string, currency: string): string {
+   const [whole = '0', fraction = ''] = value.split('.');
+@@ -158,24 +166,31 @@
+     private readonly tokenProvider: PaypalCheckoutTokenProvider,
+   ) {}
+ 
++  private authorizedRequest(
++    scope: PaypalAccessTokenScope,
++    token: string,
++    request: Omit<PaypalPayoutHttpRequest, 'accessToken'>,
++  ): Promise<PaypalPayoutHttpResponse> {
++    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
++      this.httpClient.request({ ...request, accessToken }),
++    );
++  }
++
+   async submitBatch(
+     input: ExecuteSubmitPayoutBatchRequest,
+   ): Promise<ExecuteSubmitPayoutBatchResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'payout');
+     assertPayoutSenderIdLengths(input);
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+         : 'https://api-m.sandbox.paypal.com';
+ 
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl}/v1/payments/payouts`,
+-      accessToken: token,
+       requestId: input.providerRequestId,
+       body: {
+         sender_batch_header: {
+@@ -209,10 +224,9 @@
+           providerDebugId: response.debugId ?? null,
+         };
+       }
+-      const existing = await this.httpClient.request({
++      const existing = await this.authorizedRequest(tokenScope, token, {
+         method: 'GET',
+         path: `${baseUrl}/v1/payments/payouts/${pathSegment(providerPayoutBatchId, 'providerPayoutBatchId')}`,
+-        accessToken: token,
+       });
+       if (existing.status >= 400) {
+         throw {
+@@ -300,36 +314,30 @@
+ 
+   async getBatch(input: ExecuteGetPayoutBatchRequest): Promise<ExecuteGetPayoutBatchResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'payout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+         : 'https://api-m.sandbox.paypal.com';
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl}/v1/payments/payouts/${pathSegment(input.providerPayoutBatchId, 'providerPayoutBatchId')}`,
+-      accessToken: token,
+     });
+     return this.mapBatchLookup(response, input.providerPayoutBatchId);
+   }
+ 
+   async getItem(input: ExecuteGetPayoutItemRequest): Promise<ExecuteGetPayoutItemResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'payout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+         : 'https://api-m.sandbox.paypal.com';
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl}/v1/payments/payouts-item/${pathSegment(input.providerPayoutItemId, 'providerPayoutItemId')}`,
+-      accessToken: token,
+     });
+     return this.mapItemLookup(response, input.providerPayoutItemId);
+   }
+@@ -338,18 +346,15 @@
+     input: ExecuteCancelUnclaimedPayoutItemRequest,
+   ): Promise<ExecuteCancelUnclaimedPayoutItemResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'payout');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
+     const baseUrl =
+       input.environment === 'live'
+         ? 'https://api-m.paypal.com'
+         : 'https://api-m.sandbox.paypal.com';
+-    const response = await this.httpClient.request({
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl}/v1/payments/payouts-item/${pathSegment(input.providerPayoutItemId, 'providerPayoutItemId')}/cancel`,
+-      accessToken: token,
+       body: {},
+     });
+     if (response.status >= 400) {
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-seller-onboarding-executor.factory.ts src/paypal/lib/paypal-seller-onboarding-executor.factory.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-seller-onboarding-executor.factory.ts	2026-10-22 12:01:28.819819647 +0300
++++ src/paypal/lib/paypal-seller-onboarding-executor.factory.ts	2026-10-22 12:17:42.336030840 +0300
+@@ -2,6 +2,7 @@
+ import type { PaymentExecutionStatus } from '../../contracts/index';
+ import type { ResolvedPaymentRuntime } from '../../core/index';
+ import {
++  assertProviderNetworkAllowedInProduction,
+   blockedHttpClient,
+   blockedOAuthGetter,
+   shouldRejectProviderNetworkCalls,
+@@ -33,6 +34,13 @@
+   const { runtime, nodeEnv, forceFakeHttp, httpClient, executionStatus, partnerConfig } = input;
+   const isProduction = nodeEnv === 'production';
+ 
++  assertProviderNetworkAllowedInProduction({
++    runtime,
++    executionStatus,
++    nodeEnv,
++    component: 'PayPal seller onboarding executor',
++  });
++
+   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
+     return new PaypalSellerOnboardingExecutor(
+       runtime,
+@@ -89,11 +97,14 @@
+   return new PaypalSellerOnboardingExecutor(
+     runtime,
+     sellerHttp,
+-    (scope) =>
+-      oauthClient.getAccessToken({
+-        accountRef: scope.accountRef,
+-        environment: scope.environment,
+-      }),
++    (scope, options) =>
++      oauthClient.getAccessToken(
++        {
++          accountRef: scope.accountRef,
++          environment: scope.environment,
++        },
++        options,
++      ),
+     partnerConfig,
+   );
+ }
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-seller-onboarding-executor.ts src/paypal/lib/paypal-seller-onboarding-executor.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-seller-onboarding-executor.ts	2026-10-22 12:01:28.819749728 +0300
++++ src/paypal/lib/paypal-seller-onboarding-executor.ts	2026-10-22 12:22:30.405913408 +0300
+@@ -15,8 +15,16 @@
+   type ResolvedPaymentRuntime,
+   type SellerOnboardingProviderPort,
+ } from '../../core/index';
++import {
++  resendWithFreshPaypalTokenOn401,
++  type PaypalAccessTokenScope,
++} from './paypal-access-token-retry';
+ import type { PaypalCheckoutTokenProvider } from './paypal-checkout-executor';
+-import type { PaypalSellerOnboardingHttpClient } from './paypal-seller-onboarding-http-client';
++import type {
++  PaypalSellerOnboardingHttpClient,
++  PaypalSellerOnboardingHttpRequest,
++  PaypalSellerOnboardingHttpResponse,
++} from './paypal-seller-onboarding-http-client';
+ 
+ export type PaypalSellerOnboardingPartnerConfig = {
+   partnerMerchantId: string;
+@@ -102,18 +110,25 @@
+     private readonly partnerConfig: PaypalSellerOnboardingPartnerConfig,
+   ) {}
+ 
++  private authorizedRequest(
++    scope: PaypalAccessTokenScope,
++    token: string,
++    request: Omit<PaypalSellerOnboardingHttpRequest, 'accessToken'>,
++  ): Promise<PaypalSellerOnboardingHttpResponse> {
++    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
++      this.httpClient.request({ ...request, accessToken }),
++    );
++  }
++
+   async createReferral(
+     input: ExecuteCreateSellerReferralRequest,
+   ): Promise<ExecuteCreateSellerReferralResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'seller_onboarding');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v2/customer/partner-referrals`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+       requestId: input.providerRequestId,
+       body: {
+@@ -154,14 +169,11 @@
+     input: ExecuteGetSellerReferralRequest,
+   ): Promise<ExecuteGetSellerReferralResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'seller_onboarding');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl(input.environment)}/v2/customer/partner-referrals/${pathSegment(input.providerReferralId, 'providerReferralId')}`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+     });
+     if (response.status >= 400) {
+@@ -178,14 +190,11 @@
+     input: ExecuteFindSellerMerchantRequest,
+   ): Promise<ExecuteFindSellerMerchantResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'seller_onboarding');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl(input.environment)}/v1/customer/partners/${pathSegment(this.partnerConfig.partnerMerchantId, 'partnerMerchantId')}/merchant-integrations?tracking_id=${encodeURIComponent(input.trackingId)}`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+     });
+     if (response.status === 404) {
+@@ -232,14 +241,11 @@
+     input: ExecuteGetSellerMerchantStatusRequest,
+   ): Promise<ExecuteGetSellerMerchantStatusResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'seller_onboarding');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl(input.environment)}/v1/customer/partners/${pathSegment(this.partnerConfig.partnerMerchantId, 'partnerMerchantId')}/merchant-integrations/${pathSegment(input.providerMerchantId, 'providerMerchantId')}`,
+-      accessToken: token,
+       attributionId: this.partnerConfig.partnerAttributionId,
+     });
+     if (response.status >= 400) {
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-subscription-executor.factory.ts src/paypal/lib/paypal-subscription-executor.factory.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-subscription-executor.factory.ts	2026-10-22 12:01:28.819957264 +0300
++++ src/paypal/lib/paypal-subscription-executor.factory.ts	2026-10-22 12:17:42.360030676 +0300
+@@ -2,6 +2,7 @@
+ import type { PaymentExecutionStatus } from '../../contracts/index';
+ import type { ResolvedPaymentRuntime } from '../../core/index';
+ import {
++  assertProviderNetworkAllowedInProduction,
+   blockedHttpClient,
+   blockedOAuthGetter,
+   shouldRejectProviderNetworkCalls,
+@@ -29,6 +30,13 @@
+   const { runtime, nodeEnv, forceFakeHttp, httpClient, executionStatus } = input;
+   const isProduction = nodeEnv === 'production';
+ 
++  assertProviderNetworkAllowedInProduction({
++    runtime,
++    executionStatus,
++    nodeEnv,
++    component: 'PayPal subscription executor',
++  });
++
+   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
+     return new PaypalSubscriptionExecutor(runtime, blockedHttpClient(), blockedOAuthGetter());
+   }
+@@ -71,10 +79,13 @@
+   const subscriptionHttp =
+     httpClient ?? new FetchPaypalSubscriptionHttpClient(credentials.requestTimeoutMs ?? 10_000);
+ 
+-  return new PaypalSubscriptionExecutor(runtime, subscriptionHttp, (scope) =>
+-    oauthClient.getAccessToken({
+-      accountRef: scope.accountRef,
+-      environment: scope.environment,
+-    }),
++  return new PaypalSubscriptionExecutor(runtime, subscriptionHttp, (scope, options) =>
++    oauthClient.getAccessToken(
++      {
++        accountRef: scope.accountRef,
++        environment: scope.environment,
++      },
++      options,
++    ),
+   );
+ }
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-subscription-executor.ts src/paypal/lib/paypal-subscription-executor.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-subscription-executor.ts	2026-10-22 12:01:28.819852088 +0300
++++ src/paypal/lib/paypal-subscription-executor.ts	2026-10-22 12:22:30.405062217 +0300
+@@ -30,8 +30,16 @@
+   mapPaypalProductStatus,
+   mapPaypalSubscriptionStatus,
+ } from '../../core/index';
++import {
++  resendWithFreshPaypalTokenOn401,
++  type PaypalAccessTokenScope,
++} from './paypal-access-token-retry';
+ import type { PaypalCheckoutTokenProvider } from './paypal-checkout-executor';
+-import type { PaypalSubscriptionHttpClient } from './paypal-subscription-http-client';
++import type {
++  PaypalSubscriptionHttpClient,
++  PaypalSubscriptionHttpRequest,
++  PaypalSubscriptionHttpResponse,
++} from './paypal-subscription-http-client';
+ 
+ function baseUrl(environment: 'sandbox' | 'live'): string {
+   return environment === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+@@ -154,18 +162,25 @@
+     private readonly tokenProvider: PaypalCheckoutTokenProvider,
+   ) {}
+ 
++  private authorizedRequest(
++    scope: PaypalAccessTokenScope,
++    token: string,
++    request: Omit<PaypalSubscriptionHttpRequest, 'accessToken'>,
++  ): Promise<PaypalSubscriptionHttpResponse> {
++    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
++      this.httpClient.request({ ...request, accessToken }),
++    );
++  }
++
+   async createProduct(
+     input: ExecuteCreateCatalogProductRequest,
+   ): Promise<ExecuteCreateCatalogProductResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v1/catalogs/products`,
+-      accessToken: token,
+       requestId: input.providerRequestId,
+       body: {
+         name: input.name,
+@@ -192,14 +207,11 @@
+     input: ExecuteGetCatalogProductRequest,
+   ): Promise<ExecuteGetCatalogProductResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl(input.environment)}/v1/catalogs/products/${pathSegment(input.providerProductId, 'providerProductId')}`,
+-      accessToken: token,
+     });
+     mapHttpError(response, 'PayPal catalog product lookup failed');
+     return {
+@@ -215,14 +227,11 @@
+     input: ExecuteCreateBillingPlanRequest,
+   ): Promise<ExecuteCreateBillingPlanResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v1/billing/plans`,
+-      accessToken: token,
+       requestId: input.providerRequestId,
+       body: {
+         product_id: input.providerProductId,
+@@ -262,14 +271,11 @@
+ 
+   async getPlan(input: ExecuteGetBillingPlanRequest): Promise<ExecuteGetBillingPlanResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl(input.environment)}/v1/billing/plans/${pathSegment(input.providerPlanId, 'providerPlanId')}`,
+-      accessToken: token,
+     });
+     mapHttpError(response, 'PayPal billing plan lookup failed');
+     return {
+@@ -293,14 +299,11 @@
+     input: ExecuteCreateSubscriptionRequest,
+   ): Promise<ExecuteCreateSubscriptionResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v1/billing/subscriptions`,
+-      accessToken: token,
+       requestId: input.providerRequestId,
+       body: {
+         plan_id: input.providerPlanId,
+@@ -340,14 +343,11 @@
+     input: ExecuteGetSubscriptionRequest,
+   ): Promise<ExecuteGetSubscriptionResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'GET',
+       path: `${baseUrl(input.environment)}/v1/billing/subscriptions/${pathSegment(input.providerSubscriptionId, 'providerSubscriptionId')}`,
+-      accessToken: token,
+     });
+     mapHttpError(response, 'PayPal subscription lookup failed');
+     const billingInfo = response.body['billing_info'] as Record<string, unknown> | undefined;
+@@ -389,14 +389,11 @@
+     action: 'activate' | 'deactivate',
+   ): Promise<ExecutePlanLifecycleResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v1/billing/plans/${pathSegment(input.providerPlanId, 'providerPlanId')}/${action}`,
+-      accessToken: token,
+       body: {},
+     });
+     mapHttpError(response, `PayPal billing plan ${action} failed`);
+@@ -419,14 +416,11 @@
+     action: 'cancel' | 'suspend' | 'activate',
+   ): Promise<ExecuteSubscriptionLifecycleResult> {
+     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
+-    const token = await this.tokenProvider({
+-      accountRef: input.accountRef,
+-      environment: input.environment,
+-    });
+-    const response = await this.httpClient.request({
++    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
++    const token = await this.tokenProvider(tokenScope);
++    const response = await this.authorizedRequest(tokenScope, token, {
+       method: 'POST',
+       path: `${baseUrl(input.environment)}/v1/billing/subscriptions/${pathSegment(input.providerSubscriptionId, 'providerSubscriptionId')}/${action}`,
+-      accessToken: token,
+       body: { reason: input.reason },
+     });
+     mapHttpError(response, `PayPal subscription ${action} failed`);
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-webhook-verifier.factory.ts src/paypal/lib/paypal-webhook-verifier.factory.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-webhook-verifier.factory.ts	2026-10-22 12:01:28.820083163 +0300
++++ src/paypal/lib/paypal-webhook-verifier.factory.ts	2026-10-22 12:18:41.118636573 +0300
+@@ -2,7 +2,10 @@
+ import type { PaymentExecutionStatus } from '../../contracts/index';
+ import type { ResolvedPaymentRuntime } from '../../core/index';
+ import { createBlockedWebhookVerificationClient } from './blocked-provider-network';
+-import { shouldRejectProviderNetworkCalls } from './build-reject-only-executor';
++import {
++  assertProviderNetworkAllowedInProduction,
++  shouldRejectProviderNetworkCalls,
++} from './build-reject-only-executor';
+ import { FakePaypalWebhookVerificationClient } from './fake-paypal-webhook-verification-client';
+ import { FetchPaypalOAuthHttpClient } from './live-paypal-http-clients';
+ import { LivePaypalWebhookVerificationClient } from './live-paypal-webhook-verification-client';
+@@ -14,6 +17,13 @@
+   nodeEnv?: string;
+   executionStatus?: PaymentExecutionStatus;
+   forceFake?: boolean;
++  /** PayPal webhook id (`PAYPAL_WEBHOOK_ID`); used when a verify request carries none. */
++  webhookId?: string;
++  /**
++   * Throw when the verifier is built without `webhookId`, instead of answering every request with
++   * `verification_unavailable`. Defaults to true when `nodeEnv === 'production'`.
++   */
++  requireWebhookId?: boolean;
+ };
+ 
+ export function buildPaypalWebhookVerifier(
+@@ -21,12 +31,28 @@
+ ): PaypalWebhookVerifier {
+   const { runtime, nodeEnv, forceFake, executionStatus } = input;
+   const isProduction = nodeEnv === 'production';
++  const webhookId = input.webhookId?.trim() || undefined;
++  const options = { webhookId };
++
++  assertProviderNetworkAllowedInProduction({
++    runtime,
++    executionStatus,
++    nodeEnv,
++    component: 'PayPal webhook verifier',
++  });
++  if ((input.requireWebhookId ?? isProduction) && !webhookId) {
++    throw new PaymentConfigurationError(
++      'PayPal webhook verification requires a webhook id (PAYPAL_WEBHOOK_ID)',
++      ['webhookId'],
++    );
++  }
+ 
+   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
+     return new PaypalWebhookVerifier(
+       runtime,
+       createBlockedWebhookVerificationClient(),
+       nodeEnv,
++      options,
+     );
+   }
+ 
+@@ -41,6 +67,7 @@
+       runtime,
+       new FakePaypalWebhookVerificationClient(),
+       nodeEnv,
++      options,
+     );
+   }
+ 
+@@ -50,6 +77,7 @@
+       runtime,
+       createBlockedWebhookVerificationClient(),
+       nodeEnv,
++      options,
+     );
+   }
+ 
+@@ -75,5 +103,6 @@
+       credentials.requestTimeoutMs ?? 10_000,
+     ),
+     nodeEnv,
++    options,
+   );
+ }
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/paypal-webhook-verifier.ts src/paypal/lib/paypal-webhook-verifier.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/paypal-webhook-verifier.ts	2026-10-22 12:01:28.820116985 +0300
++++ src/paypal/lib/paypal-webhook-verifier.ts	2026-10-22 12:19:02.121616805 +0300
+@@ -25,18 +25,33 @@
+     authAlgo: string;
+     transmissionSig: string;
+     webhookEvent: unknown;
++    /** Original webhook body text; live clients send it to PayPal unmodified (#15). */
++    rawWebhookEvent?: string;
+   }): Promise<{ verification_status: string }>;
+ };
+ 
++export type PaypalWebhookVerifierOptions = {
++  /** Webhook id used when a request carries none (checked when the verifier is built). */
++  webhookId?: string;
++};
++
++type ParsedWebhookEvent = { event_type?: string; resource?: { id?: string } };
++
++function isJsonObject(value: unknown): value is ParsedWebhookEvent {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
+ export class PaypalWebhookVerifier {
+   constructor(
+     private readonly runtime: ResolvedPaymentRuntime,
+     private readonly client: PaypalWebhookVerificationClient,
+     private readonly nodeEnv: string | undefined,
++    private readonly options: PaypalWebhookVerifierOptions = {},
+   ) {}
+ 
+   async verify(request: VerifyWebhookRequest): Promise<VerifyWebhookResult> {
+-    if (!request.webhookId?.trim()) {
++    const webhookId = request.webhookId?.trim() || this.options.webhookId?.trim();
++    if (!webhookId) {
+       return {
+         verified: false,
+         transmissionId: request.headers.transmissionId,
+@@ -47,32 +62,49 @@
+       };
+     }
+ 
+-    let parsed: { event_type?: string; resource?: { id?: string } };
++    let parsed: ParsedWebhookEvent;
+     try {
+-      parsed = JSON.parse(request.rawBody) as { event_type?: string; resource?: { id?: string } };
++      const value: unknown = JSON.parse(request.rawBody);
++      if (!isJsonObject(value)) {
++        throw new Error('not an object');
++      }
++      parsed = value;
+     } catch {
+       return {
+         verified: false,
+         transmissionId: request.headers.transmissionId,
+         eventType: null,
+         resourceId: null,
+-        unavailableReason: 'Webhook body is not valid JSON',
++        unavailableReason: 'Webhook body is not a valid JSON object',
+         failureKind: 'invalid_payload',
+       };
+     }
+ 
+     try {
+       const response = await this.client.verifyWebhookSignature({
+-        webhookId: request.webhookId,
++        webhookId,
+         transmissionId: request.headers.transmissionId,
+         transmissionTime: request.headers.transmissionTime,
+         certUrl: request.headers.certUrl,
+         authAlgo: request.headers.authAlgo,
+         transmissionSig: request.headers.transmissionSig,
+         webhookEvent: parsed,
++        rawWebhookEvent: request.rawBody,
+       });
+ 
+-      const verified = response.verification_status === 'SUCCESS';
++      // Only an explicit FAILURE is a rejected signature; anything else we cannot read stays retryable.
++      const status = response.verification_status;
++      if (status !== 'SUCCESS' && status !== 'FAILURE') {
++        return {
++          verified: false,
++          transmissionId: request.headers.transmissionId,
++          eventType: parsed.event_type ?? null,
++          resourceId: parsed.resource?.id ?? null,
++          unavailableReason: 'PayPal webhook verification is temporarily unavailable',
++          failureKind: 'verification_unavailable',
++        };
++      }
++      const verified = status === 'SUCCESS';
+       return {
+         verified,
+         transmissionId: request.headers.transmissionId,
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/__tests__/live-paypal-http-clients.unit.test.ts src/paypal/lib/__tests__/live-paypal-http-clients.unit.test.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/__tests__/live-paypal-http-clients.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/paypal/lib/__tests__/live-paypal-http-clients.unit.test.ts	2026-10-22 12:24:45.092480978 +0300
+@@ -0,0 +1,297 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import {
++  FetchPaypalOAuthHttpClient,
++  FetchPaypalOrdersHttpClient,
++  FetchPaypalPayoutHttpClient,
++  FetchPaypalSellerOnboardingHttpClient,
++  FetchPaypalSubscriptionHttpClient,
++} from '../live-paypal-http-clients';
++
++const TOKEN = 'live-access-token-123';
++const SUBSCRIPTIONS = 'https://api-m.sandbox.paypal.com/v1/billing/subscriptions';
++const OAUTH = 'https://api-m.sandbox.paypal.com/v1/oauth2/token';
++
++type FetchInit = RequestInit & { headers: Record<string, string> };
++
++function stubFetch(respond: (url: string, init: FetchInit) => Promise<Response> | Response) {
++  const fetchMock = vi.fn(async (url: string, init: FetchInit) => respond(url, init));
++  vi.stubGlobal('fetch', fetchMock);
++  return fetchMock;
++}
++
++/** A fetch that never answers until its signal aborts (real AbortController timeout). */
++function hangingFetch() {
++  return stubFetch(
++    (_url, init) =>
++      new Promise<Response>((_resolve, reject) => {
++        init.signal?.addEventListener('abort', () => {
++          const error = new Error('This operation was aborted');
++          error.name = 'AbortError';
++          reject(error);
++        });
++      }),
++  );
++}
++
++function json(status: number, body: unknown, headers: Record<string, string> = {}) {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { 'content-type': 'application/json', ...headers },
++  });
++}
++
++describe('FetchPaypalSubscriptionHttpClient', () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  it('sends bearer auth, request id and JSON body and parses a success response', async () => {
++    const fetchMock = stubFetch(() =>
++      json(201, { id: 'I-1', status: 'APPROVAL_PENDING' }, { 'paypal-debug-id': 'dbg-1' }),
++    );
++    const response = await new FetchPaypalSubscriptionHttpClient(5_000).request({
++      method: 'POST',
++      path: SUBSCRIPTIONS,
++      accessToken: TOKEN,
++      requestId: 'req-1',
++      body: { plan_id: 'P-1' },
++    });
++
++    expect(response).toEqual({
++      status: 201,
++      body: { id: 'I-1', status: 'APPROVAL_PENDING' },
++      debugId: 'dbg-1',
++    });
++    const [url, init] = fetchMock.mock.calls[0]!;
++    expect(url).toBe(SUBSCRIPTIONS);
++    expect(init.method).toBe('POST');
++    expect(init.headers).toMatchObject({
++      Authorization: `Bearer ${TOKEN}`,
++      'Content-Type': 'application/json',
++      'PayPal-Request-Id': 'req-1',
++    });
++    expect(init.body).toBe('{"plan_id":"P-1"}');
++  });
++
++  it('sends no body and no request id on a GET', async () => {
++    const fetchMock = stubFetch(() => json(200, { id: 'I-1' }));
++    await new FetchPaypalSubscriptionHttpClient().request({
++      method: 'GET',
++      path: `${SUBSCRIPTIONS}/I-1`,
++      accessToken: TOKEN,
++    });
++    const init = fetchMock.mock.calls[0]![1];
++    expect(init.body).toBeUndefined();
++    expect(init.headers['PayPal-Request-Id']).toBeUndefined();
++  });
++
++  it('maps a 204 with an empty body to an empty object', async () => {
++    stubFetch(() => new Response(null, { status: 204 }));
++    const response = await new FetchPaypalSubscriptionHttpClient().request({
++      method: 'POST',
++      path: `${SUBSCRIPTIONS}/I-1/cancel`,
++      accessToken: TOKEN,
++      body: { reason: 'r' },
++    });
++    expect(response).toEqual({ status: 204, body: {}, debugId: null });
++  });
++
++  it('returns 4xx and 5xx JSON error bodies with the debug id for the executor to map', async () => {
++    for (const status of [400, 404, 422, 500, 503]) {
++      stubFetch(() =>
++        json(status, { name: 'ERR', debug_id: 'abc' }, { 'paypal-debug-id': `dbg-${status}` }),
++      );
++      const response = await new FetchPaypalSubscriptionHttpClient().request({
++        method: 'GET',
++        path: `${SUBSCRIPTIONS}/I-1`,
++        accessToken: TOKEN,
++      });
++      expect(response).toEqual({
++        status,
++        body: { name: 'ERR', debug_id: 'abc' },
++        debugId: `dbg-${status}`,
++      });
++    }
++  });
++
++  it('keeps at most 200 characters of a non-JSON body', async () => {
++    stubFetch(() => new Response(`<html>${'x'.repeat(500)}</html>`, { status: 502 }));
++    const response = await new FetchPaypalSubscriptionHttpClient().request({
++      method: 'GET',
++      path: `${SUBSCRIPTIONS}/I-1`,
++      accessToken: TOKEN,
++    });
++    expect(response.status).toBe(502);
++    expect(String(response.body['raw'])).toHaveLength(200);
++  });
++
++  it('times out with a sanitized, retryable uncertain error', async () => {
++    hangingFetch();
++    const error = await new FetchPaypalSubscriptionHttpClient(10)
++      .request({ method: 'GET', path: `${SUBSCRIPTIONS}/I-1`, accessToken: TOKEN })
++      .catch((caught: unknown) => caught);
++    expect(error).toMatchObject({
++      code: 'PROVIDER_UNCERTAIN',
++      message: 'PayPal subscription HTTP request timed out',
++      retryable: true,
++      uncertain: true,
++    });
++    expect(JSON.stringify(error)).not.toContain(TOKEN);
++  });
++
++  it('sanitizes a network failure without the token or URL internals', async () => {
++    stubFetch(() => {
++      throw new TypeError(`fetch failed Authorization: Bearer ${TOKEN}`);
++    });
++    const error = await new FetchPaypalSubscriptionHttpClient()
++      .request({ method: 'GET', path: `${SUBSCRIPTIONS}/I-1`, accessToken: TOKEN })
++      .catch((caught: unknown) => caught);
++    expect(error).toMatchObject({
++      code: 'PROVIDER_UNCERTAIN',
++      message: 'PayPal subscription request failed due to a network error',
++    });
++    expect(JSON.stringify(error)).not.toContain(TOKEN);
++    expect(String((error as Error).message)).not.toContain(TOKEN);
++  });
++});
++
++describe('FetchPaypalOAuthHttpClient', () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  const basic = { Authorization: 'Basic Y2xpZW50OnNlY3JldA==' };
++
++  it('posts the form and parses the token response', async () => {
++    const fetchMock = stubFetch(() =>
++      json(200, { access_token: 'tok', expires_in: 32_400 }, { 'paypal-debug-id': 'dbg-o' }),
++    );
++    const form = new URLSearchParams({ grant_type: 'client_credentials' });
++    const response = await new FetchPaypalOAuthHttpClient().postForm(OAUTH, form, basic, 5_000);
++    expect(response).toEqual({
++      status: 200,
++      body: { access_token: 'tok', expires_in: 32_400 },
++      debugId: 'dbg-o',
++    });
++    const [url, init] = fetchMock.mock.calls[0]!;
++    expect(url).toBe(OAUTH);
++    expect(init.method).toBe('POST');
++    expect(init.body).toBe(form);
++    expect(init.headers).toBe(basic);
++  });
++
++  it('maps an empty 204 body to an empty object', async () => {
++    stubFetch(() => new Response(null, { status: 204 }));
++    const response = await new FetchPaypalOAuthHttpClient().postForm(
++      OAUTH,
++      new URLSearchParams(),
++      basic,
++      5_000,
++    );
++    expect(response).toEqual({ status: 204, body: {}, debugId: null });
++  });
++
++  it('returns 401 and 500 JSON bodies as data', async () => {
++    for (const status of [401, 500]) {
++      stubFetch(() => json(status, { error: 'invalid_client' }));
++      const response = await new FetchPaypalOAuthHttpClient().postForm(
++        OAUTH,
++        new URLSearchParams(),
++        basic,
++        5_000,
++      );
++      expect(response.status).toBe(status);
++      expect(response.body).toEqual({ error: 'invalid_client' });
++    }
++  });
++
++  it('keeps at most 200 characters of a non-JSON body', async () => {
++    stubFetch(() => new Response('y'.repeat(1_000), { status: 503 }));
++    const response = await new FetchPaypalOAuthHttpClient().postForm(
++      OAUTH,
++      new URLSearchParams(),
++      basic,
++      5_000,
++    );
++    expect(String(response.body['raw'])).toHaveLength(200);
++  });
++
++  it('times out with a sanitized, retryable error that does not carry credentials', async () => {
++    hangingFetch();
++    const error = await new FetchPaypalOAuthHttpClient()
++      .postForm(OAUTH, new URLSearchParams(), basic, 10)
++      .catch((caught: unknown) => caught);
++    expect(error).toMatchObject({
++      code: 'PROVIDER_UNCERTAIN',
++      message: 'PayPal OAuth request timed out',
++      retryable: true,
++    });
++    expect(JSON.stringify(error)).not.toContain('Y2xpZW50OnNlY3JldA');
++  });
++});
++
++describe('live PayPal HTTP clients never follow redirects with credentials', () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  const calls: Array<[string, () => Promise<unknown>]> = [
++    [
++      'oauth',
++      () => new FetchPaypalOAuthHttpClient().postForm(OAUTH, new URLSearchParams(), {}, 5_000),
++    ],
++    [
++      'subscription',
++      () =>
++        new FetchPaypalSubscriptionHttpClient().request({
++          method: 'GET',
++          path: SUBSCRIPTIONS,
++          accessToken: TOKEN,
++        }),
++    ],
++    [
++      'orders',
++      () =>
++        new FetchPaypalOrdersHttpClient().request({
++          method: 'GET',
++          path: SUBSCRIPTIONS,
++          accessToken: TOKEN,
++        }),
++    ],
++    [
++      'payout',
++      () =>
++        new FetchPaypalPayoutHttpClient().request({
++          method: 'GET',
++          path: SUBSCRIPTIONS,
++          accessToken: TOKEN,
++        }),
++    ],
++    [
++      'seller onboarding',
++      () =>
++        new FetchPaypalSellerOnboardingHttpClient().request({
++          method: 'GET',
++          path: SUBSCRIPTIONS,
++          accessToken: TOKEN,
++          attributionId: 'BN',
++        }),
++    ],
++  ];
++
++  for (const [label, call] of calls) {
++    it(`${label}: asks fetch to refuse redirects and maps the refusal to a sanitized error`, async () => {
++      const fetchMock = stubFetch((_url, init) => {
++        if (init.redirect === 'error') {
++          throw new TypeError('fetch failed: unexpected redirect to https://evil.example/');
++        }
++        return json(200, { followed: true });
++      });
++      const error = await call().catch((caught: unknown) => caught);
++      expect(fetchMock.mock.calls[0]![1].redirect).toBe('error');
++      expect(error).toMatchObject({ code: 'PROVIDER_UNCERTAIN', retryable: true });
++      expect(JSON.stringify(error)).not.toContain('evil.example');
++      expect(JSON.stringify(error)).not.toContain(TOKEN);
++    });
++  }
++});
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/__tests__/live-paypal-webhook-verification-client.unit.test.ts src/paypal/lib/__tests__/live-paypal-webhook-verification-client.unit.test.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/__tests__/live-paypal-webhook-verification-client.unit.test.ts	2026-10-22 12:01:28.818245782 +0300
++++ src/paypal/lib/__tests__/live-paypal-webhook-verification-client.unit.test.ts	2026-10-22 12:10:51.140409863 +0300
+@@ -82,7 +82,7 @@
+     });
+   });
+ 
+-  it('classifies non-retryable HTTP status as invalid_payload', async () => {
++  it('classifies non-retryable HTTP status as verification_unavailable, never a rejection', async () => {
+     vi.stubGlobal(
+       'fetch',
+       vi.fn(async () => ({
+@@ -99,7 +99,7 @@
+       5_000,
+     );
+     await expect(client.verifyWebhookSignature(baseInput)).rejects.toMatchObject({
+-      kind: 'invalid_payload',
++      kind: 'verification_unavailable',
+     });
+   });
+ 
+@@ -128,7 +128,7 @@
+     }
+   });
+ 
+-  it('rejects malformed JSON verify responses', async () => {
++  it('treats malformed JSON verify responses as verification_unavailable', async () => {
+     vi.stubGlobal(
+       'fetch',
+       vi.fn(async () => ({
+@@ -144,7 +144,155 @@
+       5_000,
+     );
+     await expect(client.verifyWebhookSignature(baseInput)).rejects.toMatchObject({
+-      kind: 'invalid_payload',
++      kind: 'verification_unavailable',
+     });
+   });
+ });
++
++describe('LivePaypalWebhookVerificationClient raw event and token handling', () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  const scope = { providerCode: 'paypal', accountRef: 'default', environment: 'sandbox' as const };
++  const headers = {
++    webhookId: 'WH-1',
++    transmissionId: 'tx-1',
++    transmissionTime: '2026-01-01T00:00:00Z',
++    certUrl: 'https://example.test/cert',
++    authAlgo: 'SHA256withRSA',
++    transmissionSig: 'sig',
++  };
++
++  function response(status: number, text: string) {
++    return { ok: status >= 200 && status < 300, status, text: async () => text };
++  }
++
++  it('sends the original raw event text byte-for-byte as webhook_event', async () => {
++    const raw =
++      '{ "id":"WH-9", "event_type":"PAYMENT.SALE.COMPLETED", "summary":"caf\\u00e9 \\u2713 \\ud83d\\ude00",' +
++      ' "resource":{"amount":{"total":"1.10","value":1.10,"big":1e2,"neg":-0.0},"id":"S-1"},' +
++      ' "zeta":1, "alpha":2 }';
++    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) =>
++      response(200, '{"verification_status":"SUCCESS"}'),
++    );
++    vi.stubGlobal('fetch', fetchMock);
++    const client = new LivePaypalWebhookVerificationClient(
++      { getAccessToken: vi.fn(async () => 'token') } as never,
++      scope,
++      'sandbox',
++      5_000,
++    );
++
++    await client.verifyWebhookSignature({
++      ...headers,
++      webhookEvent: JSON.parse(raw),
++      rawWebhookEvent: raw,
++    });
++
++    const sent = String(fetchMock.mock.calls[0]?.[1]?.body);
++    expect(sent.endsWith(`"webhook_event":${raw}}`)).toBe(true);
++    expect(sent).toContain('"total":"1.10","value":1.10,"big":1e2,"neg":-0.0');
++    expect(sent).toContain('caf\\u00e9 \\u2713 \\ud83d\\ude00');
++    expect(sent.indexOf('"zeta"')).toBeLessThan(sent.indexOf('"alpha"'));
++    expect(sent).not.toContain(JSON.stringify(JSON.parse(raw)));
++    const outer = JSON.parse(sent) as Record<string, unknown>;
++    expect(outer).toMatchObject({
++      auth_algo: 'SHA256withRSA',
++      cert_url: 'https://example.test/cert',
++      transmission_id: 'tx-1',
++      transmission_sig: 'sig',
++      transmission_time: '2026-01-01T00:00:00Z',
++      webhook_id: 'WH-1',
++    });
++    expect(outer['webhook_event']).toEqual(JSON.parse(raw));
++  });
++
++  it('refuses a raw event that is not a JSON object without calling PayPal', async () => {
++    const fetchMock = vi.fn();
++    vi.stubGlobal('fetch', fetchMock);
++    const client = new LivePaypalWebhookVerificationClient(
++      { getAccessToken: vi.fn(async () => 'token') } as never,
++      scope,
++      'sandbox',
++      5_000,
++    );
++    for (const raw of ['[1,2]', 'null', '"x"', '{"a":1} {"b":2}', '{"a":1}}, "webhook_id":"x"']) {
++      await expect(
++        client.verifyWebhookSignature({ ...headers, webhookEvent: {}, rawWebhookEvent: raw }),
++      ).rejects.toMatchObject({ kind: 'invalid_payload' });
++    }
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it('does not follow redirects with the bearer token', async () => {
++    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) =>
++      response(200, '{"verification_status":"SUCCESS"}'),
++    );
++    vi.stubGlobal('fetch', fetchMock);
++    const client = new LivePaypalWebhookVerificationClient(
++      { getAccessToken: vi.fn(async () => 'token') } as never,
++      scope,
++      'sandbox',
++      5_000,
++    );
++    await client.verifyWebhookSignature({ ...headers, webhookEvent: {} });
++    expect(fetchMock.mock.calls[0]?.[1]?.redirect).toBe('error');
++  });
++
++  it('evicts the token and retries once after a 401', async () => {
++    const getAccessToken = vi.fn(
++      async (_scope: unknown, options?: { rejectedToken?: string }) =>
++        options?.rejectedToken ? 'fresh' : 'revoked',
++    );
++    const fetchMock = vi.fn(async (_url: string, init: RequestInit) =>
++      (init.headers as Record<string, string>)['Authorization'] === 'Bearer revoked'
++        ? response(401, '{"name":"AUTHENTICATION_FAILURE"}')
++        : response(200, '{"verification_status":"SUCCESS"}'),
++    );
++    vi.stubGlobal('fetch', fetchMock);
++    const client = new LivePaypalWebhookVerificationClient(
++      { getAccessToken } as never,
++      scope,
++      'sandbox',
++      5_000,
++    );
++    const result = await client.verifyWebhookSignature({ ...headers, webhookEvent: {} });
++    expect(result.verification_status).toBe('SUCCESS');
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(getAccessToken.mock.calls[1]?.[1]).toEqual({ rejectedToken: 'revoked' });
++  });
++
++  for (const status of [400, 401, 403, 404, 409, 422]) {
++    it(`maps HTTP ${status} after the token retry to verification_unavailable`, async () => {
++      const fetchMock = vi.fn(async () => response(status, '{"name":"X"}'));
++      vi.stubGlobal('fetch', fetchMock);
++      const client = new LivePaypalWebhookVerificationClient(
++        { getAccessToken: vi.fn(async () => 'secret-access-token') } as never,
++        scope,
++        'sandbox',
++        5_000,
++      );
++      const error = await client
++        .verifyWebhookSignature({ ...headers, webhookEvent: {} })
++        .catch((caught: unknown) => caught);
++      expect(error).toBeInstanceOf(PaypalWebhookVerificationHttpError);
++      expect((error as PaypalWebhookVerificationHttpError).kind).toBe('verification_unavailable');
++      expect(String(error)).not.toContain('secret-access-token');
++      expect(fetchMock).toHaveBeenCalledTimes(status === 401 ? 2 : 1);
++    });
++  }
++
++  it('maps a 2xx without verification_status to verification_unavailable', async () => {
++    vi.stubGlobal('fetch', vi.fn(async () => response(200, '{}')));
++    const client = new LivePaypalWebhookVerificationClient(
++      { getAccessToken: vi.fn(async () => 'token') } as never,
++      scope,
++      'sandbox',
++      5_000,
++    );
++    await expect(
++      client.verifyWebhookSignature({ ...headers, webhookEvent: {} }),
++    ).rejects.toMatchObject({ kind: 'verification_unavailable' });
++  });
++});
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/__tests__/paypal-checkout-executor.factory.unit.test.ts src/paypal/lib/__tests__/paypal-checkout-executor.factory.unit.test.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/__tests__/paypal-checkout-executor.factory.unit.test.ts	2026-10-22 12:01:28.818343728 +0300
++++ src/paypal/lib/__tests__/paypal-checkout-executor.factory.unit.test.ts	2026-10-22 12:14:30.139452190 +0300
+@@ -1,5 +1,6 @@
+ import { describe, expect, it, vi } from 'vitest';
+ import type { ResolvedPaymentRuntime } from '../../../core/index';
++import { PaymentConfigurationError } from '../../../core/lib/payment-configuration-error';
+ import { buildPaypalCheckoutExecutor } from '../paypal-checkout-executor.factory';
+ 
+ function runtime(overrides: Partial<ResolvedPaymentRuntime> = {}): ResolvedPaymentRuntime {
+@@ -28,11 +29,21 @@
+ }
+ 
+ describe('buildPaypalCheckoutExecutor', () => {
+-  it('builds a reject-mode executor in production when checkout credentials are missing', () => {
++  it('refuses a reject-mode executor in production when checkout credentials are missing', () => {
++    expect(() =>
++      buildPaypalCheckoutExecutor({
++        runtime: runtime({ mode: 'fake', checkoutCredentials: undefined }),
++        strategyFactory: vi.fn(),
++        nodeEnv: 'production',
++      }),
++    ).toThrow(PaymentConfigurationError);
++  });
++
++  it('builds a reject-mode executor outside production when checkout credentials are missing', () => {
+     const executor = buildPaypalCheckoutExecutor({
+       runtime: runtime({ mode: 'fake', checkoutCredentials: undefined }),
+       strategyFactory: vi.fn(),
+-      nodeEnv: 'production',
++      nodeEnv: 'development',
+     });
+     expect(executor).toBeDefined();
+   });
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/__tests__/paypal-factory-production-guard.unit.test.ts src/paypal/lib/__tests__/paypal-factory-production-guard.unit.test.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/__tests__/paypal-factory-production-guard.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/paypal/lib/__tests__/paypal-factory-production-guard.unit.test.ts	2026-10-22 12:24:45.183480485 +0300
+@@ -0,0 +1,161 @@
++import { describe, expect, it, vi } from 'vitest';
++import type { PaymentExecutionStatus } from '../../../contracts/index';
++import { PaymentConfigurationError } from '../../../core/lib/payment-configuration-error';
++import type { ResolvedPaymentRuntime } from '../../../core/index';
++import { buildPaypalCheckoutExecutor } from '../paypal-checkout-executor.factory';
++import { buildPaypalMarketplaceExecutor } from '../paypal-marketplace-executor.factory';
++import { buildPaypalPayoutExecutor } from '../paypal-payout-executor.factory';
++import { buildPaypalSellerOnboardingExecutor } from '../paypal-seller-onboarding-executor.factory';
++import { buildPaypalSubscriptionExecutor } from '../paypal-subscription-executor.factory';
++import { buildPaypalWebhookVerifier } from '../paypal-webhook-verifier.factory';
++
++const context = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'test-app',
++  environment: 'live' as const,
++};
++
++function runtime(overrides: Partial<ResolvedPaymentRuntime> = {}): ResolvedPaymentRuntime {
++  return {
++    mode: 'live-provider',
++    context,
++    descriptor: { ...context, capabilities: [] },
++    checkoutCredentials: {
++      clientId: 'client-id-value',
++      clientSecret: 'client-secret-value',
++      environment: 'live',
++    },
++    ...overrides,
++  };
++}
++
++const unconfigured: PaymentExecutionStatus = {
++  runtimeState: 'unconfigured',
++  deploymentEnvironment: 'live',
++  executionMode: null,
++  providerCallsEnabled: false,
++  simulatedExecutionEnabled: false,
++  source: 'unconfigured',
++  issues: [],
++};
++
++type Build = (input: {
++  runtime: ResolvedPaymentRuntime;
++  nodeEnv?: string;
++  executionStatus?: PaymentExecutionStatus;
++}) => unknown;
++
++const factories: Array<[string, Build]> = [
++  ['subscription', (input) => buildPaypalSubscriptionExecutor(input)],
++  ['checkout', (input) => buildPaypalCheckoutExecutor({ ...input, strategyFactory: vi.fn() })],
++  [
++    'marketplace',
++    (input) =>
++      buildPaypalMarketplaceExecutor({ ...input, partnerConfig: { partnerAttributionId: 'bn' } }),
++  ],
++  ['payout', (input) => buildPaypalPayoutExecutor(input)],
++  [
++    'seller onboarding',
++    (input) =>
++      buildPaypalSellerOnboardingExecutor({
++        ...input,
++        partnerConfig: {
++          partnerMerchantId: 'partner',
++          partnerAttributionId: 'bn',
++          returnUrl: 'https://example.com/return',
++          products: ['EXPRESS_CHECKOUT'],
++          features: ['PAYMENT'],
++        },
++      }),
++  ],
++  ['webhook verifier', (input) => buildPaypalWebhookVerifier({ ...input, webhookId: 'WH-1' })],
++];
++
++function captureError(run: () => unknown): unknown {
++  try {
++    run();
++  } catch (error) {
++    return error;
++  }
++  return undefined;
++}
++
++describe('PayPal factories refuse a reject-only composition in production (#7)', () => {
++  for (const [label, build] of factories) {
++    it(`${label}: throws for a fake runtime without credentials`, () => {
++      const error = captureError(() =>
++        build({
++          runtime: runtime({ mode: 'fake', checkoutCredentials: undefined }),
++          nodeEnv: 'production',
++        }),
++      );
++      expect(error).toBeInstanceOf(PaymentConfigurationError);
++      expect((error as PaymentConfigurationError).missingFields).toEqual(
++        expect.arrayContaining(['credentials.clientId', 'credentials.clientSecret']),
++      );
++    });
++
++    it(`${label}: throws for an unconfigured executionStatus without printing secrets`, () => {
++      const error = captureError(() =>
++        build({ runtime: runtime(), nodeEnv: 'production', executionStatus: unconfigured }),
++      );
++      expect(error).toBeInstanceOf(PaymentConfigurationError);
++      expect((error as PaymentConfigurationError).missingFields).toEqual(
++        expect.arrayContaining(['executionStatus.runtimeState']),
++      );
++      expect(String((error as Error).message)).not.toContain('client-secret-value');
++      expect(JSON.stringify(error)).not.toContain('client-secret-value');
++    });
++
++    it(`${label}: builds with credentials in production`, () => {
++      expect(() => build({ runtime: runtime(), nodeEnv: 'production' })).not.toThrow();
++    });
++
++    it(`${label}: keeps the reject-only composition outside production`, () => {
++      for (const nodeEnv of [undefined, 'development', 'prod']) {
++        expect(() =>
++          build({ runtime: runtime({ mode: 'fake', checkoutCredentials: undefined }), nodeEnv }),
++        ).not.toThrow();
++        expect(() =>
++          build({ runtime: runtime(), nodeEnv, executionStatus: unconfigured }),
++        ).not.toThrow();
++      }
++    });
++  }
++});
++
++describe('buildPaypalWebhookVerifier webhook id check (#7)', () => {
++  it('throws at build time in production when the webhook id is missing', () => {
++    for (const webhookId of [undefined, '', '   ']) {
++      const error = captureError(() =>
++        buildPaypalWebhookVerifier({ runtime: runtime(), nodeEnv: 'production', webhookId }),
++      );
++      expect(error).toBeInstanceOf(PaymentConfigurationError);
++      expect((error as PaymentConfigurationError).missingFields).toEqual(['webhookId']);
++    }
++  });
++
++  it('does not require the webhook id outside production unless asked', () => {
++    expect(() =>
++      buildPaypalWebhookVerifier({ runtime: runtime(), nodeEnv: 'development' }),
++    ).not.toThrow();
++    expect(() =>
++      buildPaypalWebhookVerifier({
++        runtime: runtime(),
++        nodeEnv: 'development',
++        requireWebhookId: true,
++      }),
++    ).toThrow(PaymentConfigurationError);
++  });
++
++  it('allows a production host to opt out explicitly', () => {
++    expect(() =>
++      buildPaypalWebhookVerifier({
++        runtime: runtime(),
++        nodeEnv: 'production',
++        requireWebhookId: false,
++      }),
++    ).not.toThrow();
++  });
++});
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/__tests__/paypal-oauth-token-retry.unit.test.ts src/paypal/lib/__tests__/paypal-oauth-token-retry.unit.test.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/__tests__/paypal-oauth-token-retry.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/paypal/lib/__tests__/paypal-oauth-token-retry.unit.test.ts	2026-10-22 12:24:44.995481502 +0300
+@@ -0,0 +1,271 @@
++import { describe, expect, it, vi } from 'vitest';
++import { evaluateCapabilities, type ResolvedPaymentRuntime } from '../../../core/index';
++import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
++import { sendWithPaypalAccessToken } from '../paypal-access-token-retry';
++import {
++  PaypalCheckoutExecutor,
++  type PaypalCheckoutTokenProvider,
++} from '../paypal-checkout-executor';
++import { PaypalMarketplaceExecutor } from '../paypal-marketplace-executor';
++import { PaypalOAuthClient, type PaypalOAuthCredentials } from '../paypal-oauth-client';
++import { PaypalPayoutExecutor } from '../paypal-payout-executor';
++import { PaypalSellerOnboardingExecutor } from '../paypal-seller-onboarding-executor';
++import { PaypalSubscriptionExecutor } from '../paypal-subscription-executor';
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'test-app',
++  environment: 'sandbox' as const,
++};
++const scope = { accountRef: 'default', environment: 'sandbox' as const };
++
++function tokenResponses(...tokens: string[]) {
++  const postForm = vi.fn();
++  for (const token of tokens) {
++    postForm.mockResolvedValueOnce({
++      status: 200,
++      body: { access_token: token, expires_in: 32_400 },
++    });
++  }
++  return postForm;
++}
++
++function oauthClient(
++  postForm: ReturnType<typeof vi.fn>,
++  credentials: () => PaypalOAuthCredentials | null = () => ({
++    clientId: 'client-a',
++    clientSecret: 'secret',
++    environment: 'sandbox',
++  }),
++) {
++  return new PaypalOAuthClient(credentials, { postForm }, 60_000);
++}
++
++describe('PaypalOAuthClient token cache', () => {
++  it('keys the cache by clientId as well as account and environment', async () => {
++    let clientId = 'client-a';
++    const postForm = tokenResponses('token-a', 'token-b');
++    const client = oauthClient(postForm, () => ({
++      clientId,
++      clientSecret: 'secret',
++      environment: 'sandbox',
++    }));
++
++    expect(await client.getAccessToken(scope)).toBe('token-a');
++    clientId = 'client-b';
++    expect(await client.getAccessToken(scope)).toBe('token-b');
++    clientId = 'client-a';
++    expect(await client.getAccessToken(scope)).toBe('token-a');
++    expect(postForm).toHaveBeenCalledTimes(2);
++  });
++
++  it('evicts the rejected token and fetches a fresh one', async () => {
++    const postForm = tokenResponses('revoked', 'fresh');
++    const client = oauthClient(postForm);
++
++    expect(await client.getAccessToken(scope)).toBe('revoked');
++    expect(await client.getAccessToken(scope)).toBe('revoked');
++    expect(await client.getAccessToken(scope, { rejectedToken: 'revoked' })).toBe('fresh');
++    expect(await client.getAccessToken(scope)).toBe('fresh');
++    expect(postForm).toHaveBeenCalledTimes(2);
++  });
++
++  it('keeps a newer token when a late caller reports an older rejected token', async () => {
++    const postForm = tokenResponses('revoked', 'fresh');
++    const client = oauthClient(postForm);
++
++    await client.getAccessToken(scope);
++    await client.getAccessToken(scope, { rejectedToken: 'revoked' });
++    expect(await client.getAccessToken(scope, { rejectedToken: 'revoked' })).toBe('fresh');
++    expect(postForm).toHaveBeenCalledTimes(2);
++  });
++
++  it('refreshes once for many concurrent callers that saw the same 401 (single flight)', async () => {
++    const postForm = tokenResponses('revoked', 'fresh', 'unexpected');
++    const client = oauthClient(postForm);
++    await client.getAccessToken(scope);
++
++    const tokens = await Promise.all(
++      Array.from({ length: 10 }, () => client.getAccessToken(scope, { rejectedToken: 'revoked' })),
++    );
++    expect(new Set(tokens)).toEqual(new Set(['fresh']));
++    expect(postForm).toHaveBeenCalledTimes(2);
++  });
++});
++
++describe('sendWithPaypalAccessToken', () => {
++  it('retries once with a fresh token after a 401', async () => {
++    const postForm = tokenResponses('revoked', 'fresh');
++    const client = oauthClient(postForm);
++    const seen: string[] = [];
++    const response = await sendWithPaypalAccessToken(
++      (s, options) => client.getAccessToken(s, options),
++      scope,
++      async (accessToken) => {
++        seen.push(accessToken);
++        return accessToken === 'revoked' ? { status: 401, body: {} } : { status: 200, body: {} };
++      },
++    );
++    expect(response.status).toBe(200);
++    expect(seen).toEqual(['revoked', 'fresh']);
++  });
++
++  it('does not retry other statuses', async () => {
++    const send = vi.fn(async () => ({ status: 403, body: {} }));
++    const tokenProvider = vi.fn(async () => 'token');
++    const response = await sendWithPaypalAccessToken(tokenProvider, scope, send);
++    expect(response.status).toBe(403);
++    expect(send).toHaveBeenCalledTimes(1);
++    expect(tokenProvider).toHaveBeenCalledTimes(1);
++  });
++
++  it('throws a non-retryable PROVIDER_AUTH_FAILURE on a second 401 without leaking tokens', async () => {
++    const postForm = tokenResponses('secret-token-1', 'secret-token-2');
++    const client = oauthClient(postForm);
++    const send = vi.fn(async () => ({ status: 401, body: {}, debugId: 'dbg-1' }));
++    const error = await sendWithPaypalAccessToken(
++      (s, options) => client.getAccessToken(s, options),
++      scope,
++      send,
++    ).catch((caught: unknown) => caught);
++
++    expect(error).toMatchObject({
++      code: 'PROVIDER_AUTH_FAILURE',
++      retryable: false,
++      uncertain: false,
++      providerDebugId: 'dbg-1',
++    });
++    expect(send).toHaveBeenCalledTimes(2);
++    expect(JSON.stringify(error)).not.toContain('secret-token');
++    expect(String((error as { message?: string }).message)).not.toContain('secret-token');
++  });
++});
++
++function runtime(): ResolvedPaymentRuntime {
++  return {
++    mode: 'live-provider',
++    context: ctx,
++    descriptor: {
++      ...ctx,
++      capabilities: evaluateCapabilities(
++        sandboxPaypalProviderConfig({
++          credentials: { clientId: 'set', clientSecret: 'set' },
++          capabilityFlags: {
++            subscription: true,
++            checkout: true,
++            refund: true,
++            payout: true,
++            seller_onboarding: true,
++            marketplace_checkout: true,
++          },
++          partner: {
++            merchantId: 'partner-merchant',
++            attributionId: 'BN-TEST',
++            sellerOnboardingReturnUrl: 'https://example.com/return',
++          },
++        }),
++        ctx,
++      ),
++    },
++    checkoutCredentials: { clientId: 'id', clientSecret: 'secret', environment: 'sandbox' },
++  } as ResolvedPaymentRuntime;
++}
++
++const sellerPartnerConfig = {
++  partnerMerchantId: 'PARTNER',
++  partnerAttributionId: 'BN',
++  returnUrl: 'https://app.example/return',
++  products: ['EXPRESS_CHECKOUT'],
++  features: ['PAYMENT'],
++};
++
++type ExecutorCall = (
++  client: { request: (input: { accessToken: string }) => Promise<unknown> },
++  tokenProvider: PaypalCheckoutTokenProvider,
++) => Promise<unknown>;
++
++const executorCalls: Array<[string, ExecutorCall]> = [
++  [
++    'subscription',
++    (client, tokens) =>
++      new PaypalSubscriptionExecutor(runtime(), client as never, tokens).getSubscription({
++        ...ctx,
++        providerSubscriptionId: 'I-1',
++      }),
++  ],
++  [
++    'checkout',
++    (client, tokens) =>
++      new PaypalCheckoutExecutor(runtime(), () => ({}) as never, client as never, tokens).getRefund(
++        { ...ctx, providerRefundId: 'R-1' },
++      ),
++  ],
++  [
++    'marketplace',
++    (client, tokens) =>
++      new PaypalMarketplaceExecutor(runtime(), client as never, tokens, {
++        partnerAttributionId: 'BN-TEST',
++      }).getRefund({ ...ctx, providerRefundId: 'R-1' }),
++  ],
++  [
++    'payout',
++    (client, tokens) =>
++      new PaypalPayoutExecutor(runtime(), client as never, tokens).getBatch({
++        ...ctx,
++        providerPayoutBatchId: 'B-1',
++      }),
++  ],
++  [
++    'seller onboarding',
++    (client, tokens) =>
++      new PaypalSellerOnboardingExecutor(
++        runtime(),
++        client as never,
++        tokens,
++        sellerPartnerConfig as never,
++      ).getMerchantStatus({ ...ctx, providerMerchantId: 'M-1' } as never),
++  ],
++];
++
++describe('PayPal executors retry once with a fresh token after HTTP 401', () => {
++  for (const [label, call] of executorCalls) {
++    it(`${label}: evicts the revoked token and retries the call once`, async () => {
++      const postForm = tokenResponses('revoked', 'fresh');
++      const oauth = oauthClient(postForm);
++      const seen: string[] = [];
++      const client = {
++        request: async (input: { accessToken: string }) => {
++          seen.push(input.accessToken);
++          return input.accessToken === 'revoked'
++            ? { status: 401, body: { error: 'invalid_token' } }
++            : { status: 404, body: {} };
++        },
++      };
++      const error = await call(client, (s, options) => oauth.getAccessToken(s, options)).catch(
++        (caught: unknown) => caught,
++      );
++      expect(seen).toEqual(['revoked', 'fresh']);
++      expect(postForm).toHaveBeenCalledTimes(2);
++      expect((error as { code?: string } | undefined)?.code).not.toBe('PROVIDER_AUTH_FAILURE');
++    });
++
++    it(`${label}: a second 401 is PROVIDER_AUTH_FAILURE`, async () => {
++      const postForm = tokenResponses('revoked-1', 'revoked-2', 'unused');
++      const oauth = oauthClient(postForm);
++      const seen: string[] = [];
++      const client = {
++        request: async (input: { accessToken: string }) => {
++          seen.push(input.accessToken);
++          return { status: 401, body: { error: 'invalid_token' } };
++        },
++      };
++      const error = await call(client, (s, options) => oauth.getAccessToken(s, options)).catch(
++        (caught: unknown) => caught,
++      );
++      expect(error).toMatchObject({ code: 'PROVIDER_AUTH_FAILURE', retryable: false });
++      expect(seen).toEqual(['revoked-1', 'revoked-2']);
++      expect(JSON.stringify(error)).not.toContain('revoked-');
++    });
++  }
++});
+diff --color -ruN .superpowers/snap-after-t2/src/paypal/lib/__tests__/paypal-webhook-verification-recovery.unit.test.ts src/paypal/lib/__tests__/paypal-webhook-verification-recovery.unit.test.ts
+--- .superpowers/snap-after-t2/src/paypal/lib/__tests__/paypal-webhook-verification-recovery.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/paypal/lib/__tests__/paypal-webhook-verification-recovery.unit.test.ts	2026-10-22 12:24:45.156480631 +0300
+@@ -0,0 +1,269 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import type { VerifyWebhookRequest } from '../../../contracts/index';
++import {
++  buildOperationIdempotencyScope,
++  MemoryPaymentReliabilityStore,
++  resolvePaymentRuntime,
++  WebhookProcessingService,
++} from '../../../core/index';
++import { sandboxPaypalProviderConfig } from '../../../../test/helpers/provider-config-fixtures';
++import { LivePaypalWebhookVerificationClient } from '../live-paypal-webhook-verification-client';
++import { PaypalOAuthClient } from '../paypal-oauth-client';
++import {
++  PaypalWebhookVerifier,
++  type PaypalWebhookVerificationClient,
++} from '../paypal-webhook-verifier';
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'test-app',
++  environment: 'sandbox' as const,
++};
++
++const headers = {
++  transmissionId: 'tx-1',
++  transmissionTime: '2026-10-22T00:00:00Z',
++  certUrl: 'https://api.paypal.com/cert',
++  authAlgo: 'SHA256withRSA',
++  transmissionSig: 'sig',
++};
++
++function runtime() {
++  return resolvePaymentRuntime({
++    config: sandboxPaypalProviderConfig({
++      credentials: { clientId: 'id', clientSecret: 'secret' },
++      capabilityFlags: { subscription: true, checkout: true },
++    }),
++    nodeEnv: 'development',
++  });
++}
++
++function request(rawBody: string): VerifyWebhookRequest {
++  return { ...ctx, webhookId: 'WH-1', rawBody, headers };
++}
++
++function clientReturning(status: string): PaypalWebhookVerificationClient {
++  return { verifyWebhookSignature: async () => ({ verification_status: status }) };
++}
++
++async function seedSubmitted(store: MemoryPaymentReliabilityStore, subscriptionId: string) {
++  const operation = await store.createOperation({
++    idempotencyKey: subscriptionId,
++    idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++    commandFingerprint: 'fp',
++    ...ctx,
++    kind: 'subscription',
++    subscriptionStatus: 'approval_pending',
++    providerSubscriptionId: subscriptionId,
++    providerPlanId: 'P-1',
++  });
++  return store.transitionOperation({
++    operationId: operation.operationId,
++    expectedVersion: operation.version,
++    nextStatus: 'submitted',
++    providerReferenceId: subscriptionId,
++    reason: 'seed',
++  });
++}
++
++function activatedBody(eventId: string, subscriptionId: string): string {
++  return JSON.stringify({
++    id: eventId,
++    event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++    resource: { id: subscriptionId, status: 'ACTIVE' },
++  });
++}
++
++describe('PaypalWebhookVerifier verification_status mapping', () => {
++  const body = JSON.stringify({ id: 'WH-1', event_type: 'X', resource: { id: 'R-1' } });
++
++  it('only FAILURE from a 2xx response is a rejected signature', async () => {
++    const result = await new PaypalWebhookVerifier(
++      runtime(),
++      clientReturning('FAILURE'),
++      'development',
++    ).verify(request(body));
++    expect(result).toMatchObject({ verified: false, failureKind: 'signature_rejected' });
++  });
++
++  it('an unknown verification_status is verification_unavailable', async () => {
++    const result = await new PaypalWebhookVerifier(
++      runtime(),
++      clientReturning('PENDING'),
++      'development',
++    ).verify(request(body));
++    expect(result).toMatchObject({ verified: false, failureKind: 'verification_unavailable' });
++  });
++
++  it('passes the original raw body to the verification client', async () => {
++    const raw = '{"id":"WH-1","amount":1.10,"event_type":"X","resource":{"id":"R-1"}}';
++    const verifyWebhookSignature = vi.fn(async () => ({ verification_status: 'SUCCESS' }));
++    await new PaypalWebhookVerifier(runtime(), { verifyWebhookSignature }, 'development').verify(
++      request(raw),
++    );
++    expect(verifyWebhookSignature).toHaveBeenCalledWith(
++      expect.objectContaining({ rawWebhookEvent: raw, webhookEvent: JSON.parse(raw) }),
++    );
++  });
++
++  it('rejects a body that is valid JSON but not an object as invalid_payload', async () => {
++    const verifyWebhookSignature = vi.fn(async () => ({ verification_status: 'SUCCESS' }));
++    for (const raw of ['[]', 'null', '42', '"text"']) {
++      const result = await new PaypalWebhookVerifier(
++        runtime(),
++        { verifyWebhookSignature },
++        'development',
++      ).verify(request(raw));
++      expect(result).toMatchObject({ verified: false, failureKind: 'invalid_payload' });
++    }
++    expect(verifyWebhookSignature).not.toHaveBeenCalled();
++  });
++
++  it('uses the webhook id configured at build time when the request has none', async () => {
++    const verifyWebhookSignature = vi.fn(async () => ({ verification_status: 'SUCCESS' }));
++    const result = await new PaypalWebhookVerifier(
++      runtime(),
++      { verifyWebhookSignature },
++      'development',
++      { webhookId: 'WH-CONFIGURED' },
++    ).verify({ ...request(body), webhookId: '' });
++    expect(result.verified).toBe(true);
++    expect(verifyWebhookSignature).toHaveBeenCalledWith(
++      expect.objectContaining({ webhookId: 'WH-CONFIGURED' }),
++    );
++  });
++});
++
++describe('webhook verification auth failures keep evidence recoverable (#19, #1)', () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  function liveVerifier(oauth: PaypalOAuthClient) {
++    return new PaypalWebhookVerifier(
++      runtime(),
++      new LivePaypalWebhookVerificationClient(
++        oauth,
++        { accountRef: 'default', environment: 'sandbox' },
++        'sandbox',
++        1_000,
++      ),
++      'production',
++    );
++  }
++
++  const fetchModes: Record<string, [number, string] | 'timeout'> = {
++    s401: [401, '{"error":"invalid_token"}'],
++    s403: [403, '{"name":"PERMISSION_DENIED"}'],
++    s400: [400, '{"name":"VALIDATION_ERROR"}'],
++    okNoStatus: [200, '{}'],
++    s503: [503, '{}'],
++    html502: [502, '<html>bad gateway</html>'],
++    timeout: 'timeout',
++  };
++
++  for (const [mode, behaviour] of Object.entries(fetchModes)) {
++    it(`${mode}: evidence stays pending and a redelivery processes the event`, async () => {
++      let failing = true;
++      vi.stubGlobal('fetch', async () => {
++        if (failing) {
++          if (behaviour === 'timeout') {
++            const error = new Error('aborted');
++            error.name = 'AbortError';
++            throw error;
++          }
++          return new Response(behaviour[1], { status: behaviour[0] });
++        }
++        return new Response('{"verification_status":"SUCCESS"}', { status: 200 });
++      });
++      const oauth = new PaypalOAuthClient(
++        () => ({ clientId: 'x', clientSecret: 'y', environment: 'sandbox' }),
++        {
++          postForm: async () => ({ status: 200, body: { access_token: 'tok', expires_in: 3600 } }),
++        },
++      );
++      const verifier = liveVerifier(oauth);
++      const store = new MemoryPaymentReliabilityStore();
++      const service = new WebhookProcessingService(store);
++      await seedSubmitted(store, 'S1');
++      const raw = activatedBody('WH-EV-1', 'S1');
++      const verify = () => verifier.verify(request(raw));
++
++      await expect(
++        service.receiveWebhook({ ...ctx, rawBody: raw, providerEventId: 'WH-EV-1', verify }),
++      ).rejects.toMatchObject({ code: 'VERIFICATION_UNAVAILABLE' });
++      const evidence = await store.findEvidenceByProviderEvent(
++        'paypal',
++        'default',
++        'sandbox',
++        'WH-EV-1',
++      );
++      expect(evidence).toMatchObject({
++        verificationStatus: 'pending',
++        processingStatus: 'pending',
++        errorCode: 'VERIFICATION_UNAVAILABLE',
++      });
++
++      failing = false;
++      const receipt = await service.receiveWebhook({
++        ...ctx,
++        rawBody: raw,
++        providerEventId: 'WH-EV-1',
++        verify,
++      });
++      expect(receipt.processingStatus).toBe('processed');
++      const operation = await store.findOperationByProviderSubscriptionId(
++        'paypal',
++        'default',
++        'sandbox',
++        'S1',
++      );
++      expect(operation?.subscriptionStatus).toBe('active');
++    });
++  }
++
++  it('a revoked cached token is evicted: three webhooks are processed after one refresh (p8)', async () => {
++    const tokens = ['revoked-token', 'fresh-token'];
++    let oauthCalls = 0;
++    const authorizations: string[] = [];
++    vi.stubGlobal('fetch', async (_url: string, init: RequestInit) => {
++      const authorization = (init.headers as Record<string, string>)['Authorization'] ?? '';
++      authorizations.push(authorization);
++      return authorization === 'Bearer revoked-token'
++        ? new Response('{"name":"AUTHENTICATION_FAILURE"}', { status: 401 })
++        : new Response('{"verification_status":"SUCCESS"}', { status: 200 });
++    });
++    const oauth = new PaypalOAuthClient(
++      () => ({ clientId: 'x', clientSecret: 'y', environment: 'sandbox' }),
++      {
++        postForm: async () => ({
++          status: 200,
++          body: { access_token: tokens[oauthCalls++] ?? 'unexpected', expires_in: 32_400 },
++        }),
++      },
++    );
++    const verifier = liveVerifier(oauth);
++    const store = new MemoryPaymentReliabilityStore();
++    const service = new WebhookProcessingService(store);
++
++    for (let index = 0; index < 3; index += 1) {
++      await seedSubmitted(store, `S${index}`);
++      const raw = activatedBody(`WH-${index}`, `S${index}`);
++      const receipt = await service.receiveWebhook({
++        ...ctx,
++        rawBody: raw,
++        providerEventId: `WH-${index}`,
++        verify: () => verifier.verify(request(raw)),
++      });
++      expect(receipt.processingStatus).toBe('processed');
++    }
++    expect(oauthCalls).toBe(2);
++    expect(authorizations).toEqual([
++      'Bearer revoked-token',
++      'Bearer fresh-token',
++      'Bearer fresh-token',
++      'Bearer fresh-token',
++    ]);
++  });
++});

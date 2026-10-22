@@ -47,7 +47,8 @@ export function classifyWebhookEvidenceResume(
  * without delivery fields.
  */
 export function isConsumerDeliveryComplete(evidence: ProviderEvidenceRecord): boolean {
-  if (evidence.consumerDeliveryStatus === undefined) {
+  // `null` (a nullable SQL column) means the same as `undefined`: no delivery requested.
+  if (evidence.consumerDeliveryStatus == null) {
     return true;
   }
   return (
@@ -71,7 +72,7 @@ export function verificationFailureKind(
   if (verification.failureKind) {
     return verification.failureKind;
   }
-  return verification.unavailableReason ? 'signature_rejected' : 'signature_rejected';
+  return 'signature_rejected';
 }
 
 export function isVerificationUnavailable(verification: VerifyWebhookResult): boolean {

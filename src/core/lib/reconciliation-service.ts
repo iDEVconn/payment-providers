@@ -46,6 +46,7 @@ import {
 import {
   HELD_EFFECTS_OVERFLOW,
   SUBSCRIPTION_EFFECTS_HOOK_FAILED,
+  SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP,
   applyPlanTransition,
   applySubscriptionEvents,
   deliverSubscriptionEffects,
@@ -58,11 +59,10 @@ import {
 } from './subscription-evidence-application';
 import {
   isSubscriptionPaymentEvidenceEvent,
-  isSubscriptionWebhookProviderRefreshEvent,
   mapPlanWebhookEventToStatus,
-  mapSubscriptionWebhookEventToStatus,
   planStatusToOperationStatus,
 } from './subscription-transition-policy';
+import { isSubscriptionEvidenceEvent } from './subscription-evidence-events';
 import { isSellerOnboardingWebhookEvent } from './seller-transition-policy';
 import { reconcileSellerConnectionAggregate } from './seller-connection-reconciliation';
 import type { ReconciliationProviderLookup } from './checkout-provider-port';
@@ -115,14 +115,6 @@ export const SUBSCRIPTION_COMMAND_NOT_APPLIED = 'SUBSCRIPTION_COMMAND_NOT_APPLIE
 
 function isSubscriptionCommandKind(kind: PaymentOperationKind): kind is SubscriptionCommandKind {
   return kind in SUBSCRIPTION_COMMAND_TARGET;
-}
-
-function isSubscriptionEvidenceEvent(eventType: string): boolean {
-  return (
-    mapSubscriptionWebhookEventToStatus(eventType) !== null ||
-    isSubscriptionWebhookProviderRefreshEvent(eventType) ||
-    isSubscriptionPaymentEvidenceEvent(eventType)
-  );
 }
 
 /** Plan mismatches found by provider lookups are remembered per foreign plan, not per row. */
@@ -1048,6 +1040,17 @@ export class ReconciliationService {
         outcome: 'retryable_failure',
         resultCode: HELD_EFFECTS_OVERFLOW,
         resultMessage: 'Not applied: the subscription holds the maximum of undelivered effects',
+      });
+      result.retryableFailures += 1;
+      return;
+    }
+    if (applied.equalTimestampConflict) {
+      await this.store.insertReconciliationAttempt({
+        evidenceId: evidence.evidenceId,
+        operationId: operation.operationId,
+        outcome: 'retryable_failure',
+        resultCode: SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP,
+        resultMessage: 'Status conflicts at the same provider state time; a lookup must settle it',
       });
       result.retryableFailures += 1;
       return;

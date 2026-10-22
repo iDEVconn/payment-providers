@@ -108,6 +108,7 @@ describe('recover() without a consumer (issue #21)', () => {
         delivered: 0,
         skipped: 0,
         failed: 0,
+        deliveryFailed: 0,
       });
     }
     for (const eventId of eventIds) {

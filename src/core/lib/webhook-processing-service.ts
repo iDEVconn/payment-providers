@@ -24,6 +24,7 @@ import {
   HELD_EFFECTS_OVERFLOW,
   SUBSCRIPTION_EFFECTS_HOOK_FAILED,
   SUBSCRIPTION_EFFECTS_HOOK_MISSING,
+  SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP,
   applyPlanTransition,
   applySubscriptionEvents,
   deliverSubscriptionEffects,
@@ -37,10 +38,9 @@ import {
 } from './subscription-evidence-application';
 import {
   isSubscriptionPaymentEvidenceEvent,
-  isSubscriptionWebhookProviderRefreshEvent,
   mapPlanWebhookEventToStatus,
-  mapSubscriptionWebhookEventToStatus,
 } from './subscription-transition-policy';
+import { isSubscriptionEvidenceEvent } from './subscription-evidence-events';
 import type { ReconciliationProviderLookup } from './checkout-provider-port';
 import { resolveProviderFailure } from './resolve-provider-failure';
 import { sanitizeOperationalErrorMessage } from './public-error-sanitizer';
@@ -103,8 +103,6 @@ export type ReceiveWebhookInput = {
 
 /** Default intake cap for a webhook body (256 KiB of UTF-8). */
 export const DEFAULT_WEBHOOK_MAX_BODY_BYTES = 262_144;
-/** Former default skew. The freshness check is now off unless a host enables it. */
-export const DEFAULT_WEBHOOK_MAX_TRANSMISSION_SKEW_MS = 900_000;
 /** Allowed future skew of `transmissionTime` once `maxTransmissionAgeMs` turns the check on (5 min). */
 export const DEFAULT_WEBHOOK_MAX_TRANSMISSION_FUTURE_MS = 300_000;
 
@@ -256,15 +254,6 @@ function isUnreadableSubscriptionState(error: unknown): boolean {
     error instanceof PaymentReliabilityError &&
     (error.code === PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_STATE_UNREADABLE ||
       error.code === PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_STATE_VERSION_UNSUPPORTED)
-  );
-}
-
-/** Events the pure subscription core reduces: subscription lifecycle, failed payments and sales. */
-function isSubscriptionEvidenceEvent(eventType: string): boolean {
-  return (
-    mapSubscriptionWebhookEventToStatus(eventType) !== null ||
-    isSubscriptionWebhookProviderRefreshEvent(eventType) ||
-    isSubscriptionPaymentEvidenceEvent(eventType)
   );
 }
 
@@ -519,12 +508,13 @@ export class WebhookProcessingService {
     let parsedEventType: string | null = null;
     let parsedResourceId: string | null = null;
     try {
+      // Stored before verification: only string values, never whatever an unauthenticated body sends.
       const parsed = JSON.parse(input.rawBody) as {
-        event_type?: string;
-        resource?: { id?: string };
-      };
-      parsedEventType = parsed.event_type ?? null;
-      parsedResourceId = parsed.resource?.id ?? null;
+        event_type?: unknown;
+        resource?: { id?: unknown } | null;
+      } | null;
+      parsedEventType = typeof parsed?.event_type === 'string' ? parsed.event_type : null;
+      parsedResourceId = typeof parsed?.resource?.id === 'string' ? parsed.resource.id : null;
     } catch {
       parsedEventType = null;
       parsedResourceId = null;
@@ -647,7 +637,8 @@ export class WebhookProcessingService {
   ): Promise<ProviderEvidenceRecord> {
     const existing = await this.store.findEvidenceById(evidenceId);
     const deliveryFields =
-      existing?.consumerDeliveryStatus === undefined && existing?.processingStatus !== 'processed'
+      // A SQL store may read the unset column back as `null`: same meaning as `undefined`.
+      existing?.consumerDeliveryStatus == null && existing?.processingStatus !== 'processed'
         ? {
             consumerDeliveryStatus: 'pending' as const,
             consumerDeliveryAttempts: existing?.consumerDeliveryAttempts ?? 0,
@@ -1091,8 +1082,13 @@ export class WebhookProcessingService {
           ),
         );
       }
-      // Ordered as a webhook by the snapshot's own state time, as the event body's time may be older.
-      step = { event: snapshotEvent, options: { source: 'webhook' } };
+      // Ordered as a webhook by the snapshot's own state time, as the event body's time may be
+      // older; at the same second with another status the snapshot wins (final review F4).
+      step = {
+        event: snapshotEvent,
+        options: { source: 'webhook' },
+        lookupOnEqualConflict: true,
+      };
     }
 
     let applied: ApplySubscriptionEventsResult;
@@ -1138,6 +1134,18 @@ export class WebhookProcessingService {
         delivery.code,
       );
     }
+    if (applied.equalTimestampConflict) {
+      // Never `processed` silently: reconciliation's provider lookup settles the status.
+      const conflicting = await this.store.updateEvidence({
+        evidenceId: evidence.evidenceId,
+        relatedOperationId: operation.operationId,
+        processingStatus: 'unmatched',
+        errorCode: SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP,
+        errorMessage: 'Status conflicts with the stored status at the same provider state time',
+        processedAt: new Date().toISOString(),
+      });
+      return this.toReceipt(conflicting, false);
+    }
 
     const updatedEvidence = await this.markFinancialProcessed(evidence.evidenceId, {
       relatedOperationId: operation.operationId,
@@ -1181,6 +1189,7 @@ export class WebhookProcessingService {
           heldKey: evidence.evidenceId,
           planMismatchToNotify: null,
           heldOverflow: false,
+          equalTimestampConflict: false,
         },
         {
           evidenceId: evidence.evidenceId,

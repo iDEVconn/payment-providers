@@ -1,0 +1,3052 @@
+diff --color -ruN .superpowers/snap-after-t6a/src/contracts/index.ts .superpowers/snap-after-t6b/src/contracts/index.ts
+--- .superpowers/snap-after-t6a/src/contracts/index.ts	2026-10-22 14:55:49.716721227 +0300
++++ .superpowers/snap-after-t6b/src/contracts/index.ts	2026-10-22 15:25:17.206671672 +0300
+@@ -17,3 +17,4 @@
+ export * from './lib/reliability-errors';
+ export * from './lib/operation-result';
+ export * from './lib/recovery';
++export * from './lib/retry';
+diff --color -ruN .superpowers/snap-after-t6a/src/contracts/lib/evidence.ts .superpowers/snap-after-t6b/src/contracts/lib/evidence.ts
+--- .superpowers/snap-after-t6a/src/contracts/lib/evidence.ts	2026-10-22 14:55:49.716992858 +0300
++++ .superpowers/snap-after-t6b/src/contracts/lib/evidence.ts	2026-10-22 15:25:17.206559206 +0300
+@@ -1,4 +1,5 @@
+ import type { PaymentEnvironment } from './capabilities';
++import type { RetryStatus } from './retry';
+ 
+ export type ProviderEvidenceKind = 'webhook' | 'reconciliation';
+ 
+@@ -50,6 +51,14 @@
+   /** Failed delivery attempts so far; recovery stops at `maxConsumerDeliveryAttempts`. */
+   consumerDeliveryAttempts?: number;
+   consumerDeliveryLastError?: string | null;
++  /*
++   * Recovery and reconciliation retry bookkeeping (issues #8, #20): unsuccessful attempts to
++   * process the row, the earliest time it is selected again, and `'gave_up'` after the attempt
++   * cap. Consumer delivery keeps its own counter and terminal status above.
++   */
++  attempts?: number | null;
++  nextAttemptAt?: string | null;
++  retryStatus?: RetryStatus | null;
+   createdAt: string;
+   updatedAt: string;
+ };
+@@ -88,6 +97,9 @@
+   consumerDeliveredAt?: string | null;
+   consumerDeliveryAttempts?: number;
+   consumerDeliveryLastError?: string | null;
++  attempts?: number | null;
++  nextAttemptAt?: string | null;
++  retryStatus?: RetryStatus | null;
+ };
+ 
+ export type ReconciliationAttempt = {
+diff --color -ruN .superpowers/snap-after-t6a/src/contracts/lib/operations.ts .superpowers/snap-after-t6b/src/contracts/lib/operations.ts
+--- .superpowers/snap-after-t6a/src/contracts/lib/operations.ts	2026-10-22 14:55:49.717102695 +0300
++++ .superpowers/snap-after-t6b/src/contracts/lib/operations.ts	2026-10-22 15:25:17.206153147 +0300
+@@ -1,5 +1,6 @@
+ import type { PaymentEnvironment } from './capabilities';
+ import type { PayoutFinancialStatus, PayoutRecipientType } from './payout';
++import type { RetryStatus } from './retry';
+ import type { PlanStatus, ProductStatus, SubscriptionStatus } from './subscription';
+ 
+ /** Operation kinds. M4 payout; M5 subscription; M6 seller referral mutation. */
+@@ -86,6 +87,14 @@
+   providerReferralId: string | null;
+   executionLeaseExpiresAt: string | null;
+   executionOwnerToken: string | null;
++  /*
++   * Reconciliation retry bookkeeping (issue #8): unsuccessful attempts, the earliest time the
++   * operation is listed again, and `'gave_up'` after the attempt cap. Nullable columns; absent on
++   * stores written before 0.3 (read as "never attempted").
++   */
++  attempts?: number | null;
++  nextAttemptAt?: string | null;
++  retryStatus?: RetryStatus | null;
+   version: number;
+   createdAt: string;
+   updatedAt: string;
+@@ -234,8 +243,34 @@
+   subscriptionStateJson?: string | null;
+   sellerRef?: string | null;
+   providerReferralId?: string | null;
++  attempts?: number | null;
++  nextAttemptAt?: string | null;
++  retryStatus?: RetryStatus | null;
++};
++
++/** Optional filters of `listUncertainOperations`. */
++export type ListUncertainOperationsOptions = {
++  /**
++   * Also list `submitted` operations of a kind in `submittedStaleKinds` without a
++   * `providerReferenceId` whose `updatedAt` is at or before this ISO time and whose execution lease
++   * is missing or expired: a create that crashed between the claim and the result write
++   * (issue #12). Omitted: only `unknown` operations.
++   */
++  submittedStaleBefore?: string;
++  /**
++   * Kinds `submittedStaleBefore` applies to. Default `['subscription', 'checkout']` (the creates
++   * with a retry path); other kinds may wait in `submitted` without a reference by design (payout
++   * items before PayPal assigns their ids).
++   */
++  submittedStaleKinds?: PaymentOperationKind[];
+ };
+ 
++/** Kinds whose stale `submitted` creates `listUncertainOperations` lists by default. */
++export const DEFAULT_SUBMITTED_STALE_KINDS: ReadonlyArray<PaymentOperationKind> = [
++  'subscription',
++  'checkout',
++];
++
+ /**
+  * Kind of a claim transition: `claim_execution` is the first claim of a `prepared` operation for a
+  * provider call (`claimOperationForExecution`, or a create execution lease taken from `prepared`);
+diff --color -ruN .superpowers/snap-after-t6a/src/contracts/lib/recovery.ts .superpowers/snap-after-t6b/src/contracts/lib/recovery.ts
+--- .superpowers/snap-after-t6a/src/contracts/lib/recovery.ts	2026-10-22 14:55:49.717158376 +0300
++++ .superpowers/snap-after-t6b/src/contracts/lib/recovery.ts	2026-10-22 15:25:17.206589254 +0300
+@@ -15,6 +15,12 @@
+    * newer work.
+    */
+   includeConsumerDelivery?: boolean;
++  /**
++   * When `false`, rows whose verification is still `pending` are not claimed. Default `true`.
++   * Recovery passes `false`: it cannot verify a row without the transmission headers (only a
++   * provider redelivery can), so those rows would only be skipped and fill every batch (issue #20).
++   */
++  includePendingVerification?: boolean;
+ };
+ 
+ export type RecoverPaymentReliabilityInput = {
+@@ -71,6 +77,9 @@
+   consumerDeliveredAt?: string | null;
+   consumerDeliveryAttempts?: number;
+   consumerDeliveryLastError?: string | null;
++  attempts?: number | null;
++  nextAttemptAt?: string | null;
++  retryStatus?: string | null;
+   eventType: string | null;
+   resourceId: string | null;
+   errorCode: string | null;
+diff --color -ruN .superpowers/snap-after-t6a/src/contracts/lib/retry.ts .superpowers/snap-after-t6b/src/contracts/lib/retry.ts
+--- .superpowers/snap-after-t6a/src/contracts/lib/retry.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6b/src/contracts/lib/retry.ts	2026-10-22 15:25:17.206657719 +0300
+@@ -0,0 +1,25 @@
++/**
++ * Terminal marker of a row the engine stopped retrying (issues #8, #20). Stored in the nullable
++ * `retryStatus` column of operations and evidence next to `attempts` and `nextAttemptAt`; `null`
++ * means "still retried". The row keeps its own status (`unknown`, `unmatched`, `pending`, ...), so
++ * a host that fixed the cause resets `retryStatus`, `attempts` and `nextAttemptAt` to `null` and
++ * the row is picked up again. A store with a CHECK constraint on the column allows `'gave_up'`.
++ */
++export type RetryStatus = 'gave_up';
++
++export const RETRY_STATUS = {
++  GAVE_UP: 'gave_up',
++} as const satisfies Record<string, RetryStatus>;
++
++/**
++ * Retry bookkeeping of an operation or an evidence row. All three are nullable columns; rows written
++ * before 0.3 read as "never attempted" (`attempts` null or 0, `nextAttemptAt` null = due now).
++ */
++export type RetryState = {
++  /** Unsuccessful reconciliation or recovery attempts so far. */
++  attempts?: number | null;
++  /** Not selected again before this time; `null` = due now. */
++  nextAttemptAt?: string | null;
++  /** `'gave_up'` after `maxAttempts`; never selected again until a host resets it. */
++  retryStatus?: RetryStatus | null;
++};
+diff --color -ruN .superpowers/snap-after-t6a/src/core/index.ts .superpowers/snap-after-t6b/src/core/index.ts
+--- .superpowers/snap-after-t6a/src/core/index.ts	2026-10-22 14:55:49.717301251 +0300
++++ .superpowers/snap-after-t6b/src/core/index.ts	2026-10-22 15:25:17.208156275 +0300
+@@ -31,6 +31,7 @@
+ export * from './lib/payment-event-consumer';
+ export * from './lib/payment-recovery-service';
+ export * from './lib/reconciliation-service';
++export * from './lib/retry-backoff';
+ export * from './lib/mask-recipient';
+ export * from './lib/payout-sender-id';
+ export * from './lib/resolve-provider-failure';
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/payment-recovery-service.ts .superpowers/snap-after-t6b/src/core/lib/payment-recovery-service.ts
+--- .superpowers/snap-after-t6a/src/core/lib/payment-recovery-service.ts	2026-10-22 14:55:49.719069325 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/payment-recovery-service.ts	2026-10-22 15:25:17.206746701 +0300
+@@ -6,10 +6,22 @@
+   type RecoverPaymentEvidenceResult,
+   type RecoverPaymentReliabilityInput,
+   type RecoverPaymentReliabilityResult,
++  type RetryState,
+ } from '../../contracts/index';
+ import { PaymentConfigurationError } from './payment-configuration-error';
+ import { sanitizeOperationalErrorMessage } from './public-error-sanitizer';
+-import { isConsumerDeliveryComplete } from './webhook-evidence-resume';
++import {
++  nextRetryDeferral,
++  resolveRetryBackoffPolicy,
++  retryDelayMs,
++  type RetryBackoffOptions,
++  type RetryBackoffPolicy,
++} from './retry-backoff';
++import {
++  isAwaitingConsumerDeliveryOnly,
++  isConsumerDeliveryComplete,
++  isRecoverableEvidenceRow,
++} from './webhook-evidence-resume';
+ 
+ const CONSUMER_DELIVERY_FAILURE_MESSAGE = 'Consumer event delivery failed';
+ export { isRecoverableEvidenceRow } from './webhook-evidence-resume';
+@@ -23,7 +35,13 @@
+ /** Failed consumer deliveries per evidence row before it becomes `failed_terminal`. */
+ export const DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS = 10;
+ 
+-export type PaymentRecoveryDependencies = {
++/**
++ * `retryBaseDelayMs`, `retryMaxDelayMs`, `maxAttempts`: a claimed row that is still unfinished
++ * after its attempt (skipped, still `pending` or `unmatched`, failed) is deferred with exponential
++ * backoff and gets `retryStatus: 'gave_up'` after `maxAttempts` (see `RetryBackoffOptions`). A
++ * failed consumer delivery is deferred the same way; its terminal state stays `failed_terminal`.
++ */
++export type PaymentRecoveryDependencies = RetryBackoffOptions & {
+   store: EvidenceStore;
+   webhookProcessing: WebhookProcessingService;
+   /**
+@@ -43,8 +61,10 @@
+ 
+ export class PaymentRecoveryService {
+   private readonly maxConsumerDeliveryAttempts: number;
++  private readonly retryPolicy: RetryBackoffPolicy;
+ 
+   constructor(private readonly deps: PaymentRecoveryDependencies) {
++    this.retryPolicy = resolveRetryBackoffPolicy(deps, 'Payment recovery');
+     const max = deps.maxConsumerDeliveryAttempts ?? DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS;
+     if (!Number.isInteger(max) || max < 1) {
+       throw new PaymentConfigurationError(
+@@ -69,6 +89,8 @@
+       providerCode: input.providerCode,
+       accountRef: input.accountRef,
+       includeConsumerDelivery: this.deps.consumer !== null,
++      // Verification needs the transmission headers; only a provider redelivery can verify.
++      includePendingVerification: false,
+     });
+ 
+     return this.executeRecoveryBatch(claimed);
+@@ -123,6 +145,7 @@
+           evidenceId: row.evidenceId,
+           claimLeaseExpiresAt: null,
+           claimWorkerId: null,
++          ...(await this.retryDeferralAfterAttempt(row.evidenceId)),
+         });
+       }
+     }
+@@ -130,6 +153,30 @@
+     return summary;
+   }
+ 
++  /**
++   * A row that still needs work after its attempt waits for its backoff instead of filling the
++   * next batch (issue #20); after `maxAttempts` it gives up. A row only awaiting consumer delivery
++   * is deferred after a failed delivery and never gives up here (its cap is the delivery cap).
++   */
++  private async retryDeferralAfterAttempt(evidenceId: string): Promise<RetryState> {
++    const fresh = await this.deps.store.findEvidenceById(evidenceId);
++    if (!fresh) {
++      return {};
++    }
++    if (isAwaitingConsumerDeliveryOnly(fresh)) {
++      if (!this.deps.consumer || fresh.consumerDeliveryStatus !== 'failed') {
++        // Processed now: an older processing backoff must not hold back the delivery.
++        return fresh.nextAttemptAt ? { nextAttemptAt: null } : {};
++      }
++      const delayMs = retryDelayMs(fresh.consumerDeliveryAttempts ?? 1, this.retryPolicy);
++      return { nextAttemptAt: new Date(Date.now() + delayMs).toISOString() };
++    }
++    if (!isRecoverableEvidenceRow(fresh)) {
++      return {};
++    }
++    return nextRetryDeferral(fresh.attempts, this.retryPolicy);
++  }
++
+   private async recoverClaimedEvidence(
+     evidence: ProviderEvidenceRecord,
+   ): Promise<
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/persistence/memory-payment-reliability-store.ts .superpowers/snap-after-t6b/src/core/lib/persistence/memory-payment-reliability-store.ts
+--- .superpowers/snap-after-t6a/src/core/lib/persistence/memory-payment-reliability-store.ts	2026-10-22 14:55:49.719276020 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/persistence/memory-payment-reliability-store.ts	2026-10-22 15:25:17.207798359 +0300
+@@ -2,6 +2,7 @@
+ import { checkoutCreateExecutionLeaseExpiresAt } from '../checkout-create-execution-lease';
+ import type { AcquireCheckoutCreateExecutionLeaseResult } from './payment-reliability-store';
+ import {
++  DEFAULT_SUBMITTED_STALE_KINDS,
+   OPERATION_TRANSITION_KIND,
+   PAYMENT_RELIABILITY_ERROR,
+   PAYMENT_RPC_TRANSITION_DETAIL,
+@@ -27,7 +28,9 @@
+   type ListPaymentEvidenceForRecoveryInput,
+   type ListPaymentEvidenceForRecoveryResult,
+   type PaymentEvidenceAdminView,
++  type ListUncertainOperationsOptions,
+ } from '../../../contracts/index';
++import { isRetryDue } from '../retry-backoff';
+ import { sha256Payload } from '../sha256-payload';
+ import { assertTransitionAllowed } from '../transition-policy';
+ import {
+@@ -40,13 +43,30 @@
+   return new Date().toISOString();
+ }
+ 
+-function byReceivedAt(left: ProviderEvidenceRecord, right: ProviderEvidenceRecord): number {
++/** `ORDER BY COALESCE(next_attempt_at, received_at), evidence_id`. */
++function byNextAttemptAt(left: ProviderEvidenceRecord, right: ProviderEvidenceRecord): number {
+   return (
+-    left.receivedAt.localeCompare(right.receivedAt) ||
+-    left.evidenceId.localeCompare(right.evidenceId)
++    compareIsoTimes(
++      left.nextAttemptAt ?? left.receivedAt,
++      right.nextAttemptAt ?? right.receivedAt,
++    ) || left.evidenceId.localeCompare(right.evidenceId)
+   );
+ }
+ 
++/** `ORDER BY COALESCE(next_attempt_at, created_at), operation_id`. */
++function operationsByNextAttemptAt(left: PaymentOperation, right: PaymentOperation): number {
++  return (
++    compareIsoTimes(left.nextAttemptAt ?? left.createdAt, right.nextAttemptAt ?? right.createdAt) ||
++    left.operationId.localeCompare(right.operationId)
++  );
++}
++
++/** Compares instants, so `nextAttemptAt` written with another offset or precision still sorts. */
++function compareIsoTimes(left: string, right: string): number {
++  const difference = Date.parse(left) - Date.parse(right);
++  return Number.isFinite(difference) ? Math.sign(difference) : left.localeCompare(right);
++}
++
+ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
+   private readonly operations = new Map<string, PaymentOperation>();
+   private readonly operationsByIdempotency = new Map<string, PaymentOperation>();
+@@ -532,6 +552,10 @@
+         input.providerReferralId !== undefined
+           ? input.providerReferralId
+           : current.providerReferralId,
++      attempts: input.attempts !== undefined ? input.attempts : current.attempts,
++      nextAttemptAt:
++        input.nextAttemptAt !== undefined ? input.nextAttemptAt : current.nextAttemptAt,
++      retryStatus: input.retryStatus !== undefined ? input.retryStatus : current.retryStatus,
+       version: current.version + 1,
+       updatedAt: nowIso(),
+     };
+@@ -798,6 +822,10 @@
+         input.consumerDeliveryLastError !== undefined
+           ? input.consumerDeliveryLastError
+           : current.consumerDeliveryLastError,
++      attempts: input.attempts !== undefined ? input.attempts : current.attempts,
++      nextAttemptAt:
++        input.nextAttemptAt !== undefined ? input.nextAttemptAt : current.nextAttemptAt,
++      retryStatus: input.retryStatus !== undefined ? input.retryStatus : current.retryStatus,
+       updatedAt: nowIso(),
+     };
+     this.evidence.set(updated.evidenceId, updated);
+@@ -836,15 +864,22 @@
+     };
+     const deliveryWanted = (row: ProviderEvidenceRecord) =>
+       input.includeConsumerDelivery !== false || !isAwaitingConsumerDeliveryOnly(row);
++    const verificationWanted = (row: ProviderEvidenceRecord) =>
++      input.includePendingVerification !== false || row.verificationStatus !== 'pending';
++    // Rows named explicitly are claimed whatever their backoff; `gave_up` still excludes them.
++    const due = (row: ProviderEvidenceRecord) =>
++      Boolean(input.evidenceIds?.length) || isRetryDue({ nextAttemptAt: row.nextAttemptAt }, now);
+     const candidates = [...this.evidence.values()]
+       .filter(
+         (row) =>
+           leaseAvailable(row) &&
+           scopeMatch(row) &&
+           isRecoverableEvidenceRow(row) &&
+-          deliveryWanted(row),
++          deliveryWanted(row) &&
++          verificationWanted(row) &&
++          due(row),
+       )
+-      .sort(byReceivedAt)
++      .sort(byNextAttemptAt)
+       .slice(0, input.limit);
+     const leaseUntil = new Date(now + input.leaseMs).toISOString();
+     return Promise.all(
+@@ -880,26 +915,48 @@
+   }
+ 
+   async listReconciliationCandidates(limit: number): Promise<ProviderEvidenceRecord[]> {
++    const now = Date.now();
+     return [...this.evidence.values()]
+       .filter(
+         (row) =>
++          row.evidenceKind === 'webhook' &&
+           row.verificationStatus === 'verified' &&
+           (row.processingStatus === 'unmatched' ||
+             (row.relatedOperationId &&
+-              this.operations.get(row.relatedOperationId)?.status === 'unknown')),
++              this.operations.get(row.relatedOperationId)?.status === 'unknown')) &&
++          isRetryDue(row, now),
+       )
+-      .sort(byReceivedAt)
++      .sort(byNextAttemptAt)
+       .slice(0, limit);
+   }
+ 
+-  async listUncertainOperations(limit: number): Promise<PaymentOperation[]> {
++  async listUncertainOperations(
++    limit: number,
++    options: ListUncertainOperationsOptions = {},
++  ): Promise<PaymentOperation[]> {
++    const now = Date.now();
++    const staleBefore = options.submittedStaleBefore
++      ? Date.parse(options.submittedStaleBefore)
++      : Number.NaN;
++    const staleKinds = options.submittedStaleKinds ?? DEFAULT_SUBMITTED_STALE_KINDS;
++    const isStaleSubmitted = (operation: PaymentOperation) =>
++      operation.status === 'submitted' &&
++      Number.isFinite(staleBefore) &&
++      staleKinds.includes(operation.kind) &&
++      !operation.providerReferenceId &&
++      Date.parse(operation.updatedAt) <= staleBefore &&
++      !(
++        operation.executionOwnerToken &&
++        operation.executionLeaseExpiresAt &&
++        Date.parse(operation.executionLeaseExpiresAt) > now
++      );
+     return [...this.operations.values()]
+-      .filter((operation) => operation.status === 'unknown')
+-      .sort(
+-        (left, right) =>
+-          left.createdAt.localeCompare(right.createdAt) ||
+-          left.operationId.localeCompare(right.operationId),
++      .filter(
++        (operation) =>
++          (operation.status === 'unknown' || isStaleSubmitted(operation)) &&
++          isRetryDue(operation, now),
+       )
++      .sort(operationsByNextAttemptAt)
+       .slice(0, limit);
+   }
+ 
+@@ -1396,6 +1453,9 @@
+     consumerDeliveredAt: row.consumerDeliveredAt,
+     consumerDeliveryAttempts: row.consumerDeliveryAttempts,
+     consumerDeliveryLastError: row.consumerDeliveryLastError,
++    attempts: row.attempts ?? null,
++    nextAttemptAt: row.nextAttemptAt ?? null,
++    retryStatus: row.retryStatus ?? null,
+     eventType: row.eventType,
+     resourceId: row.resourceId,
+     errorCode: row.errorCode,
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/persistence/payment-reliability-store.ts .superpowers/snap-after-t6b/src/core/lib/persistence/payment-reliability-store.ts
+--- .superpowers/snap-after-t6a/src/core/lib/persistence/payment-reliability-store.ts	2026-10-22 14:55:49.719247434 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/persistence/payment-reliability-store.ts	2026-10-22 15:25:17.207773872 +0300
+@@ -17,6 +17,7 @@
+   UpdateSellerConnectionInput,
+   ClaimPendingEvidenceInput,
+   ListPaymentEvidenceForRecoveryInput,
++  ListUncertainOperationsOptions,
+   ListPaymentEvidenceForRecoveryResult,
+ } from '../../../contracts/index';
+ 
+@@ -34,6 +35,12 @@
+  * - `subscriptionStateJson` (one nullable text/jsonb column) is stored verbatim by create, update
+  *   and transition and returned on every read; the engine keeps the subscription reducer state
+  *   there (last payment, failed-payment count, recent ids, undelivered effects).
++ * - Retry bookkeeping (issues #8, #20): operations and evidence carry three nullable columns,
++ *   `attempts` (integer), `nextAttemptAt` (timestamp) and `retryStatus` (`null` or `'gave_up'`).
++ *   `updateOperation`/`updateEvidence` store them like any other field. Every candidate list skips
++ *   rows with `retryStatus` set or `nextAttemptAt` in the future (store clock) and returns the
++ *   rest by `COALESCE(next_attempt_at, created_at/received_at)`, then id: a row that was deferred
++ *   queues up again at its due time instead of in front of newer rows.
+  * - Each successful write of an operation increments `version` by exactly 1 and sets `updatedAt`.
+  * - Methods that check `expectedVersion` are compare-and-set: on a mismatch they change nothing.
+  *   Two concurrent calls with the same `expectedVersion` never both succeed (SQL:
+@@ -89,7 +96,8 @@
+   /**
+    * Compare-and-set field patch at `expectedVersion` (`TRANSITION_CONFLICT` on a mismatch). No
+    * status change and no history row. `undefined` keeps, `null` clears; a cleared provider id no
+-   * longer matches its lookup. Provider ids are bound as in `transitionOperation`.
++   * longer matches its lookup. Provider ids are bound as in `transitionOperation`. Reconciliation
++   * defers an operation through this method (`attempts`, `nextAttemptAt`, `retryStatus`).
+    */
+   updateOperation(input: UpdatePaymentOperationInput): Promise<PaymentOperation>;
+   /**
+@@ -172,24 +180,30 @@
+   ): Promise<ProviderEvidenceRecord | null>;
+   /**
+    * Field patch, `undefined` keeps and `null` clears (`errorCode`, `errorMessage`, `processedAt`,
+-   * `relatedOperationId`, lease and consumer fields). The consumer-delivery fields
++   * `relatedOperationId`, lease, consumer and retry fields). The consumer-delivery fields
+    * (`consumerDeliveryStatus`, `consumerDeliveredAt`, `consumerDeliveryAttempts`,
+    * `consumerDeliveryLastError`) MUST be persisted and returned as written. No version check:
+    * the recovery lease serialises writers.
+    */
+   updateEvidence(input: UpdateProviderEvidenceInput): Promise<ProviderEvidenceRecord>;
+   /**
+-   * Leases up to `limit` recoverable rows (see `isRecoverableEvidenceRow`) whose lease is free,
+-   * expired or already held by `workerId`, oldest `receivedAt` first, and returns them with the
+-   * new lease (`claimWorkerId`, `claimLeaseExpiresAt` = now + `leaseMs`), sorted oldest first.
++   * Leases up to `limit` recoverable rows (see `isRecoverableEvidenceRow`: not `retryStatus`
++   * `'gave_up'` unless only the consumer delivery is left) whose lease is free, expired or already
++   * held by `workerId` and whose `nextAttemptAt` is null or reached, by
++   * `COALESCE(next_attempt_at, received_at), evidence_id`, and returns them with the new lease
++   * (`claimWorkerId`, `claimLeaseExpiresAt` = now + `leaseMs`) in that order. Rows named in
++   * `evidenceIds` are claimed whatever their `nextAttemptAt` (an explicit request).
+    * Two workers never get the same row while its lease is unexpired (SQL: `FOR UPDATE SKIP
+    * LOCKED`, or a conditional per-row update; under contention a worker may then get fewer rows
+    * than `limit`). In Postgres `UPDATE ... RETURNING` does not keep the subquery's `ORDER BY`:
+-   * sort the returned rows (CTE + outer `ORDER BY received_at, evidence_id`).
++   * sort the returned rows (CTE + outer `ORDER BY COALESCE(next_attempt_at, received_at),
++   * evidence_id`).
+    *
+    * `includeConsumerDelivery: false` MUST skip rows that only await consumer delivery: recovery
+    * passes it when no consumer is configured, and a store that ignores it fills every batch with
+    * those rows (oldest first), so newer verified rows are never processed.
++   * `includePendingVerification: false` MUST skip rows whose verification is `pending` (recovery
++   * cannot verify them and passes it always).
+    * A blank `workerId` throws `INVALID_REQUEST`.
+    */
+   claimPendingEvidence(input: ClaimPendingEvidenceInput): Promise<ProviderEvidenceRecord[]>;
+@@ -198,12 +212,26 @@
+ /** Candidates for `ReconciliationService` and its attempt log. */
+ export interface ReconciliationStore {
+   /**
+-   * Verified evidence that is `unmatched` or whose related operation is `unknown`, oldest
+-   * `receivedAt` first (`ORDER BY received_at, evidence_id`), at most `limit` rows.
++   * Verified `webhook` evidence that is `unmatched` or whose related operation is `unknown`,
++   * without `retryStatus` and with `nextAttemptAt` null or reached, at most `limit` rows,
++   * `ORDER BY COALESCE(next_attempt_at, received_at), evidence_id`. Rows of kind `reconciliation`
++   * (written by reconciliation itself) are not listed: their operation is listed by
++   * `listUncertainOperations`, and listing them too repeats the provider lookup.
+    */
+   listReconciliationCandidates(limit: number): Promise<ProviderEvidenceRecord[]>;
+-  /** Operations in `unknown`, oldest `createdAt` first (`ORDER BY created_at, operation_id`). */
+-  listUncertainOperations(limit: number): Promise<PaymentOperation[]>;
++  /**
++   * Operations in `unknown`, plus stale `submitted` ones when `options.submittedStaleBefore` is
++   * given (kind in `submittedStaleKinds`, default `DEFAULT_SUBMITTED_STALE_KINDS`; no
++   * `providerReferenceId`; `updatedAt` at or before it; execution lease missing or expired: a
++   * create that crashed after its claim). Only rows without `retryStatus` and with
++   * `nextAttemptAt` null or reached, at most `limit`,
++   * `ORDER BY COALESCE(next_attempt_at, created_at), operation_id`. Hosts implementing the 0.2
++   * signature ignore the options and never list stale `submitted` operations.
++   */
++  listUncertainOperations(
++    limit: number,
++    options?: ListUncertainOperationsOptions,
++  ): Promise<PaymentOperation[]>;
+   insertReconciliationAttempt(
+     input: InsertReconciliationAttemptInput,
+   ): Promise<ReconciliationAttempt>;
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/reconciliation-service.ts .superpowers/snap-after-t6b/src/core/lib/reconciliation-service.ts
+--- .superpowers/snap-after-t6a/src/core/lib/reconciliation-service.ts	2026-10-22 14:55:49.719348053 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/reconciliation-service.ts	2026-10-22 15:25:17.207842434 +0300
+@@ -11,9 +11,21 @@
+   ReconcilePaymentOperationsResult,
+   SubscriptionStatus,
+ } from '../../contracts/index';
+-import { PAYMENT_RELIABILITY_ERROR } from '../../contracts/index';
++import {
++  DEFAULT_SUBMITTED_STALE_KINDS,
++  PAYMENT_RELIABILITY_ERROR,
++  PaymentReliabilityError,
++} from '../../contracts/index';
+ import { sanitizeOperationalErrorMessage } from './public-error-sanitizer';
+ import {
++  DEFAULT_SUBMITTED_STALE_AFTER_MS,
++  nextRetryDeferral,
++  resolvePositiveDurationMs,
++  resolveRetryBackoffPolicy,
++  type RetryBackoffOptions,
++  type RetryBackoffPolicy,
++} from './retry-backoff';
++import {
+   assertTransitionAllowed,
+   assertVerifiedEvidence,
+   mapCheckoutWebhookEventToStatus,
+@@ -194,47 +206,74 @@
+ 
+ const CAPABILITY_NOT_CONFIGURED = 'STORE_CAPABILITY_NOT_CONFIGURED';
+ 
++/**
++ * Rows that correlate to no operation cost one store lookup each: they are deferred without using
++ * the `limit` budget, and one run scans at most `limit` times this many evidence rows.
++ */
++const UNMATCHED_SCAN_FACTOR = 10;
++
++/**
++ * Backoff (`retryBaseDelayMs`, `retryMaxDelayMs`, `maxAttempts`, see `RetryBackoffOptions`): a
++ * candidate that is still unresolved after its attempt is deferred and gives up after
++ * `maxAttempts` (issue #8). `submittedStaleAfterMs` (integer ms > 0, default
++ * `DEFAULT_SUBMITTED_STALE_AFTER_MS`): a `submitted` operation without a provider reference this
++ * long after its last write is treated as uncertain (issue #12).
++ */
++export type ReconciliationServiceOptions = RetryBackoffOptions & {
++  submittedStaleAfterMs?: number;
++};
++
+ export class ReconciliationService {
++  private readonly retryPolicy: RetryBackoffPolicy;
++  private readonly submittedStaleAfterMs: number;
++
+   constructor(
+     private readonly store: ReconciliationServiceStore,
+     private readonly providerLookup: ReconciliationProviderLookup,
+     /** Optional host hooks; `onSubscriptionEffects` gets the reducer's effects after each save. */
+     private readonly hooks: SubscriptionEffectsHooks = {},
++    options: ReconciliationServiceOptions = {},
+   ) {
++    this.retryPolicy = resolveRetryBackoffPolicy(options, 'Reconciliation');
++    this.submittedStaleAfterMs = resolvePositiveDurationMs(
++      options.submittedStaleAfterMs,
++      'submittedStaleAfterMs',
++      'Reconciliation',
++      DEFAULT_SUBMITTED_STALE_AFTER_MS,
++    );
+     assertStoreCapabilitiesComplete(store, ['payout', 'seller', 'marketplace']);
+   }
+ 
++  /**
++   * One run: due evidence candidates (at most `limit` that correlate to an operation; rows that
++   * correlate to none are deferred and the batch is refilled), then due uncertain operations, then
++   * seller connections. Every candidate still unresolved afterwards is deferred with backoff.
++   */
+   async reconcile(limit = 25): Promise<ReconcilePaymentOperationsResult> {
+-    const evidenceCandidates = await this.store.listReconciliationCandidates(limit);
+-    const uncertainOperations = await this.store.listUncertainOperations(limit);
++    const uncertainOperations = await this.store.listUncertainOperations(limit, {
++      submittedStaleBefore: new Date(Date.now() - this.submittedStaleAfterMs).toISOString(),
++      submittedStaleKinds: [...DEFAULT_SUBMITTED_STALE_KINDS],
++    });
+     const sellerStore = hasSellerStore(this.store) ? this.store : null;
+     const connectionCandidates = sellerStore
+       ? await sellerStore.listSellerConnectionsForReconciliation(limit)
+       : [];
+     const result: ReconcileCounters = {
+-      examined:
+-        evidenceCandidates.length + uncertainOperations.length + connectionCandidates.length,
++      examined: uncertainOperations.length + connectionCandidates.length,
+       applied: 0,
+       retryableFailures: 0,
+       terminalFailures: 0,
+       noOps: 0,
+     };
+ 
+-    for (const evidence of evidenceCandidates) {
+-      await this.reconcileEvidence(evidence, result);
+-    }
+-
+-    const reconciledOperationIds = new Set(
+-      evidenceCandidates
+-        .map((row) => row.relatedOperationId)
+-        .filter((operationId): operationId is string => Boolean(operationId)),
+-    );
++    const reconciledOperationIds = await this.reconcileEvidenceCandidates(limit, result);
+ 
+     for (const operation of uncertainOperations) {
+       if (reconciledOperationIds.has(operation.operationId)) {
+         continue;
+       }
+       await this.reconcileOperation(operation, result);
++      await this.deferOperationIfUnresolved(operation.operationId);
+     }
+ 
+     if (sellerStore) {
+@@ -256,10 +295,91 @@
+     return result;
+   }
+ 
++  /** Returns the ids of the operations the examined evidence belongs to. */
++  private async reconcileEvidenceCandidates(
++    limit: number,
++    result: ReconcileCounters,
++  ): Promise<Set<string>> {
++    const examined = new Set<string>();
++    const relatedOperationIds = new Set<string>();
++    const maxScanned = limit * UNMATCHED_SCAN_FACTOR;
++    let correlated = 0;
++    while (correlated < limit && examined.size < maxScanned) {
++      // Deferred rows leave the due set, so the next page holds the rows behind them. A store that
++      // ignores `nextAttemptAt` returns the same rows again: the run then stops.
++      const page = (await this.store.listReconciliationCandidates(limit)).filter(
++        (row) => !examined.has(row.evidenceId),
++      );
++      if (page.length === 0) {
++        break;
++      }
++      for (const evidence of page) {
++        if (correlated >= limit || examined.size >= maxScanned) {
++          break;
++        }
++        examined.add(evidence.evidenceId);
++        result.examined += 1;
++        if (evidence.relatedOperationId) {
++          relatedOperationIds.add(evidence.relatedOperationId);
++        }
++        if (await this.reconcileEvidence(evidence, result)) {
++          correlated += 1;
++        }
++        await this.deferEvidenceIfStillCandidate(evidence.evidenceId);
++      }
++    }
++    return relatedOperationIds;
++  }
++
++  /** Still `unmatched`, or its operation still `unknown`: wait for the backoff (issue #8). */
++  private async deferEvidenceIfStillCandidate(evidenceId: string): Promise<void> {
++    const fresh = await this.store.findEvidenceById(evidenceId);
++    if (!fresh || fresh.verificationStatus !== 'verified') {
++      return;
++    }
++    const related = fresh.relatedOperationId
++      ? await this.store.findOperationById(fresh.relatedOperationId)
++      : null;
++    if (fresh.processingStatus !== 'unmatched' && related?.status !== 'unknown') {
++      return;
++    }
++    await this.store.updateEvidence({
++      evidenceId,
++      ...nextRetryDeferral(fresh.attempts, this.retryPolicy),
++    });
++  }
++
++  /** Still `unknown` (or a `submitted` create without provider reference): wait for the backoff. */
++  private async deferOperationIfUnresolved(operationId: string): Promise<void> {
++    const fresh = await this.store.findOperationById(operationId);
++    if (
++      !fresh ||
++      (fresh.status !== 'unknown' && !(fresh.status === 'submitted' && !fresh.providerReferenceId))
++    ) {
++      return;
++    }
++    try {
++      await this.store.updateOperation({
++        operationId,
++        expectedVersion: fresh.version,
++        ...nextRetryDeferral(fresh.attempts, this.retryPolicy),
++      });
++    } catch (error) {
++      // Another writer moved the operation on; it is listed again by its new state.
++      if (
++        !(error instanceof PaymentReliabilityError) ||
++        error.code !== PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT
++      ) {
++        throw error;
++      }
++    }
++  }
++
++  /** `false` when no operation correlates (the row is foreign or not matchable yet). */
+   private async reconcileEvidence(
+     evidence: ProviderEvidenceRecord,
+     result: ReconcileCounters,
+-  ): Promise<void> {
++  ): Promise<boolean> {
+     assertVerifiedEvidence(evidence.verificationStatus);
+ 
+     const mappedFromEvent = evidence.eventType
+@@ -288,16 +408,16 @@
+         resultMessage: 'No operation correlated during reconciliation',
+       });
+       result.noOps += 1;
+-      return;
++      return false;
+     }
+ 
+     if (operation.kind === 'subscription') {
+       await this.reconcileSubscriptionEvidence(evidence, operation, result);
+-      return;
++      return true;
+     }
+     if (isSubscriptionCommandKind(operation.kind)) {
+       await this.reconcileSubscriptionCommand(operation, result);
+-      return;
++      return true;
+     }
+ 
+     const providerOutcome = await this.lookupProviderOutcome(operation, evidence.resourceId);
+@@ -322,12 +442,14 @@
+       result,
+       providerReferenceId: evidence.resourceId ?? operation.providerReferenceId,
+     });
++    return true;
+   }
+ 
+   private async reconcileOperation(
+-    operation: PaymentOperation,
++    listed: PaymentOperation,
+     result: ReconcileCounters,
+   ): Promise<void> {
++    let operation = listed;
+     if (isSubscriptionCommandKind(operation.kind)) {
+       await this.reconcileSubscriptionCommand(operation, result);
+       return;
+@@ -335,6 +457,13 @@
+     const providerReferenceId = this.resolveProviderReferenceId(operation);
+ 
+     if (!providerReferenceId) {
++      if (operation.status === 'submitted') {
++        const marked = await this.markStaleSubmittedUnknown(operation);
++        if (!marked) {
++          return;
++        }
++        operation = marked;
++      }
+       const evidence = await this.insertReconciliationEvidence(operation, {
+         resourceId: null,
+         eventType: 'RECONCILIATION.MISSING_PROVIDER_REFERENCE',
+@@ -383,6 +512,35 @@
+     });
+   }
+ 
++  /**
++   * A `submitted` create without any provider id long after its claim: the worker died before it
++   * wrote the provider result (issue #12). Mark it `unknown` so the host's create retry (same
++   * provider request id) and the uncertain views pick it up. `null` when another writer moved it.
++   */
++  private async markStaleSubmittedUnknown(
++    operation: PaymentOperation,
++  ): Promise<PaymentOperation | null> {
++    try {
++      return await this.store.transitionOperation({
++        operationId: operation.operationId,
++        expectedVersion: operation.version,
++        nextStatus: 'unknown',
++        ...(operation.kind === 'subscription' ? { subscriptionStatus: 'unknown' as const } : {}),
++        failureCode: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
++        failureMessage: 'The provider call did not record a result',
++        reason: 'Reconciliation found a stale submitted operation without provider reference',
++      });
++    } catch (error) {
++      if (
++        error instanceof PaymentReliabilityError &&
++        error.code === PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT
++      ) {
++        return null;
++      }
++      throw error;
++    }
++  }
++
+   private resolveProviderReferenceId(operation: PaymentOperation): string | null {
+     if (operation.kind === 'refund') {
+       return (
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/retry-backoff.ts .superpowers/snap-after-t6b/src/core/lib/retry-backoff.ts
+--- .superpowers/snap-after-t6a/src/core/lib/retry-backoff.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6b/src/core/lib/retry-backoff.ts	2026-10-22 15:25:17.207822307 +0300
+@@ -0,0 +1,125 @@
++import { RETRY_STATUS, type RetryState } from '../../contracts/index';
++import { PaymentConfigurationError } from './payment-configuration-error';
++
++/** First delay after an unsuccessful attempt (1 min); doubles with every further attempt. */
++export const DEFAULT_RETRY_BASE_DELAY_MS = 60_000;
++/** Longest delay between two attempts (1 h). */
++export const DEFAULT_RETRY_MAX_DELAY_MS = 3_600_000;
++/** Unsuccessful attempts after which a row gets `retryStatus: 'gave_up'`. */
++export const DEFAULT_RETRY_MAX_ATTEMPTS = 20;
++/** A `submitted` operation without a provider reference this long after its claim is stale (5 min). */
++export const DEFAULT_SUBMITTED_STALE_AFTER_MS = 300_000;
++
++/**
++ * Backoff of reconciliation and recovery (issues #8, #20). After an unsuccessful or skipped attempt
++ * a row waits `retryBaseDelayMs * 2^(attempts - 1)`, at most `retryMaxDelayMs`; after `maxAttempts`
++ * it gets `retryStatus: 'gave_up'` and is never selected again until a host resets it.
++ */
++export type RetryBackoffOptions = {
++  /** Integer ms > 0. Default `DEFAULT_RETRY_BASE_DELAY_MS`. */
++  retryBaseDelayMs?: number;
++  /** Integer ms >= `retryBaseDelayMs`. Default `DEFAULT_RETRY_MAX_DELAY_MS`. */
++  retryMaxDelayMs?: number;
++  /** Integer >= 1. Default `DEFAULT_RETRY_MAX_ATTEMPTS`. */
++  maxAttempts?: number;
++};
++
++export type RetryBackoffPolicy = Required<RetryBackoffOptions>;
++
++/** The fields a deferral writes onto an operation or an evidence row. */
++export type RetryDeferral = Required<RetryState>;
++
++function requirePositiveInteger(
++  value: number | undefined,
++  key: string,
++  service: string,
++  fallback: number,
++): number {
++  if (value === undefined) {
++    return fallback;
++  }
++  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
++    throw new PaymentConfigurationError(
++      `${service} option ${key} must be an integer greater than 0`,
++      [key],
++    );
++  }
++  return value;
++}
++
++/** Validates the options at construction: an invalid value must never disable the backoff. */
++export function resolveRetryBackoffPolicy(
++  options: RetryBackoffOptions,
++  service: string,
++): RetryBackoffPolicy {
++  const retryBaseDelayMs = requirePositiveInteger(
++    options.retryBaseDelayMs,
++    'retryBaseDelayMs',
++    service,
++    DEFAULT_RETRY_BASE_DELAY_MS,
++  );
++  const retryMaxDelayMs = requirePositiveInteger(
++    options.retryMaxDelayMs,
++    'retryMaxDelayMs',
++    service,
++    Math.max(DEFAULT_RETRY_MAX_DELAY_MS, retryBaseDelayMs),
++  );
++  if (retryMaxDelayMs < retryBaseDelayMs) {
++    throw new PaymentConfigurationError(
++      `${service} option retryMaxDelayMs must not be smaller than retryBaseDelayMs`,
++      ['retryMaxDelayMs'],
++    );
++  }
++  const maxAttempts = requirePositiveInteger(
++    options.maxAttempts,
++    'maxAttempts',
++    service,
++    DEFAULT_RETRY_MAX_ATTEMPTS,
++  );
++  return { retryBaseDelayMs, retryMaxDelayMs, maxAttempts };
++}
++
++/** Same validation for a single positive duration option (e.g. `submittedStaleAfterMs`). */
++export function resolvePositiveDurationMs(
++  value: number | undefined,
++  key: string,
++  service: string,
++  fallback: number,
++): number {
++  return requirePositiveInteger(value, key, service, fallback);
++}
++
++/** Delay before the next attempt once `attempts` unsuccessful attempts were made (>= 1). */
++export function retryDelayMs(attempts: number, policy: RetryBackoffPolicy): number {
++  const exponent = Math.min(Math.max(attempts - 1, 0), 40);
++  return Math.min(policy.retryMaxDelayMs, policy.retryBaseDelayMs * 2 ** exponent);
++}
++
++/** The retry fields after one more unsuccessful attempt of a row with `previous` attempts. */
++export function nextRetryDeferral(
++  previous: number | null | undefined,
++  policy: RetryBackoffPolicy,
++  nowMs: number = Date.now(),
++): RetryDeferral {
++  const attempts = Math.max(previous ?? 0, 0) + 1;
++  if (attempts >= policy.maxAttempts) {
++    return { attempts, nextAttemptAt: null, retryStatus: RETRY_STATUS.GAVE_UP };
++  }
++  return {
++    attempts,
++    nextAttemptAt: new Date(nowMs + retryDelayMs(attempts, policy)).toISOString(),
++    retryStatus: null,
++  };
++}
++
++/** `true` when a row may be selected now: not given up and `nextAttemptAt` missing or reached. */
++export function isRetryDue(row: RetryState, nowMs: number = Date.now()): boolean {
++  if (row.retryStatus != null) {
++    return false;
++  }
++  if (!row.nextAttemptAt) {
++    return true;
++  }
++  const dueMs = Date.parse(row.nextAttemptAt);
++  return !Number.isFinite(dueMs) || dueMs <= nowMs;
++}
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/subscription-lifecycle-service.ts .superpowers/snap-after-t6b/src/core/lib/subscription-lifecycle-service.ts
+--- .superpowers/snap-after-t6a/src/core/lib/subscription-lifecycle-service.ts	2026-10-22 14:55:49.719659253 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/subscription-lifecycle-service.ts	2026-10-22 15:25:17.208004949 +0300
+@@ -20,6 +20,7 @@
+   type PaymentPreferencesInput,
+   type PlanLifecycleRequest,
+   type PlanLifecycleResult,
++  type ExecuteCreateSubscriptionResult,
+   type ExecuteSubscriptionLifecycleResult,
+   type SubscriptionLifecycleCommandRequest,
+   type SubscriptionLifecycleCommandResult,
+@@ -100,6 +101,9 @@
+   return `command:${commandOp.operationId}`;
+ }
+ 
++/** Version conflicts an overlapping create can cause before its result is stored. */
++const CREATE_RESULT_PERSIST_ATTEMPTS = 3;
++
+ function isTerminal(status: PaymentOperation['status']): boolean {
+   return status === 'succeeded' || status === 'failed';
+ }
+@@ -110,24 +114,34 @@
+   ) => SubscriptionProviderCreateRetryEligibility;
+ };
+ 
++type SubscriptionCreateFingerprintInput = Pick<
++  CreateSubscriptionRequest,
++  | 'subscriber'
++  | 'returnUrl'
++  | 'cancelUrl'
++  | 'planOperationId'
++  | 'providerPlanId'
++  | 'offeringRef'
++  | keyof SubscriptionCreateOptions
++>;
++
++/**
++ * Every field that shapes the PayPal create request (issue #25): plan reference, subscriber ref and
++ * email, return/cancel URLs and the optional create fields. Fields a request does not use are left
++ * out, so a request without email or optional fields keeps the fingerprint it had in 0.2.
++ */
+ function buildSubscriptionCreateCommandFingerprint(
+-  input: Pick<
+-    CreateSubscriptionRequest,
+-    | 'subscriber'
+-    | 'returnUrl'
+-    | 'cancelUrl'
+-    | 'planOperationId'
+-    | 'providerPlanId'
+-    | 'offeringRef'
+-    | keyof SubscriptionCreateOptions
+-  >,
++  input: SubscriptionCreateFingerprintInput,
++  { withEmail = true }: { withEmail?: boolean } = {},
+ ): string {
+   const reference = resolveSubscriptionPlanReference(input);
++  const email = withEmail ? (input.subscriber.email ?? null) : null;
+   const common = {
+     subscriberRef: input.subscriber.subscriberRef,
+     returnUrl: input.returnUrl ?? null,
+     cancelUrl: input.cancelUrl ?? null,
+     ...subscriptionCreateFingerprintFields(input),
++    ...(email !== null ? { subscriberEmail: email } : {}),
+   };
+   if (reference.form === 'plan_operation') {
+     return buildCommandFingerprint({ planOperationId: reference.planOperationId, ...common });
+@@ -139,6 +153,31 @@
+   });
+ }
+ 
++/**
++ * Operations created before 0.3 have a fingerprint without the subscriber email. Such a row matches
++ * a request whose email-less fingerprint equals it and whose email equals the stored
++ * `subscriberEmail` (which 0.2 stored), so upgraded hosts can still replay and retry it.
++ */
++function matchesSubscriptionCreateFingerprint(
++  operation: PaymentOperation,
++  input: SubscriptionCreateFingerprintInput,
++): boolean {
++  if (operation.commandFingerprint === buildSubscriptionCreateCommandFingerprint(input)) {
++    return true;
++  }
++  const email = input.subscriber.email ?? null;
++  return (
++    email !== null &&
++    operation.subscriberEmail === email &&
++    operation.commandFingerprint ===
++      buildSubscriptionCreateCommandFingerprint(input, { withEmail: false })
++  );
++}
++
++function hasErrorCode(error: unknown, code: string): boolean {
++  return error instanceof PaymentReliabilityError && error.code === code;
++}
++
+ function assertSubscriptionOperationScope(
+   operation: PaymentOperation,
+   input: SubscriptionProviderContext & { subscriptionOperationId?: string },
+@@ -484,8 +523,10 @@
+       );
+     }
+ 
+-    const fingerprint = buildSubscriptionCreateCommandFingerprint(input);
+-    const base = this.subscriptionOperationBase(input, fingerprint);
++    const base = this.subscriptionOperationBase(
++      input,
++      await this.subscriptionCreateFingerprint(input),
++    );
+     await this.assertProviderPlanActiveBeforeCreate(input, base, plan.providerPlanId);
+ 
+     const operation = await this.store.createOperation({
+@@ -502,8 +543,10 @@
+     input: CreateSubscriptionRequest,
+     reference: { providerPlanId: string; offeringRef: string },
+   ): Promise<SubscriptionResult> {
+-    const fingerprint = buildSubscriptionCreateCommandFingerprint(input);
+-    const base = this.subscriptionOperationBase(input, fingerprint);
++    const base = this.subscriptionOperationBase(
++      input,
++      await this.subscriptionCreateFingerprint(input),
++    );
+     await this.assertProviderPlanActiveBeforeCreate(input, base, reference.providerPlanId);
+ 
+     const operation = await this.store.createOperation({
+@@ -516,6 +559,22 @@
+     return this.executeSubscriptionOperation(input, operation, reference.providerPlanId);
+   }
+ 
++  /** The request's fingerprint, or the stored pre-0.3 one when the stored row matches it. */
++  private async subscriptionCreateFingerprint(input: CreateSubscriptionRequest): Promise<string> {
++    const existing = await this.store.findOperationByIdempotency(
++      buildOperationIdempotencyScope({
++        applicationRef: input.applicationRef,
++        accountRef: input.accountRef,
++        environment: input.environment,
++        kind: 'subscription',
++      }),
++      input.idempotencyKey,
++    );
++    return existing && matchesSubscriptionCreateFingerprint(existing, input)
++      ? existing.commandFingerprint
++      : buildSubscriptionCreateCommandFingerprint(input);
++  }
++
+   /**
+    * Both plan reference forms check the provider plan before a new (or still prepared)
+    * operation reaches the provider; replays of submitted/unknown/terminal operations return
+@@ -600,10 +659,21 @@
+       return toSubscriptionResult(operation);
+     }
+ 
+-    operation = await this.store.claimOperationForExecution({
+-      operationId: operation.operationId,
+-      expectedVersion: operation.version,
+-    });
++    try {
++      operation = await this.store.claimOperationForExecution({
++        operationId: operation.operationId,
++        expectedVersion: operation.version,
++      });
++    } catch (error) {
++      // A concurrent create with the same key won the claim: return its state (issue #22).
++      const current = hasErrorCode(error, PAYMENT_RELIABILITY_ERROR.OPERATION_CONFLICT)
++        ? await this.store.findOperationById(operation.operationId)
++        : null;
++      if (current && current.status !== 'prepared') {
++        return toSubscriptionResult(current);
++      }
++      throw error;
++    }
+ 
+     try {
+       const result = await this.provider.createSubscription({
+@@ -618,20 +688,9 @@
+         cancelUrl: input.cancelUrl ?? null,
+         ...resolveSubscriptionCreateOptions(input),
+       });
+-      operation = await this.store.transitionOperation({
+-        operationId: operation.operationId,
+-        expectedVersion: operation.version,
+-        nextStatus: subscriptionStatusToOperationStatus(result.subscriptionStatus),
+-        subscriptionStatus: result.subscriptionStatus,
+-        providerSubscriptionId: result.providerSubscriptionId,
+-        providerReferenceId: result.providerSubscriptionId,
+-        approvalUrl: result.approvalUrl,
+-        startTime: result.startTime,
+-        nextBillingTime: result.nextBillingTime,
+-        reason: 'PayPal subscription created awaiting approval if required',
+-      });
++      operation = await this.persistSubscriptionCreateResult(operation, result, null);
+     } catch (error) {
+-      operation = await this.handleFailure(operation, error);
++      operation = await this.handleSubscriptionCreateFailure(operation, error);
+     }
+ 
+     return toSubscriptionResult(operation);
+@@ -661,8 +720,7 @@
+     }
+     assertSubscriptionOperationScope(operation, input);
+ 
+-    const fingerprint = buildSubscriptionCreateCommandFingerprint(input);
+-    if (fingerprint !== operation.commandFingerprint) {
++    if (!matchesSubscriptionCreateFingerprint(operation, input)) {
+       throw new PaymentReliabilityError(
+         PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT,
+         'Retry parameters do not match the original subscription command',
+@@ -1092,19 +1150,10 @@
+         cancelUrl: input.cancelUrl ?? null,
+         ...resolveSubscriptionCreateOptions(input),
+       });
+-      executingOperation = await this.persistSubscriptionCreateExecutionTransition(
++      executingOperation = await this.persistSubscriptionCreateResult(
+         executingOperation,
++        result,
+         executionOwnerToken,
+-        {
+-          nextStatus: subscriptionStatusToOperationStatus(result.subscriptionStatus),
+-          subscriptionStatus: result.subscriptionStatus,
+-          providerSubscriptionId: result.providerSubscriptionId,
+-          providerReferenceId: result.providerSubscriptionId,
+-          approvalUrl: result.approvalUrl,
+-          startTime: result.startTime,
+-          nextBillingTime: result.nextBillingTime,
+-          reason: 'PayPal subscription created awaiting approval if required',
+-        },
+       );
+     } catch (error) {
+       executingOperation = await this.handleSubscriptionCreateProviderFailure(
+@@ -1142,30 +1191,67 @@
+     return reloaded;
+   }
+ 
+-  private async persistSubscriptionCreateExecutionTransition(
++  /**
++   * PayPal created the subscription: store it even when an overlapping create call (the original
++   * and a retry, issue #22) moved the row on. Both calls send the operation id as PayPal-Request-Id,
++   * so they receive the same subscription. A row that already holds a provider subscription id, or
++   * is terminal, is returned as stored. Other errors are rethrown for the caller's failure path.
++   */
++  private async persistSubscriptionCreateResult(
+     operation: PaymentOperation,
+-    executionOwnerToken: string,
+-    input: Omit<
+-      Parameters<OperationStore['transitionOperation']>[0],
+-      | 'operationId'
+-      | 'expectedVersion'
+-      | 'expectedExecutionOwnerToken'
+-      | 'executionOwnerToken'
+-      | 'executionLeaseExpiresAt'
+-    >,
++    result: ExecuteCreateSubscriptionResult,
++    executionOwnerToken: string | null,
++  ): Promise<PaymentOperation> {
++    let current = operation;
++    let ownerToken = executionOwnerToken;
++    for (let attempt = 0; attempt < CREATE_RESULT_PERSIST_ATTEMPTS; attempt += 1) {
++      try {
++        return await this.store.transitionOperation({
++          operationId: current.operationId,
++          expectedVersion: current.version,
++          ...(ownerToken ? { expectedExecutionOwnerToken: ownerToken } : {}),
++          executionOwnerToken: null,
++          executionLeaseExpiresAt: null,
++          nextStatus: subscriptionStatusToOperationStatus(result.subscriptionStatus),
++          subscriptionStatus: result.subscriptionStatus,
++          providerSubscriptionId: result.providerSubscriptionId,
++          providerReferenceId: result.providerSubscriptionId,
++          approvalUrl: result.approvalUrl,
++          startTime: result.startTime,
++          nextBillingTime: result.nextBillingTime,
++          reason: 'PayPal subscription created awaiting approval if required',
++        });
++      } catch (error) {
++        if (!this.isSubscriptionExecutorPersistenceConflict(error)) {
++          throw error;
++        }
++        const fresh = await this.reloadSubscriptionOperationAfterPersistenceConflict(
++          current.operationId,
++        );
++        if (fresh.providerSubscriptionId?.trim() || isTerminal(fresh.status)) {
++          return fresh;
++        }
++        // The other call holds the lease or wrote a failure: this call has the result, so it wins.
++        current = fresh;
++        ownerToken = null;
++      }
++    }
++    return this.reloadSubscriptionOperationAfterPersistenceConflict(operation.operationId);
++  }
++
++  /**
++   * Failure of the first create call. When a create retry moved the row on in the meantime, the
++   * stored state is returned and nothing is overwritten (issue #22).
++   */
++  private async handleSubscriptionCreateFailure(
++    operation: PaymentOperation,
++    error: unknown,
+   ): Promise<PaymentOperation> {
+     try {
+-      return await this.store.transitionOperation({
+-        operationId: operation.operationId,
+-        expectedVersion: operation.version,
+-        expectedExecutionOwnerToken: executionOwnerToken,
+-        executionOwnerToken: null,
+-        executionLeaseExpiresAt: null,
+-        ...input,
+-      });
+-    } catch (error) {
+-      if (!this.isSubscriptionExecutorPersistenceConflict(error)) {
+-        throw error;
++      return await this.handleFailure(operation, error, { pinVersion: true });
++    } catch (transitionError) {
++      if (!this.isSubscriptionExecutorPersistenceConflict(transitionError)) {
++        throw transitionError;
+       }
+       return this.reloadSubscriptionOperationAfterPersistenceConflict(operation.operationId);
+     }
+@@ -1218,6 +1304,8 @@
+   private async handleFailure(
+     operation: PaymentOperation,
+     error: unknown,
++    /** Only write when the row is still at `operation.version`; else return it as stored. */
++    { pinVersion = false }: { pinVersion?: boolean } = {},
+   ): Promise<PaymentOperation> {
+     const err = error as {
+       code?: string;
+@@ -1239,6 +1327,9 @@
+         'Operation was not found',
+       );
+     }
++    if (pinVersion && current.version !== operation.version) {
++      return current;
++    }
+ 
+     return this.store.transitionOperation({
+       operationId: current.operationId,
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/__tests__/fair-retry-queue.unit.test.ts .superpowers/snap-after-t6b/src/core/lib/__tests__/fair-retry-queue.unit.test.ts
+--- .superpowers/snap-after-t6a/src/core/lib/__tests__/fair-retry-queue.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6b/src/core/lib/__tests__/fair-retry-queue.unit.test.ts	2026-10-22 15:25:17.207369956 +0300
+@@ -0,0 +1,517 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import {
++  RETRY_STATUS,
++  type ExecuteGetSubscriptionResult,
++  type PaymentOperation,
++} from '../../../contracts/index';
++import type { ReconciliationProviderLookup } from '../checkout-provider-port';
++import { buildOperationIdempotencyScope } from '../operation-idempotency';
++import { PaymentConfigurationError } from '../payment-configuration-error';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import { PaymentRecoveryService } from '../payment-recovery-service';
++import { ReconciliationService } from '../reconciliation-service';
++import {
++  DEFAULT_RETRY_BASE_DELAY_MS,
++  DEFAULT_RETRY_MAX_ATTEMPTS,
++  DEFAULT_RETRY_MAX_DELAY_MS,
++} from '../retry-backoff';
++import { WebhookProcessingService } from '../webhook-processing-service';
++
++/*
++ * Issues #8 and #20: candidate selection for reconciliation, recovery and uncertain operations is
++ * fair. Unsuccessful rows are deferred with exponential backoff and give up after a cap; recovery
++ * never claims rows it can only skip. Ports probe p5 (30 foreign unmatched rows; 30 old
++ * verification-unavailable rows plus one verified/pending row).
++ */
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'app',
++  environment: 'sandbox' as const,
++};
++
++const T0 = Date.parse('2026-10-22T12:00:00.000Z');
++
++function lookupOf(
++  getSubscription: ReconciliationProviderLookup['getSubscription'],
++): ReconciliationProviderLookup {
++  return { getSubscription } as unknown as ReconciliationProviderLookup;
++}
++
++function activeSnapshot(id: string): ExecuteGetSubscriptionResult {
++  return {
++    providerSubscriptionId: id,
++    providerPlanId: 'P-1',
++    subscriptionStatus: 'active',
++    approvalUrl: null,
++    startTime: null,
++    nextBillingTime: null,
++    lifecycleReason: null,
++  };
++}
++
++let eventSeq = 0;
++
++function receive(
++  webhooks: WebhookProcessingService,
++  eventType: string,
++  subscriptionId: string,
++  verified = true,
++  resource: Record<string, unknown> = {},
++) {
++  eventSeq += 1;
++  return webhooks.receiveWebhook({
++    ...ctx,
++    rawBody: JSON.stringify({
++      id: `WH-${eventSeq}`,
++      event_type: eventType,
++      resource: { id: subscriptionId, ...resource },
++    }),
++    verify: async () =>
++      verified
++        ? { verified: true, transmissionId: 't', eventType, resourceId: subscriptionId }
++        : {
++            verified: false,
++            transmissionId: 't',
++            eventType: null,
++            resourceId: null,
++            failureKind: 'verification_unavailable' as const,
++            unavailableReason: 'outage',
++          },
++  });
++}
++
++async function seedSubmitted(
++  store: MemoryPaymentReliabilityStore,
++  subscriptionId: string,
++): Promise<PaymentOperation> {
++  const op = await store.createOperation({
++    ...ctx,
++    idempotencyKey: subscriptionId,
++    idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++    commandFingerprint: 'fp',
++    kind: 'subscription',
++    subscriptionStatus: 'approval_pending',
++    providerSubscriptionId: subscriptionId,
++    providerPlanId: 'P-1',
++  });
++  return store.transitionOperation({
++    operationId: op.operationId,
++    expectedVersion: op.version,
++    nextStatus: 'submitted',
++    providerReferenceId: subscriptionId,
++    reason: 'seed',
++  });
++}
++
++async function seedUnknown(
++  store: MemoryPaymentReliabilityStore,
++  subscriptionId: string,
++): Promise<PaymentOperation> {
++  const op = await store.createOperation({
++    ...ctx,
++    idempotencyKey: subscriptionId,
++    idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++    commandFingerprint: 'fp',
++    kind: 'subscription',
++    subscriptionStatus: 'approval_pending',
++    providerSubscriptionId: subscriptionId,
++    providerPlanId: 'P-1',
++  });
++  const claimed = await store.claimOperationForExecution({
++    operationId: op.operationId,
++    expectedVersion: op.version,
++  });
++  return store.transitionOperation({
++    operationId: claimed.operationId,
++    expectedVersion: claimed.version,
++    nextStatus: 'unknown',
++    subscriptionStatus: 'unknown',
++    reason: 'timeout',
++  });
++}
++
++function bySubscriptionId(store: MemoryPaymentReliabilityStore, id: string) {
++  return store.findOperationByProviderSubscriptionId(
++    ctx.providerCode,
++    ctx.accountRef,
++    ctx.environment,
++    id,
++  );
++}
++
++async function evidenceOf(store: MemoryPaymentReliabilityStore, evidenceId: string) {
++  const row = await store.findEvidenceById(evidenceId);
++  if (!row) {
++    throw new Error(`missing evidence ${evidenceId}`);
++  }
++  return row;
++}
++
++afterEach(() => {
++  vi.useRealTimers();
++});
++
++describe('reconcile() does not starve behind foreign unmatched rows (issue #8, probe p5)', () => {
++  it('reconciles our event within one run of reconcile(25) behind 30 foreign rows', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const foreign: string[] = [];
++    for (let i = 0; i < 30; i += 1) {
++      foreign.push((await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', `F${i}`)).evidenceId);
++    }
++    const mine = await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', 'S7');
++    expect(mine.processingStatus).toBe('unmatched');
++    await seedSubmitted(store, 'S7');
++
++    const reconciliation = new ReconciliationService(
++      store,
++      lookupOf(async ({ providerSubscriptionId }) => activeSnapshot(providerSubscriptionId)),
++    );
++    await reconciliation.reconcile(25);
++
++    expect((await bySubscriptionId(store, 'S7'))?.subscriptionStatus).toBe('active');
++    expect((await evidenceOf(store, mine.evidenceId)).processingStatus).toBe('processed');
++    // Every foreign row was attempted once and deferred, none of them gave up.
++    for (const evidenceId of foreign) {
++      const row = await evidenceOf(store, evidenceId);
++      expect(row.attempts).toBe(1);
++      expect(Date.parse(row.nextAttemptAt ?? '')).toBeGreaterThan(Date.now());
++      expect(row.retryStatus ?? null).toBe(null);
++    }
++  });
++
++  it('a deferred row is not examined again before its nextAttemptAt; the delay doubles up to the max', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const row = await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', 'F-ONLY');
++    const reconciliation = new ReconciliationService(
++      store,
++      lookupOf(async () => {
++        throw new Error('not called for unmatched rows');
++      }),
++      {},
++      { retryBaseDelayMs: 1_000, retryMaxDelayMs: 3_000, maxAttempts: 10 },
++    );
++
++    expect((await reconciliation.reconcile(25)).examined).toBe(1);
++    let stored = await evidenceOf(store, row.evidenceId);
++    expect(stored.attempts).toBe(1);
++    expect(stored.nextAttemptAt).toBe(new Date(T0 + 1_000).toISOString());
++
++    expect((await reconciliation.reconcile(25)).examined).toBe(0);
++
++    vi.setSystemTime(T0 + 1_000);
++    expect((await reconciliation.reconcile(25)).examined).toBe(1);
++    stored = await evidenceOf(store, row.evidenceId);
++    expect(stored.attempts).toBe(2);
++    expect(stored.nextAttemptAt).toBe(new Date(T0 + 1_000 + 2_000).toISOString());
++
++    vi.setSystemTime(T0 + 3_000);
++    await reconciliation.reconcile(25);
++    stored = await evidenceOf(store, row.evidenceId);
++    expect(stored.attempts).toBe(3);
++    // 4000 ms would exceed retryMaxDelayMs.
++    expect(stored.nextAttemptAt).toBe(new Date(T0 + 3_000 + 3_000).toISOString());
++  });
++
++  it('gives up after maxAttempts: retryStatus gave_up, processing status kept, never listed again', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const row = await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', 'F-GIVE-UP');
++    const reconciliation = new ReconciliationService(
++      store,
++      lookupOf(async () => {
++        throw new Error('not called');
++      }),
++      {},
++      { retryBaseDelayMs: 10, retryMaxDelayMs: 10, maxAttempts: 2 },
++    );
++
++    await reconciliation.reconcile(25);
++    vi.setSystemTime(T0 + 10);
++    await reconciliation.reconcile(25);
++    const stored = await evidenceOf(store, row.evidenceId);
++    expect(stored.attempts).toBe(2);
++    expect(stored.retryStatus).toBe(RETRY_STATUS.GAVE_UP);
++    expect(stored.processingStatus).toBe('unmatched');
++
++    vi.setSystemTime(T0 + 86_400_000);
++    expect((await reconciliation.reconcile(25)).examined).toBe(0);
++  });
++
++  it('an uncertain operation whose lookup keeps failing is deferred, then gives up and stays unknown', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const stuck = await seedUnknown(store, 'I-STUCK');
++    const lookup = vi.fn(async (): Promise<ExecuteGetSubscriptionResult> => {
++      throw new Error('PayPal down');
++    });
++    const reconciliation = new ReconciliationService(
++      store,
++      lookupOf(lookup),
++      {},
++      { retryBaseDelayMs: 1_000, retryMaxDelayMs: 1_000, maxAttempts: 2 },
++    );
++
++    expect((await reconciliation.reconcile(25)).retryableFailures).toBe(1);
++    let operation = await store.findOperationById(stuck.operationId);
++    expect(operation?.attempts).toBe(1);
++    expect(operation?.nextAttemptAt).toBe(new Date(T0 + 1_000).toISOString());
++
++    await reconciliation.reconcile(25);
++    expect(lookup).toHaveBeenCalledTimes(1);
++
++    vi.setSystemTime(T0 + 1_000);
++    await reconciliation.reconcile(25);
++    expect(lookup).toHaveBeenCalledTimes(2);
++    operation = await store.findOperationById(stuck.operationId);
++    expect(operation?.retryStatus).toBe(RETRY_STATUS.GAVE_UP);
++    expect(operation?.status).toBe('unknown');
++
++    vi.setSystemTime(T0 + 86_400_000);
++    await reconciliation.reconcile(25);
++    expect(lookup).toHaveBeenCalledTimes(2);
++  });
++
++  it('a newer uncertain operation is reached while an older one waits for its backoff', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    await seedUnknown(store, 'I-OLD');
++    vi.setSystemTime(T0 + 5);
++    const newer = await seedUnknown(store, 'I-NEW');
++    const lookup = vi.fn(async ({ providerSubscriptionId }: { providerSubscriptionId: string }) => {
++      if (providerSubscriptionId === 'I-OLD') {
++        throw new Error('PayPal down');
++      }
++      return activeSnapshot(providerSubscriptionId);
++    });
++    const reconciliation = new ReconciliationService(store, lookupOf(lookup));
++
++    await reconciliation.reconcile(1);
++    expect(lookup).toHaveBeenLastCalledWith(
++      expect.objectContaining({ providerSubscriptionId: 'I-OLD' }),
++    );
++    await reconciliation.reconcile(1);
++    expect(lookup).toHaveBeenLastCalledWith(
++      expect.objectContaining({ providerSubscriptionId: 'I-NEW' }),
++    );
++    expect((await store.findOperationById(newer.operationId))?.subscriptionStatus).toBe('active');
++  });
++
++  it('a plan-mismatch row stays unmatched by design and is bounded by the attempt cap', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const row = await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', 'I-PLAN');
++    await seedSubmitted(store, 'I-PLAN');
++    const lookup = vi.fn(async () => ({ ...activeSnapshot('I-PLAN'), providerPlanId: 'P-OTHER' }));
++    const reconciliation = new ReconciliationService(
++      store,
++      lookupOf(lookup),
++      {},
++      { retryBaseDelayMs: 100, retryMaxDelayMs: 100, maxAttempts: 2 },
++    );
++
++    expect((await reconciliation.reconcile(25)).terminalFailures).toBe(1);
++    await reconciliation.reconcile(25);
++    expect(lookup).toHaveBeenCalledTimes(1);
++    vi.setSystemTime(T0 + 100);
++    await reconciliation.reconcile(25);
++    vi.setSystemTime(T0 + 86_400_000);
++    await reconciliation.reconcile(25);
++    expect(lookup).toHaveBeenCalledTimes(2);
++    expect((await evidenceOf(store, row.evidenceId)).retryStatus).toBe(RETRY_STATUS.GAVE_UP);
++    expect((await bySubscriptionId(store, 'I-PLAN'))?.subscriptionStatus).toBe('approval_pending');
++  });
++});
++
++describe('recover() does not starve (issue #20, probe p5)', () => {
++  it('processes the verified row in the first recover(25) behind 30 verification-unavailable rows', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    for (let i = 0; i < 30; i += 1) {
++      await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', `U${i}`, false).catch(() => null);
++    }
++    await new Promise((resolve) => setTimeout(resolve, 5));
++    await seedSubmitted(store, 'S9');
++    // The first processing of our event fails on a store write: verified, still pending.
++    const transition = store.transitionOperation.bind(store);
++    let failOnce = true;
++    store.transitionOperation = async (input) => {
++      if (failOnce && input.reason.startsWith('Webhook')) {
++        failOnce = false;
++        throw new Error('db down');
++      }
++      return transition(input);
++    };
++    const mineEventId = `WH-${eventSeq + 1}`;
++    await receive(webhooks, 'BILLING.SUBSCRIPTION.CANCELLED', 'S9').catch(() => null);
++    const before = await store.findEvidenceByProviderEvent(
++      'paypal',
++      'default',
++      'sandbox',
++      mineEventId,
++    );
++    expect([before?.verificationStatus, before?.processingStatus]).toEqual(['verified', 'pending']);
++
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: null,
++    });
++    const first = await recovery.recover({ workerId: 'w', limit: 25 });
++
++    expect(first.processed).toBe(1);
++    expect(first.claimed).toBe(1);
++    expect((await bySubscriptionId(store, 'S9'))?.subscriptionStatus).toBe('cancelled');
++  });
++
++  it('defers a row it could not process; a newer row is reached on the next run', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const foreign: string[] = [];
++    for (let i = 0; i < 3; i += 1) {
++      foreign.push((await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', `F${i}`)).evidenceId);
++    }
++    vi.setSystemTime(T0 + 5);
++    const mine = await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', 'S-NEW');
++    await seedSubmitted(store, 'S-NEW');
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: null,
++    });
++
++    const first = await recovery.recover({ workerId: 'w', limit: 3 });
++    expect(first).toMatchObject({ claimed: 3, skipped: 3, processed: 0 });
++    for (const evidenceId of foreign) {
++      expect((await evidenceOf(store, evidenceId)).attempts).toBe(1);
++    }
++    const second = await recovery.recover({ workerId: 'w', limit: 3 });
++    expect(second).toMatchObject({ claimed: 1, processed: 1 });
++    expect((await evidenceOf(store, mine.evidenceId)).processingStatus).toBe('processed');
++  });
++
++  it('a pending row (plan mismatch) is deferred with backoff and gives up after maxAttempts', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    await seedSubmitted(store, 'I-MISMATCH');
++    const row = await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', 'I-MISMATCH', true, {
++      plan_id: 'P-OTHER',
++    });
++    expect(row.processingStatus).toBe('pending');
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: null,
++      retryBaseDelayMs: 1_000,
++      retryMaxDelayMs: 1_000,
++      maxAttempts: 2,
++    });
++
++    expect((await recovery.recover({ workerId: 'w' })).claimed).toBe(1);
++    let stored = await evidenceOf(store, row.evidenceId);
++    expect(stored.attempts).toBe(1);
++    expect(stored.nextAttemptAt).toBe(new Date(T0 + 1_000).toISOString());
++    expect((await recovery.recover({ workerId: 'w' })).claimed).toBe(0);
++
++    vi.setSystemTime(T0 + 1_000);
++    expect((await recovery.recover({ workerId: 'w' })).claimed).toBe(1);
++    stored = await evidenceOf(store, row.evidenceId);
++    expect(stored.retryStatus).toBe(RETRY_STATUS.GAVE_UP);
++    expect(stored.processingStatus).toBe('pending');
++
++    vi.setSystemTime(T0 + 86_400_000);
++    expect((await recovery.recover({ workerId: 'w' })).claimed).toBe(0);
++    // An explicit recovery does not revive a row that gave up: the host resets it first.
++    expect(
++      (
++        await recovery.recoverEvidence({
++          evidenceId: row.evidenceId,
++          workerId: 'w',
++          environment: 'sandbox',
++        })
++      ).claimed,
++    ).toBe(0);
++  });
++
++  it('recoverEvidence ignores the backoff of the row it names', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const row = await receive(webhooks, 'BILLING.SUBSCRIPTION.ACTIVATED', 'S-LATE');
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: null,
++    });
++    expect((await recovery.recover({ workerId: 'w' })).skipped).toBe(1);
++    await seedSubmitted(store, 'S-LATE');
++    const explicit = await recovery.recoverEvidence({
++      evidenceId: row.evidenceId,
++      workerId: 'w',
++      environment: 'sandbox',
++    });
++    expect(explicit.processed).toBe(1);
++  });
++});
++
++describe('retry options are validated', () => {
++  const store = new MemoryPaymentReliabilityStore();
++  const lookup = lookupOf(async () => activeSnapshot('I-1'));
++
++  it('exposes the defaults', () => {
++    expect([
++      DEFAULT_RETRY_BASE_DELAY_MS,
++      DEFAULT_RETRY_MAX_DELAY_MS,
++      DEFAULT_RETRY_MAX_ATTEMPTS,
++    ]).toEqual([60_000, 3_600_000, 20]);
++  });
++
++  it.each([
++    [{ retryBaseDelayMs: 0 }, 'retryBaseDelayMs'],
++    [{ retryBaseDelayMs: -1 }, 'retryBaseDelayMs'],
++    [{ retryBaseDelayMs: Number.NaN }, 'retryBaseDelayMs'],
++    [{ retryBaseDelayMs: 1.5 }, 'retryBaseDelayMs'],
++    [{ retryMaxDelayMs: Number.POSITIVE_INFINITY }, 'retryMaxDelayMs'],
++    [{ retryBaseDelayMs: 2_000, retryMaxDelayMs: 1_000 }, 'retryMaxDelayMs'],
++    [{ maxAttempts: 0 }, 'maxAttempts'],
++    [{ maxAttempts: 2.5 }, 'maxAttempts'],
++    [{ submittedStaleAfterMs: 0 }, 'submittedStaleAfterMs'],
++  ])('ReconciliationService rejects %o', (options, field) => {
++    let error: unknown;
++    try {
++      new ReconciliationService(store, lookup, {}, options);
++    } catch (caught) {
++      error = caught;
++    }
++    expect(error).toBeInstanceOf(PaymentConfigurationError);
++    expect((error as PaymentConfigurationError).missingFields).toEqual([field]);
++  });
++
++  it.each([
++    [{ retryBaseDelayMs: 0 }, 'retryBaseDelayMs'],
++    [{ retryBaseDelayMs: 5_000, retryMaxDelayMs: 1_000 }, 'retryMaxDelayMs'],
++    [{ maxAttempts: -3 }, 'maxAttempts'],
++  ])('PaymentRecoveryService rejects %o', (options, field) => {
++    let error: unknown;
++    try {
++      new PaymentRecoveryService({
++        store,
++        webhookProcessing: new WebhookProcessingService(store),
++        consumer: null,
++        ...options,
++      });
++    } catch (caught) {
++      error = caught;
++    }
++    expect(error).toBeInstanceOf(PaymentConfigurationError);
++    expect((error as PaymentConfigurationError).missingFields).toEqual([field]);
++  });
++});
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/__tests__/payment-recovery-consumer-delivery.unit.test.ts .superpowers/snap-after-t6b/src/core/lib/__tests__/payment-recovery-consumer-delivery.unit.test.ts
+--- .superpowers/snap-after-t6a/src/core/lib/__tests__/payment-recovery-consumer-delivery.unit.test.ts	2026-10-22 14:55:49.718481995 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/__tests__/payment-recovery-consumer-delivery.unit.test.ts	2026-10-22 15:25:17.207300496 +0300
+@@ -1,4 +1,4 @@
+-import { describe, expect, it, vi } from 'vitest';
++import { afterEach, describe, expect, it, vi } from 'vitest';
+ import { buildOperationIdempotencyScope } from '../operation-idempotency';
+ import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
+ import {
+@@ -6,6 +6,7 @@
+   PaymentRecoveryService,
+ } from '../payment-recovery-service';
+ import type { VerifiedProcessedPaymentEvent } from '../payment-event-consumer';
++import { DEFAULT_RETRY_MAX_DELAY_MS } from '../retry-backoff';
+ import { WebhookProcessingService } from '../webhook-processing-service';
+ 
+ /*
+@@ -69,6 +70,16 @@
+   return eventIds;
+ }
+ 
++/** A failed delivery waits for its backoff (issue #20): move the clock past it between runs. */
++function passRetryBackoff(): void {
++  vi.useFakeTimers({ toFake: ['Date'] });
++  vi.setSystemTime(Date.now() + DEFAULT_RETRY_MAX_DELAY_MS);
++}
++
++afterEach(() => {
++  vi.useRealTimers();
++});
++
+ async function evidenceFor(store: MemoryPaymentReliabilityStore, eventId: string) {
+   const row = await store.findEvidenceByProviderEvent('paypal', 'default', 'sandbox', eventId);
+   if (!row) {
+@@ -184,6 +195,7 @@
+     const runs = [];
+     for (let run = 0; run < 5; run += 1) {
+       runs.push(await recovery.recover({ workerId: 'w' }));
++      passRetryBackoff();
+     }
+     expect(deliver).toHaveBeenCalledTimes(3);
+     expect(runs.map((summary) => summary.failed)).toEqual([1, 1, 1, 0, 0]);
+@@ -225,6 +237,7 @@
+     });
+     for (let run = 0; run < 12; run += 1) {
+       await recovery.recover({ workerId: 'w' });
++      passRetryBackoff();
+     }
+     expect(deliver).toHaveBeenCalledTimes(10);
+     expect((await evidenceFor(store, eventId!)).consumerDeliveryStatus).toBe('failed_terminal');
+@@ -289,6 +302,7 @@
+       consumer: { deliver },
+     });
+     const first = await recovery.recover({ workerId: 'w' });
++    passRetryBackoff();
+     const second = await recovery.recover({ workerId: 'w' });
+     expect(first).toMatchObject({ delivered: 0, failed: 1 });
+     expect(second).toMatchObject({ delivered: 1, failed: 0 });
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/__tests__/payment-recovery-service.unit.test.ts .superpowers/snap-after-t6b/src/core/lib/__tests__/payment-recovery-service.unit.test.ts
+--- .superpowers/snap-after-t6a/src/core/lib/__tests__/payment-recovery-service.unit.test.ts	2026-10-22 14:55:49.717711928 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/__tests__/payment-recovery-service.unit.test.ts	2026-10-22 15:25:17.206942929 +0300
+@@ -218,7 +218,9 @@
+     expect(updated?.consumerDeliveryLastError).toBe('Consumer event delivery failed');
+   });
+ 
+-  it('skips evidence still awaiting provider verification when claimed', async () => {
++  // Recovery cannot verify without the transmission headers: it no longer claims such rows only to
++  // skip them (issue #20; was claimed 1 / skipped 1).
++  it('does not claim evidence still awaiting provider verification', async () => {
+     const store = new MemoryPaymentReliabilityStore();
+     const recovery = new PaymentRecoveryService({
+       store,
+@@ -243,8 +245,8 @@
+       limit: 5,
+       evidenceIds: [inserted.evidenceId],
+     });
+-    expect(summary.claimed).toBe(1);
+-    expect(summary.skipped).toBe(1);
++    expect(summary.claimed).toBe(0);
++    expect(summary.skipped).toBe(0);
+   });
+ 
+   it('respects recovery batch limit', async () => {
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/__tests__/public-error-paths.unit.test.ts .superpowers/snap-after-t6b/src/core/lib/__tests__/public-error-paths.unit.test.ts
+--- .superpowers/snap-after-t6a/src/core/lib/__tests__/public-error-paths.unit.test.ts	2026-10-22 14:55:49.717810237 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/__tests__/public-error-paths.unit.test.ts	2026-10-22 15:25:17.206994080 +0300
+@@ -11,6 +11,7 @@
+ import { buildOperationIdempotencyScope } from '../operation-idempotency';
+ import { PaypalWebhookVerifier } from '../../../paypal/lib/paypal-webhook-verifier';
+ import { resolvePaymentRuntime } from '../resolve-payment-runtime';
++import { DEFAULT_RETRY_MAX_DELAY_MS } from '../retry-backoff';
+ 
+ const SENSITIVE = {
+   secret: 'fake-client-secret',
+@@ -187,10 +188,12 @@
+       const updated = await store.findEvidenceById(inserted.evidenceId);
+       assertNoSensitiveLeak(updated?.consumerDeliveryLastError);
+       expect(updated?.consumerDeliveryLastError).toBe('Consumer event delivery failed');
++      // A failed delivery waits for its backoff (issue #20): reset it like a host would.
+       await store.updateEvidence({
+         evidenceId: inserted.evidenceId,
+         consumerDeliveryStatus: 'pending',
+         consumerDeliveryLastError: null,
++        nextAttemptAt: null,
+       });
+     }
+   });
+@@ -255,7 +258,11 @@
+     const failedRow = await store.findEvidenceById(inserted.evidenceId);
+     expect(failedRow?.consumerDeliveryLastError).toBe('Consumer event delivery failed');
+ 
++    // The failed delivery waits for its backoff (issue #20) before the next run retries it.
++    vi.useFakeTimers({ toFake: ['Date'] });
++    vi.setSystemTime(Date.now() + DEFAULT_RETRY_MAX_DELAY_MS);
+     const summary = await recovery.recover({ workerId: 'worker-retry-2', limit: 5 });
++    vi.useRealTimers();
+     expect(summary.delivered).toBe(1);
+     expect(attempts).toBe(2);
+     const confirmed = await store.findEvidenceById(inserted.evidenceId);
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/__tests__/stale-submitted-operations.unit.test.ts .superpowers/snap-after-t6b/src/core/lib/__tests__/stale-submitted-operations.unit.test.ts
+--- .superpowers/snap-after-t6a/src/core/lib/__tests__/stale-submitted-operations.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6b/src/core/lib/__tests__/stale-submitted-operations.unit.test.ts	2026-10-22 15:25:17.206783775 +0300
+@@ -0,0 +1,205 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { PAYMENT_RELIABILITY_ERROR, type PaymentOperation } from '../../../contracts/index';
++import type { ReconciliationProviderLookup } from '../checkout-provider-port';
++import { buildOperationIdempotencyScope } from '../operation-idempotency';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import { ReconciliationService } from '../reconciliation-service';
++import { DEFAULT_SUBMITTED_STALE_AFTER_MS } from '../retry-backoff';
++import type { SubscriptionProviderPort } from '../subscription-provider-port';
++import { SubscriptionLifecycleService } from '../subscription-lifecycle-service';
++
++/*
++ * Issue #12 (remainder): a crash between the claim (`submitted`) and the result write left the
++ * operation `submitted` forever. Ports probe p3 "crashed after claim".
++ */
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'app',
++  environment: 'sandbox' as const,
++};
++
++const T0 = Date.parse('2026-10-22T12:00:00.000Z');
++
++const lookup = {
++  getSubscription: vi.fn(async () => {
++    throw new Error('no lookup without a provider id');
++  }),
++} as unknown as ReconciliationProviderLookup;
++
++async function crashedAfterClaim(
++  store: MemoryPaymentReliabilityStore,
++  idempotencyKey = 'z',
++): Promise<PaymentOperation> {
++  const op = await store.createOperation({
++    ...ctx,
++    idempotencyKey,
++    idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++    commandFingerprint: 'fp',
++    kind: 'subscription',
++    subscriptionStatus: 'approval_pending',
++    providerPlanId: 'P-1',
++  });
++  return store.claimOperationForExecution({
++    operationId: op.operationId,
++    expectedVersion: op.version,
++  });
++}
++
++afterEach(() => {
++  vi.useRealTimers();
++});
++
++describe('stale submitted operations (issue #12)', () => {
++  it('listUncertainOperations includes a submitted operation older than submittedStaleBefore (probe p3)', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const claimed = await crashedAfterClaim(store);
++    expect(claimed.status).toBe('submitted');
++
++    expect(await store.listUncertainOperations(25)).toEqual([]);
++    expect(
++      await store.listUncertainOperations(25, {
++        submittedStaleBefore: new Date(T0 - 1).toISOString(),
++      }),
++    ).toEqual([]);
++    const stale = await store.listUncertainOperations(25, {
++      submittedStaleBefore: new Date(T0).toISOString(),
++    });
++    expect(stale.map((operation) => operation.operationId)).toEqual([claimed.operationId]);
++  });
++
++  it('never lists a submitted operation with a provider reference or an unexpired execution lease', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const awaitingApproval = await crashedAfterClaim(store, 'approval');
++    await store.transitionOperation({
++      operationId: awaitingApproval.operationId,
++      expectedVersion: awaitingApproval.version,
++      nextStatus: 'submitted',
++      providerSubscriptionId: 'I-APPROVAL',
++      providerReferenceId: 'I-APPROVAL',
++      reason: 'created, awaiting buyer approval',
++    });
++    const created = await store.createOperation({
++      ...ctx,
++      idempotencyKey: 'leased',
++      idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++      commandFingerprint: 'fp',
++      kind: 'subscription',
++      providerPlanId: 'P-1',
++    });
++    await store.acquireCheckoutCreateExecutionLease({
++      operationId: created.operationId,
++      expectedVersion: created.version,
++    });
++
++    vi.setSystemTime(T0 + 10_000);
++    expect(
++      await store.listUncertainOperations(25, {
++        submittedStaleBefore: new Date(T0 + 5_000).toISOString(),
++      }),
++    ).toEqual([]);
++  });
++
++  it('reconcile marks a crashed create unknown after submittedStaleAfterMs so it can be retried', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    expect(DEFAULT_SUBMITTED_STALE_AFTER_MS).toBe(300_000);
++    const store = new MemoryPaymentReliabilityStore();
++    const request = {
++      ...ctx,
++      idempotencyKey: 'sub-crash',
++      providerPlanId: 'P-1',
++      offeringRef: 'pro',
++      subscriber: { subscriberRef: 'u1', email: 'a@b.c' },
++    };
++    const getPlan = vi.fn(async () => ({
++      providerPlanId: 'P-1',
++      providerProductId: 'PROD-1',
++      planStatus: 'active' as const,
++    }));
++    // The worker dies while PayPal is answering: the create never returns.
++    const crashed = new SubscriptionLifecycleService(store, {
++      getPlan,
++      createSubscription: () => new Promise(() => undefined),
++    } as unknown as SubscriptionProviderPort);
++    void crashed.createSubscription(request);
++    await vi.waitFor(async () => {
++      const row = await store.findOperationByIdempotency(
++        buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++        'sub-crash',
++      );
++      expect(row?.status).toBe('submitted');
++    });
++    const claimed = (await store.findOperationByIdempotency(
++      buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++      'sub-crash',
++    )) as PaymentOperation;
++    const reconciliation = new ReconciliationService(store, lookup);
++    // vi.waitFor moves the fake clock: count from the claim.
++    const claimedAt = Date.parse(claimed.updatedAt);
++
++    vi.setSystemTime(claimedAt + DEFAULT_SUBMITTED_STALE_AFTER_MS - 1);
++    expect((await reconciliation.reconcile(25)).examined).toBe(0);
++    expect((await store.findOperationById(claimed.operationId))?.status).toBe('submitted');
++
++    vi.setSystemTime(claimedAt + DEFAULT_SUBMITTED_STALE_AFTER_MS);
++    expect((await reconciliation.reconcile(25)).examined).toBe(1);
++    const stale = await store.findOperationById(claimed.operationId);
++    expect(stale).toMatchObject({
++      status: 'unknown',
++      subscriptionStatus: 'unknown',
++      failureCode: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
++      attempts: 1,
++    });
++    const history = await store.listOperationTransitions(claimed.operationId);
++    expect(history.map((row) => `${row.fromStatus}->${row.toStatus}`)).toEqual([
++      'prepared->submitted',
++      'submitted->unknown',
++    ]);
++
++    // The host's create retry now recovers it with the same PayPal-Request-Id.
++    const createSubscription = vi.fn(async () => ({
++      providerSubscriptionId: 'I-RECOVERED',
++      providerPlanId: 'P-1',
++      subscriptionStatus: 'approval_pending' as const,
++      approvalUrl: 'https://paypal.test/approve/I-RECOVERED',
++      startTime: null,
++      nextBillingTime: null,
++    }));
++    const lifecycle = new SubscriptionLifecycleService(store, {
++      getPlan,
++      createSubscription,
++    } as unknown as SubscriptionProviderPort);
++    const { idempotencyKey: _key, ...retryRequest } = request;
++    const retried = await lifecycle.retrySubscriptionCreate(
++      { ...retryRequest, subscriptionOperationId: claimed.operationId },
++      { evaluateProviderCreateRetryEligibility: () => 'allowed' },
++    );
++    expect(retried).toMatchObject({
++      operationStatus: 'submitted',
++      providerSubscriptionId: 'I-RECOVERED',
++    });
++    expect(createSubscription).toHaveBeenCalledWith(
++      expect.objectContaining({ providerRequestId: claimed.operationId }),
++    );
++  });
++
++  it('submittedStaleAfterMs is configurable', async () => {
++    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
++    const store = new MemoryPaymentReliabilityStore();
++    const claimed = await crashedAfterClaim(store);
++    const reconciliation = new ReconciliationService(
++      store,
++      lookup,
++      {},
++      {
++        submittedStaleAfterMs: 1_000,
++      },
++    );
++    vi.setSystemTime(T0 + 1_000);
++    await reconciliation.reconcile(25);
++    expect((await store.findOperationById(claimed.operationId))?.status).toBe('unknown');
++  });
++});
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/__tests__/subscription-create-fingerprint.unit.test.ts .superpowers/snap-after-t6b/src/core/lib/__tests__/subscription-create-fingerprint.unit.test.ts
+--- .superpowers/snap-after-t6a/src/core/lib/__tests__/subscription-create-fingerprint.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6b/src/core/lib/__tests__/subscription-create-fingerprint.unit.test.ts	2026-10-22 15:25:17.207418630 +0300
+@@ -0,0 +1,236 @@
++import { describe, expect, it, vi } from 'vitest';
++import {
++  PAYMENT_RELIABILITY_ERROR,
++  type CreateSubscriptionRequest,
++  type ExecuteCreateSubscriptionRequest,
++} from '../../../contracts/index';
++import { buildCommandFingerprint } from '../command-fingerprint';
++import { buildOperationIdempotencyScope } from '../operation-idempotency';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import type { SubscriptionProviderPort } from '../subscription-provider-port';
++import { SubscriptionLifecycleService } from '../subscription-lifecycle-service';
++
++/*
++ * Issue #25: every request-shaping field of a subscription create (the subscriber email included)
++ * is part of the command fingerprint, so a replay or retry with the same idempotency key and a
++ * different request is IDEMPOTENCY_CONFLICT instead of being sent to PayPal.
++ */
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'app',
++  environment: 'sandbox' as const,
++};
++
++const base = {
++  ...ctx,
++  idempotencyKey: 'k',
++  providerPlanId: 'P-1',
++  offeringRef: 'pro',
++  subscriber: { subscriberRef: 'u1', email: 'a@b.c' },
++} satisfies CreateSubscriptionRequest;
++
++function provider(firstCreate: 'timeout' | 'ok' = 'timeout') {
++  const bodies: ExecuteCreateSubscriptionRequest[] = [];
++  const port = {
++    getPlan: vi.fn(async () => ({
++      providerPlanId: 'P-1',
++      providerProductId: 'PROD-1',
++      planStatus: 'active' as const,
++    })),
++    createSubscription: vi.fn(async (input: ExecuteCreateSubscriptionRequest) => {
++      bodies.push(input);
++      if (firstCreate === 'timeout' && bodies.length === 1) {
++        throw Object.assign(new Error('timed out'), {
++          code: 'PROVIDER_UNCERTAIN',
++          retryable: true,
++          uncertain: true,
++        });
++      }
++      return {
++        providerSubscriptionId: 'I-1',
++        providerPlanId: 'P-1',
++        subscriptionStatus: 'approval_pending' as const,
++        approvalUrl: 'https://paypal.test/approve/I-1',
++        startTime: null,
++        nextBillingTime: null,
++      };
++    }),
++  } as unknown as SubscriptionProviderPort;
++  return { port, bodies };
++}
++
++const allowRetry = { evaluateProviderCreateRetryEligibility: () => 'allowed' as const };
++
++async function rejectionCode(work: () => Promise<unknown>): Promise<string | null> {
++  try {
++    await work();
++    return null;
++  } catch (error) {
++    return (error as { code?: string }).code ?? 'no code';
++  }
++}
++
++describe('subscription create fingerprint (issue #25)', () => {
++  it('a retry with a different subscriber email is IDEMPOTENCY_CONFLICT and never reaches PayPal (probe p6)', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const { port, bodies } = provider();
++    const service = new SubscriptionLifecycleService(store, port);
++    const created = await service.createSubscription(base);
++    expect(created.operationStatus).toBe('unknown');
++
++    const { idempotencyKey: _key, ...retry } = base;
++    expect(
++      await rejectionCode(() =>
++        service.retrySubscriptionCreate(
++          {
++            ...retry,
++            subscriber: { subscriberRef: 'u1', email: 'other@x.y' },
++            subscriptionOperationId: created.subscriptionOperationId,
++          },
++          allowRetry,
++        ),
++      ),
++    ).toBe(PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT);
++    expect(
++      await rejectionCode(() =>
++        service.retrySubscriptionCreate(
++          {
++            ...retry,
++            subscriber: { subscriberRef: 'u1' },
++            subscriptionOperationId: created.subscriptionOperationId,
++          },
++          allowRetry,
++        ),
++      ),
++    ).toBe(PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT);
++    expect(bodies.map((body) => body.subscriberEmail)).toEqual(['a@b.c']);
++
++    const same = await service.retrySubscriptionCreate(
++      { ...retry, subscriptionOperationId: created.subscriptionOperationId },
++      allowRetry,
++    );
++    expect(same.providerSubscriptionId).toBe('I-1');
++    expect(bodies.map((body) => body.subscriberEmail)).toEqual(['a@b.c', 'a@b.c']);
++  });
++
++  it.each([
++    ['subscriber email', { subscriber: { subscriberRef: 'u1', email: 'other@x.y' } }],
++    ['customId', { customId: 'order-2' }],
++    ['shippingPreference', { shippingPreference: 'GET_FROM_FILE' as const }],
++    ['brandName', { brandName: 'Other brand' }],
++    ['userAction', { userAction: 'CONTINUE' as const }],
++    ['productType', { productType: 'PHYSICAL' as const }],
++    ['returnUrl', { returnUrl: 'https://other.test/return' }],
++    ['cancelUrl', { cancelUrl: 'https://other.test/cancel' }],
++    ['plan reference', { providerPlanId: 'P-2' }],
++  ])(
++    'a replay of the same key with a different %s is IDEMPOTENCY_CONFLICT',
++    async (_label, change) => {
++      const store = new MemoryPaymentReliabilityStore();
++      const { port, bodies } = provider('ok');
++      const service = new SubscriptionLifecycleService(store, port);
++      await service.createSubscription({
++        ...base,
++        customId: 'order-1',
++        shippingPreference: 'NO_SHIPPING',
++        brandName: 'Brand',
++        userAction: 'SUBSCRIBE_NOW',
++        productType: 'DIGITAL',
++        returnUrl: 'https://host.test/return',
++        cancelUrl: 'https://host.test/cancel',
++      });
++      expect(
++        await rejectionCode(() =>
++          service.createSubscription({
++            ...base,
++            customId: 'order-1',
++            shippingPreference: 'NO_SHIPPING',
++            brandName: 'Brand',
++            userAction: 'SUBSCRIBE_NOW',
++            productType: 'DIGITAL',
++            returnUrl: 'https://host.test/return',
++            cancelUrl: 'https://host.test/cancel',
++            ...change,
++          }),
++        ),
++      ).toBe(PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT);
++      expect(bodies.length).toBe(1);
++    },
++  );
++
++  it('a request without email keeps its T2 fingerprint', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const service = new SubscriptionLifecycleService(store, provider('ok').port);
++    const result = await service.createSubscription({
++      ...base,
++      subscriber: { subscriberRef: 'u1' },
++    });
++    expect(
++      (await store.findOperationById(result.subscriptionOperationId))?.commandFingerprint,
++    ).toBe(
++      buildCommandFingerprint({
++        providerPlanId: 'P-1',
++        offeringRef: 'pro',
++        subscriberRef: 'u1',
++        returnUrl: null,
++        cancelUrl: null,
++      }),
++    );
++  });
++
++  it('an operation stored with the pre-0.3 fingerprint (no email) still replays and retries with the same email', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const { port, bodies } = provider('ok');
++    const service = new SubscriptionLifecycleService(store, port);
++    const legacy = await store.createOperation({
++      ...ctx,
++      idempotencyKey: 'k',
++      idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++      commandFingerprint: buildCommandFingerprint({
++        providerPlanId: 'P-1',
++        offeringRef: 'pro',
++        subscriberRef: 'u1',
++        returnUrl: null,
++        cancelUrl: null,
++      }),
++      kind: 'subscription',
++      providerPlanId: 'P-1',
++      offeringRef: 'pro',
++      subscriberRef: 'u1',
++      subscriberEmail: 'a@b.c',
++      subscriptionStatus: 'approval_pending',
++    });
++    const claimed = await store.claimOperationForExecution({
++      operationId: legacy.operationId,
++      expectedVersion: legacy.version,
++    });
++    await store.transitionOperation({
++      operationId: claimed.operationId,
++      expectedVersion: claimed.version,
++      nextStatus: 'unknown',
++      reason: 'timeout under 0.2.x',
++    });
++
++    const replay = await service.createSubscription(base);
++    expect(replay.subscriptionOperationId).toBe(legacy.operationId);
++    const { idempotencyKey: _key, ...retry } = base;
++    const retried = await service.retrySubscriptionCreate(
++      { ...retry, subscriptionOperationId: legacy.operationId },
++      allowRetry,
++    );
++    expect(retried.providerSubscriptionId).toBe('I-1');
++    expect(bodies.map((body) => body.subscriberEmail)).toEqual(['a@b.c']);
++
++    // The stored email is the one the legacy request carried: another email is still a conflict.
++    expect(
++      await rejectionCode(() =>
++        service.createSubscription({
++          ...base,
++          subscriber: { subscriberRef: 'u1', email: 'other@x.y' },
++        }),
++      ),
++    ).toBe(PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT);
++  });
++});
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/__tests__/subscription-create-overlap.unit.test.ts .superpowers/snap-after-t6b/src/core/lib/__tests__/subscription-create-overlap.unit.test.ts
+--- .superpowers/snap-after-t6a/src/core/lib/__tests__/subscription-create-overlap.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6b/src/core/lib/__tests__/subscription-create-overlap.unit.test.ts	2026-10-22 15:25:17.207406568 +0300
+@@ -0,0 +1,215 @@
++import { describe, expect, it, vi } from 'vitest';
++import type {
++  ExecuteCreateSubscriptionRequest,
++  ExecuteCreateSubscriptionResult,
++  PaymentOperation,
++} from '../../../contracts/index';
++import { buildOperationIdempotencyScope } from '../operation-idempotency';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import type { SubscriptionProviderPort } from '../subscription-provider-port';
++import { SubscriptionLifecycleService } from '../subscription-lifecycle-service';
++
++/*
++ * Issue #22: a create retry that overlaps the still-in-flight original must not leave the operation
++ * `unknown` without the PayPal subscription id. Ports probes p6 / p6b ("NEW retry concurrent with
++ * in-flight original"): both calls use the same PayPal-Request-Id, so PayPal returns one
++ * subscription; whichever call returns it persists it, and the other returns the stored result.
++ */
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'app',
++  environment: 'sandbox' as const,
++};
++
++const request = {
++  ...ctx,
++  idempotencyKey: 'k',
++  providerPlanId: 'P-1',
++  offeringRef: 'pro',
++  subscriber: { subscriberRef: 'u1', email: 'a@b.c' },
++};
++
++const { idempotencyKey: _idempotencyKey, ...retryBase } = request;
++
++const allowRetry = { evaluateProviderCreateRetryEligibility: () => 'allowed' as const };
++
++type Pending = {
++  input: ExecuteCreateSubscriptionRequest;
++  resolve: (value: ExecuteCreateSubscriptionResult) => void;
++  reject: (error: unknown) => void;
++};
++
++/** PayPal model: same PayPal-Request-Id -> same subscription. Each call waits until released. */
++function controlledPaypal() {
++  const calls: Pending[] = [];
++  const byRequestId = new Map<string, string>();
++  const createSubscription = vi.fn(
++    (input: ExecuteCreateSubscriptionRequest) =>
++      new Promise<ExecuteCreateSubscriptionResult>((resolve, reject) => {
++        if (!byRequestId.has(input.providerRequestId)) {
++          byRequestId.set(input.providerRequestId, `I-${byRequestId.size + 1}`);
++        }
++        calls.push({ input, resolve, reject });
++      }),
++  );
++  const created = (index: number): ExecuteCreateSubscriptionResult => {
++    const id = byRequestId.get(calls[index]?.input.providerRequestId ?? '') as string;
++    return {
++      providerSubscriptionId: id,
++      providerPlanId: 'P-1',
++      subscriptionStatus: 'approval_pending',
++      approvalUrl: `https://paypal.test/approve/${id}`,
++      startTime: null,
++      nextBillingTime: null,
++    };
++  };
++  const provider = {
++    getPlan: vi.fn(async () => ({
++      providerPlanId: 'P-1',
++      providerProductId: 'PROD-1',
++      planStatus: 'active' as const,
++    })),
++    createSubscription,
++  } as unknown as SubscriptionProviderPort;
++  return { provider, calls, byRequestId, created, createSubscription };
++}
++
++function timeout(): Error {
++  return Object.assign(new Error('PayPal subscription HTTP request timed out'), {
++    code: 'PROVIDER_UNCERTAIN',
++    retryable: true,
++    uncertain: true,
++  });
++}
++
++async function startOriginalThenRetry() {
++  const store = new MemoryPaymentReliabilityStore();
++  const paypal = controlledPaypal();
++  const service = new SubscriptionLifecycleService(store, paypal.provider);
++  const original = service.createSubscription(request);
++  await vi.waitFor(() => expect(paypal.calls.length).toBe(1));
++  const operation = (await store.findOperationByIdempotency(
++    buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++    'k',
++  )) as PaymentOperation;
++  expect(operation.status).toBe('submitted');
++  const retry = service.retrySubscriptionCreate(
++    { ...retryBase, subscriptionOperationId: operation.operationId },
++    allowRetry,
++  );
++  await vi.waitFor(() => expect(paypal.calls.length).toBe(2));
++  return { store, paypal, service, original, retry, operationId: operation.operationId };
++}
++
++describe('create retry overlapping the in-flight original (issue #22)', () => {
++  it('original answers first: stored submitted with I-1 and the approval URL (probe p6)', async () => {
++    const { store, paypal, service, original, retry, operationId } = await startOriginalThenRetry();
++    paypal.calls[0]?.resolve(paypal.created(0));
++    const originalResult = await original;
++    paypal.calls[1]?.resolve(paypal.created(1));
++    const retryResult = await retry;
++
++    const stored = await store.findOperationById(operationId);
++    expect(stored).toMatchObject({
++      status: 'submitted',
++      providerSubscriptionId: 'I-1',
++      approvalUrl: 'https://paypal.test/approve/I-1',
++      executionOwnerToken: null,
++    });
++    expect(originalResult.providerSubscriptionId).toBe('I-1');
++    expect(retryResult.providerSubscriptionId).toBe('I-1');
++    // One PayPal subscription, one PayPal-Request-Id.
++    expect(new Set(paypal.byRequestId.values()).size).toBe(1);
++    expect(paypal.calls.map((call) => call.input.providerRequestId)).toEqual([
++      operationId,
++      operationId,
++    ]);
++
++    // p6b: a further retry returns the stored subscription without another POST.
++    const third = await service.retrySubscriptionCreate(
++      { ...retryBase, subscriptionOperationId: operationId },
++      allowRetry,
++    );
++    expect(third).toMatchObject({ operationStatus: 'submitted', providerSubscriptionId: 'I-1' });
++    expect(paypal.createSubscription).toHaveBeenCalledTimes(2);
++  });
++
++  it('retry answers first: the original does not overwrite it', async () => {
++    const { store, paypal, original, retry, operationId } = await startOriginalThenRetry();
++    paypal.calls[1]?.resolve(paypal.created(1));
++    expect((await retry).providerSubscriptionId).toBe('I-1');
++    paypal.calls[0]?.resolve(paypal.created(0));
++    expect((await original).providerSubscriptionId).toBe('I-1');
++
++    expect(await store.findOperationById(operationId)).toMatchObject({
++      status: 'submitted',
++      providerSubscriptionId: 'I-1',
++      approvalUrl: 'https://paypal.test/approve/I-1',
++    });
++  });
++
++  it('original times out after the retry stored I-1: the timeout does not overwrite it', async () => {
++    const { store, paypal, original, retry, operationId } = await startOriginalThenRetry();
++    paypal.calls[1]?.resolve(paypal.created(1));
++    await retry;
++    paypal.calls[0]?.reject(timeout());
++    expect((await original).providerSubscriptionId).toBe('I-1');
++    expect(await store.findOperationById(operationId)).toMatchObject({
++      status: 'submitted',
++      providerSubscriptionId: 'I-1',
++      failureCode: null,
++    });
++  });
++
++  it('original times out while the retry is in flight: the retry still persists I-1', async () => {
++    const { store, paypal, original, retry, operationId } = await startOriginalThenRetry();
++    paypal.calls[0]?.reject(timeout());
++    const originalResult = await original;
++    expect(originalResult.providerSubscriptionId).toBe(null);
++    expect(originalResult.operationStatus).toBe('submitted');
++    paypal.calls[1]?.resolve(paypal.created(1));
++    expect((await retry).providerSubscriptionId).toBe('I-1');
++    expect(await store.findOperationById(operationId)).toMatchObject({
++      status: 'submitted',
++      providerSubscriptionId: 'I-1',
++    });
++  });
++
++  it('the retry times out after the original stored I-1: the stored result stays', async () => {
++    const { store, paypal, original, retry, operationId } = await startOriginalThenRetry();
++    paypal.calls[0]?.resolve(paypal.created(0));
++    await original;
++    paypal.calls[1]?.reject(timeout());
++    expect((await retry).providerSubscriptionId).toBe('I-1');
++    expect(await store.findOperationById(operationId)).toMatchObject({
++      status: 'submitted',
++      providerSubscriptionId: 'I-1',
++    });
++  });
++
++  it('two concurrent creates with one key: the claim loser returns the stored operation', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const paypal = controlledPaypal();
++    const service = new SubscriptionLifecycleService(store, paypal.provider);
++    const [first, second] = [
++      service.createSubscription(request),
++      service.createSubscription(request),
++    ];
++    await vi.waitFor(() => expect(paypal.calls.length).toBe(1));
++    const loser = await Promise.race([first, second]);
++    expect(loser).toMatchObject({ operationStatus: 'submitted', providerSubscriptionId: null });
++    paypal.calls[0]?.resolve(paypal.created(0));
++    const results = await Promise.all([first, second]);
++    expect(results.map((result) => result.subscriptionOperationId)).toEqual([
++      loser.subscriptionOperationId,
++      loser.subscriptionOperationId,
++    ]);
++    expect(paypal.createSubscription).toHaveBeenCalledTimes(1);
++    expect(await store.findOperationById(loser.subscriptionOperationId)).toMatchObject({
++      status: 'submitted',
++      providerSubscriptionId: 'I-1',
++    });
++  });
++});
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/__tests__/subscription-lifecycle-create-retry.unit.test.ts .superpowers/snap-after-t6b/src/core/lib/__tests__/subscription-lifecycle-create-retry.unit.test.ts
+--- .superpowers/snap-after-t6a/src/core/lib/__tests__/subscription-lifecycle-create-retry.unit.test.ts	2026-10-22 14:55:49.718053695 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/__tests__/subscription-lifecycle-create-retry.unit.test.ts	2026-10-22 15:25:17.207387281 +0300
+@@ -152,6 +152,8 @@
+       parentOperationId: plan.operationId,
+       providerPlanId: 'PLAN-1',
+       subscriberRef: subscriber.subscriberRef,
++      // A 0.2 row: fingerprint without the email, email stored in its column (issue #25).
++      subscriberEmail: subscriber.email,
+       maskedSubscriber: '***',
+       subscriptionStatus: 'approval_pending',
+     });
+diff --color -ruN .superpowers/snap-after-t6a/src/core/lib/webhook-evidence-resume.ts .superpowers/snap-after-t6b/src/core/lib/webhook-evidence-resume.ts
+--- .superpowers/snap-after-t6a/src/core/lib/webhook-evidence-resume.ts	2026-10-22 14:55:49.719819044 +0300
++++ .superpowers/snap-after-t6b/src/core/lib/webhook-evidence-resume.ts	2026-10-22 15:25:17.208119659 +0300
+@@ -80,7 +80,14 @@
+   );
+ }
+ 
++/**
++ * Rows recovery may claim. A row that gave up (`retryStatus: 'gave_up'`) is not claimed for
++ * processing again; only its consumer delivery, which has its own cap, is still recoverable.
++ */
+ export function isRecoverableEvidenceRow(evidence: ProviderEvidenceRecord): boolean {
++  if (evidence.retryStatus != null && !isAwaitingConsumerDeliveryOnly(evidence)) {
++    return false;
++  }
+   if (evidence.verificationStatus === 'pending') {
+     return true;
+   }
+diff --color -ruN .superpowers/snap-after-t6a/src/testing/lib/run-store-conformance.ts .superpowers/snap-after-t6b/src/testing/lib/run-store-conformance.ts
+--- .superpowers/snap-after-t6a/src/testing/lib/run-store-conformance.ts	2026-10-22 14:55:49.721608813 +0300
++++ .superpowers/snap-after-t6b/src/testing/lib/run-store-conformance.ts	2026-10-22 15:25:17.209099310 +0300
+@@ -87,6 +87,14 @@
+   return new Promise((resolve) => setTimeout(resolve, ms));
+ }
+ 
++/** An instant before every row a case inserts (a reached `nextAttemptAt` older than all of them). */
++const PAST_ISO = '2000-01-01T00:00:00.000Z';
++
++/** One hour after the test clock: far enough for any store clock skew. */
++function futureIso(): string {
++  return new Date(Date.now() + 3_600_000).toISOString();
++}
++
+ function uniqueId(prefix: string): string {
+   return `${prefix}-${globalThis.crypto.randomUUID()}`;
+ }
+@@ -115,8 +123,9 @@
+  * submitted` claim and the create execution lease (one winner under concurrency, typed
+  * `transitionKind`), transition + history atomicity, provider-id uniqueness per kind, patch
+  * semantics (`undefined` keeps, `null` clears; also for `subscriptionStateJson`), evidence
+- * uniqueness, recovery lease exclusivity and expiry, the oldest-first ORDER BY of the candidate
+- * lists, and the consumer-delivery fields.
++ * uniqueness, recovery lease exclusivity and expiry, the retry backoff of the candidate lists
++ * (`attempts`, `nextAttemptAt`, `retryStatus`, ORDER BY COALESCE(nextAttemptAt, created/received),
++ * `includePendingVerification`, stale `submitted` creates), and the consumer-delivery fields.
+  */
+ export function runStoreConformance<TStore extends SubscriptionStore>(
+   options: StoreConformanceOptions<TStore>,
+@@ -1021,48 +1030,286 @@
+       });
+     });
+ 
+-    describe('candidate ordering', () => {
+-      it('listReconciliationCandidates returns verified unmatched evidence oldest first', async (store, ctx) => {
+-        const ids: string[] = [];
+-        for (let index = 0; index < 3; index += 1) {
+-          ids.push(
+-            (
+-              await insertEvidenceIn(store, ctx, {
+-                verificationStatus: 'verified',
+-                processingStatus: 'unmatched',
+-              })
+-            ).evidenceId,
+-          );
+-          await pause(gapMs);
+-        }
++    // Order: due rows only (`retryStatus` null, `nextAttemptAt` null or reached), by
++    // COALESCE(nextAttemptAt, receivedAt/createdAt), then id. Each list is checked with a row
++    // deferred into the future (excluded), one that gave up (excluded) and one whose past
++    // `nextAttemptAt` is older than every insert time (first).
++    describe('candidate ordering and retry backoff', () => {
++      it('listReconciliationCandidates: due verified unmatched webhook evidence, oldest first by nextAttemptAt/receivedAt', async (store, ctx) => {
++        const unmatched = () =>
++          insertEvidenceIn(store, ctx, {
++            verificationStatus: 'verified',
++            processingStatus: 'unmatched',
++          });
++        const deferred = await unmatched();
++        await pause(gapMs);
++        const first = await unmatched();
++        await pause(gapMs);
++        const dueEarlier = await unmatched();
++        await pause(gapMs);
++        const gaveUp = await unmatched();
++        await pause(gapMs);
++        const last = await unmatched();
+         await insertEvidenceIn(store, ctx, { processingStatus: 'unmatched' });
+-        expect((await store.listReconciliationCandidates(10)).map((row) => row.evidenceId)).toEqual(
+-          ids,
+-        );
++        await store.updateEvidence({
++          evidenceId: deferred.evidenceId,
++          attempts: 1,
++          nextAttemptAt: futureIso(),
++        });
++        await store.updateEvidence({
++          evidenceId: dueEarlier.evidenceId,
++          attempts: 2,
++          nextAttemptAt: PAST_ISO,
++        });
++        await store.updateEvidence({
++          evidenceId: gaveUp.evidenceId,
++          attempts: 20,
++          retryStatus: 'gave_up',
++        });
++        const ids = [dueEarlier, first, last].map((row) => row.evidenceId);
++        expect(
++          (await store.listReconciliationCandidates(10)).map((row) => row.evidenceId),
++          'due rows, oldest first by nextAttemptAt/receivedAt',
++        ).toEqual(ids);
+         expect((await store.listReconciliationCandidates(2)).map((row) => row.evidenceId)).toEqual(
+           ids.slice(0, 2),
+         );
+       });
+ 
+-      it('listUncertainOperations returns unknown operations oldest first (by createdAt)', async (store, ctx) => {
++      it('listUncertainOperations: due unknown operations, oldest first by nextAttemptAt/createdAt', async (store, ctx) => {
+         const created: PaymentOperation[] = [];
+-        for (let index = 0; index < 3; index += 1) {
++        for (let index = 0; index < 5; index += 1) {
+           created.push(await createOperation(store, ctx));
+           await pause(gapMs);
+         }
+         await createOperation(store, ctx);
++        const unknown: PaymentOperation[] = [];
+         for (const operation of [...created].reverse()) {
+-          await toUnknown(store, operation);
++          unknown.unshift(await toUnknown(store, operation));
+           await pause(gapMs);
+         }
+-        const ids = created.map((operation) => operation.operationId);
+-        expect((await store.listUncertainOperations(10)).map((row) => row.operationId)).toEqual(
+-          ids,
+-        );
++        const [deferred, first, dueEarlier, gaveUp, last] = unknown as [
++          PaymentOperation,
++          PaymentOperation,
++          PaymentOperation,
++          PaymentOperation,
++          PaymentOperation,
++        ];
++        await store.updateOperation({
++          operationId: deferred.operationId,
++          expectedVersion: deferred.version,
++          attempts: 1,
++          nextAttemptAt: futureIso(),
++        });
++        await store.updateOperation({
++          operationId: dueEarlier.operationId,
++          expectedVersion: dueEarlier.version,
++          attempts: 2,
++          nextAttemptAt: PAST_ISO,
++        });
++        await store.updateOperation({
++          operationId: gaveUp.operationId,
++          expectedVersion: gaveUp.version,
++          attempts: 20,
++          retryStatus: 'gave_up',
++        });
++        const ids = [dueEarlier, first, last].map((operation) => operation.operationId);
++        expect(
++          (await store.listUncertainOperations(10)).map((row) => row.operationId),
++          'due rows, oldest first by nextAttemptAt/createdAt',
++        ).toEqual(ids);
+         expect((await store.listUncertainOperations(2)).map((row) => row.operationId)).toEqual(
+           ids.slice(0, 2),
+         );
+       });
++
++      it('claimPendingEvidence: due rows only, oldest first by nextAttemptAt/receivedAt; evidenceIds ignore nextAttemptAt', async (store, ctx) => {
++        const deferred = await insertEvidenceIn(store, ctx, { verificationStatus: 'verified' });
++        await pause(gapMs);
++        const first = await insertEvidenceIn(store, ctx, { verificationStatus: 'verified' });
++        await pause(gapMs);
++        const dueEarlier = await insertEvidenceIn(store, ctx, { verificationStatus: 'verified' });
++        await pause(gapMs);
++        const gaveUp = await insertEvidenceIn(store, ctx, {
++          verificationStatus: 'verified',
++          processingStatus: 'unmatched',
++        });
++        const gaveUpAwaitingDelivery = await insertEvidenceIn(store, ctx, {
++          verificationStatus: 'verified',
++          processingStatus: 'processed',
++          consumerDeliveryStatus: 'pending',
++        });
++        await store.updateEvidence({
++          evidenceId: deferred.evidenceId,
++          attempts: 1,
++          nextAttemptAt: futureIso(),
++        });
++        await store.updateEvidence({
++          evidenceId: dueEarlier.evidenceId,
++          attempts: 3,
++          nextAttemptAt: PAST_ISO,
++        });
++        for (const row of [gaveUp, gaveUpAwaitingDelivery]) {
++          await store.updateEvidence({
++            evidenceId: row.evidenceId,
++            attempts: 20,
++            retryStatus: 'gave_up',
++          });
++        }
++        const claimed = await store.claimPendingEvidence({
++          limit: 10,
++          leaseMs: 60_000,
++          workerId: 'w1',
++        });
++        expect(
++          claimed.map((row) => row.evidenceId),
++          'due rows, oldest first by nextAttemptAt/receivedAt; gave_up only for delivery',
++        ).toEqual([dueEarlier, first, gaveUpAwaitingDelivery].map((row) => row.evidenceId));
++        const named = await store.claimPendingEvidence({
++          limit: 10,
++          leaseMs: 60_000,
++          workerId: 'w2',
++          evidenceIds: [deferred.evidenceId, gaveUp.evidenceId],
++        });
++        expect(
++          named.map((row) => row.evidenceId),
++          'evidenceIds ignore nextAttemptAt, never gave_up',
++        ).toEqual([deferred.evidenceId]);
++      });
++
++      it('claimPendingEvidence honours includePendingVerification', async (store, ctx) => {
++        await insertEvidenceIn(store, ctx, {});
++        const verified = await insertEvidenceIn(store, ctx, { verificationStatus: 'verified' });
++        const claimed = await store.claimPendingEvidence({
++          limit: 10,
++          leaseMs: 60_000,
++          workerId: 'w1',
++          includePendingVerification: false,
++        });
++        expect(
++          claimed.map((row) => row.evidenceId),
++          'includePendingVerification false skips verification-pending rows',
++        ).toEqual([verified.evidenceId]);
++      });
++
++      it('retry fields are stored by updateOperation and updateEvidence (undefined keeps, null clears)', async (store, ctx) => {
++        const nextAttemptAt = '2030-01-01T00:00:00.000Z';
++        const retryFields = (
++          row: {
++            attempts?: number | null;
++            nextAttemptAt?: string | null;
++            retryStatus?: string | null;
++          } | null,
++        ) => [
++          row?.attempts ?? null,
++          row?.nextAttemptAt ? new Date(row.nextAttemptAt).toISOString() : null,
++          row?.retryStatus ?? null,
++        ];
++        const operation = await toUnknown(store, await createOperation(store, ctx));
++        const deferred = await store.updateOperation({
++          operationId: operation.operationId,
++          expectedVersion: operation.version,
++          attempts: 1,
++          nextAttemptAt,
++        });
++        const kept = await store.updateOperation({
++          operationId: deferred.operationId,
++          expectedVersion: deferred.version,
++          lifecycleReason: 'other field',
++        });
++        expect(retryFields(kept), 'operation attempts and nextAttemptAt kept').toEqual([
++          1,
++          nextAttemptAt,
++          null,
++        ]);
++        const gaveUp = await store.updateOperation({
++          operationId: kept.operationId,
++          expectedVersion: kept.version,
++          attempts: 2,
++          nextAttemptAt: null,
++          retryStatus: 'gave_up',
++        });
++        expect(
++          retryFields(await store.findOperationById(gaveUp.operationId)),
++          'operation gave_up stored',
++        ).toEqual([2, null, 'gave_up']);
++        const reset = await store.updateOperation({
++          operationId: gaveUp.operationId,
++          expectedVersion: gaveUp.version,
++          attempts: null,
++          retryStatus: null,
++        });
++        expect(retryFields(reset), 'operation retry fields cleared').toEqual([null, null, null]);
++
++        const row = await insertEvidence(store, ctx);
++        await store.updateEvidence({ evidenceId: row.evidenceId, attempts: 1, nextAttemptAt });
++        await store.updateEvidence({ evidenceId: row.evidenceId, verificationStatus: 'verified' });
++        expect(
++          retryFields(await store.findEvidenceById(row.evidenceId)),
++          'evidence attempts and nextAttemptAt kept',
++        ).toEqual([1, nextAttemptAt, null]);
++        await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          attempts: 2,
++          nextAttemptAt: null,
++          retryStatus: 'gave_up',
++        });
++        expect(
++          retryFields(await store.findEvidenceById(row.evidenceId)),
++          'evidence gave_up stored',
++        ).toEqual([2, null, 'gave_up']);
++        await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          attempts: null,
++          retryStatus: null,
++        });
++        expect(
++          retryFields(await store.findEvidenceById(row.evidenceId)),
++          'evidence retry fields cleared',
++        ).toEqual([null, null, null]);
++      });
++
++      it('listUncertainOperations lists stale submitted creates without provider reference (submittedStaleBefore)', async (store, ctx) => {
++        const crashed = await claim(store, await createOperation(store, ctx));
++        await pause(gapMs);
++        const created = await claim(store, await createOperation(store, ctx));
++        await store.transitionOperation({
++          operationId: created.operationId,
++          expectedVersion: created.version,
++          nextStatus: 'submitted',
++          providerReferenceId: uniqueId('I'),
++          reason: 'created, awaiting approval',
++        });
++        const prepared = await createOperation(store, ctx);
++        const leased = await createOperation(store, ctx);
++        await store.acquireCheckoutCreateExecutionLease({
++          operationId: leased.operationId,
++          expectedVersion: leased.version,
++        });
++        await claim(store, await createOperation(store, ctx, { kind: 'payout_item' }));
++        await pause(gapMs);
++        const unknown = await toUnknown(store, await createOperation(store, ctx));
++        const staleBefore = futureIso();
++        expect(
++          (await store.listUncertainOperations(10)).map((row) => row.operationId),
++          'without submittedStaleBefore only unknown operations',
++        ).toEqual([unknown.operationId]);
++        expect(
++          (await store.listUncertainOperations(10, { submittedStaleBefore: staleBefore })).map(
++            (row) => row.operationId,
++          ),
++          'stale submitted subscription/checkout creates without reference or live lease',
++        ).toEqual([crashed.operationId, unknown.operationId]);
++        expect(
++          (
++            await store.listUncertainOperations(10, {
++              submittedStaleBefore: new Date(Date.parse(crashed.updatedAt) - 60_000).toISOString(),
++            })
++          ).map((row) => row.operationId),
++          'a submitted operation newer than submittedStaleBefore is not stale',
++        ).toEqual([unknown.operationId]);
++        expect(prepared.status).toBe('prepared');
++      });
+     });
+ 
+     describe('consumer delivery fields', () => {
+diff --color -ruN .superpowers/snap-after-t6a/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts .superpowers/snap-after-t6b/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts
+--- .superpowers/snap-after-t6a/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts	2026-10-22 14:55:49.721645638 +0300
++++ .superpowers/snap-after-t6b/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts	2026-10-22 15:25:17.209075487 +0300
+@@ -200,6 +200,52 @@
+   }
+ }
+ 
++/** Ignores `nextAttemptAt` in every candidate list (deferred rows are selected at once). */
++class IgnoresNextAttemptAt extends MemoryPaymentReliabilityStore {
++  override async updateEvidence(input: UpdateProviderEvidenceInput) {
++    return super.updateEvidence({ ...input, nextAttemptAt: undefined });
++  }
++
++  override async updateOperation(input: UpdatePaymentOperationInput) {
++    return super.updateOperation({ ...input, nextAttemptAt: undefined });
++  }
++}
++
++/** Has no `attempts` column: every attempt reads 0, so nothing ever gives up. */
++class NeverIncrementsAttempts extends MemoryPaymentReliabilityStore {
++  override async updateEvidence(input: UpdateProviderEvidenceInput) {
++    return super.updateEvidence({ ...input, attempts: undefined });
++  }
++
++  override async updateOperation(input: UpdatePaymentOperationInput) {
++    return super.updateOperation({ ...input, attempts: undefined });
++  }
++}
++
++/** Has no `retry_status` column: a row that gave up is selected again forever. */
++class NeverGivesUp extends MemoryPaymentReliabilityStore {
++  override async updateEvidence(input: UpdateProviderEvidenceInput) {
++    return super.updateEvidence({ ...input, retryStatus: undefined });
++  }
++
++  override async updateOperation(input: UpdatePaymentOperationInput) {
++    return super.updateOperation({ ...input, retryStatus: undefined });
++  }
++}
++
++class IgnoresPendingVerificationFlag extends MemoryPaymentReliabilityStore {
++  override async claimPendingEvidence(input: ClaimPendingEvidenceInput) {
++    return super.claimPendingEvidence({ ...input, includePendingVerification: undefined });
++  }
++}
++
++/** A 0.2 store: `listUncertainOperations(limit)` without the stale `submitted` option. */
++class NoStaleSubmittedOperations extends MemoryPaymentReliabilityStore {
++  override async listUncertainOperations(limit: number) {
++    return super.listUncertainOperations(limit);
++  }
++}
++
+ /**
+  * Correct and exclusive, but without `SKIP LOCKED`: selects the claimable rows, then takes each one
+  * with a conditional update that succeeds only while the lease is still free. Under concurrency a
+@@ -282,6 +328,19 @@
+       () => new DropsSubscriptionStateJson(),
+       /subscriptionStateJson/,
+     ],
++    ['ignores nextAttemptAt', () => new IgnoresNextAttemptAt(), /nextAttemptAt/],
++    ['never increments attempts', () => new NeverIncrementsAttempts(), /retry fields/],
++    ['never gives up', () => new NeverGivesUp(), /oldest first by nextAttemptAt/],
++    [
++      'ignores includePendingVerification',
++      () => new IgnoresPendingVerificationFlag(),
++      /includePendingVerification/,
++    ],
++    [
++      'never lists stale submitted creates',
++      () => new NoStaleSubmittedOperations(),
++      /submittedStaleBefore/,
++    ],
+   ])('fails a store that %s', async (_label, createStore, expectedCase) => {
+     const failures = await failingCases(createStore);
+     expect(failures.length).toBeGreaterThan(0);

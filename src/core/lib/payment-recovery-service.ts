@@ -34,6 +34,13 @@ import {
 import type { EvidenceStore } from './persistence/payment-reliability-store';
 import type { WebhookProcessingService } from './webhook-processing-service';
 
+/** The consumer threw (its failure is already recorded on the row); same code as before. */
+class ConsumerDeliveryFailedError extends PaymentReliabilityError {
+  constructor() {
+    super(PAYMENT_RELIABILITY_ERROR.PERSISTENCE_FAILURE, CONSUMER_DELIVERY_FAILURE_MESSAGE);
+  }
+}
+
 /** Failed consumer deliveries per evidence row before it becomes `failed_terminal`. */
 export const DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS = 10;
 
@@ -134,12 +141,19 @@ export class PaymentRecoveryService {
       delivered: 0,
       skipped: 0,
       failed: 0,
+      deliveryFailed: 0,
     };
 
     for (const row of claimed) {
       try {
         const outcome = await this.recoverClaimedEvidence(row);
-        summary[outcome] += 1;
+        if (outcome === 'processedDeliveryFailed') {
+          // The row was processed; only the consumer failed afterwards (final review F12).
+          summary.processed += 1;
+          summary.deliveryFailed = (summary.deliveryFailed ?? 0) + 1;
+        } else {
+          summary[outcome] += 1;
+        }
       } catch {
         summary.failed += 1;
       } finally {
@@ -189,7 +203,11 @@ export class PaymentRecoveryService {
   private async recoverClaimedEvidence(
     evidence: ProviderEvidenceRecord,
   ): Promise<
-    keyof Pick<RecoverPaymentReliabilityResult, 'verified' | 'processed' | 'delivered' | 'skipped'>
+    | keyof Pick<
+        RecoverPaymentReliabilityResult,
+        'verified' | 'processed' | 'delivered' | 'skipped'
+      >
+    | 'processedDeliveryFailed'
   > {
     if (evidence.verificationStatus === 'pending') {
       return 'skipped';
@@ -200,8 +218,9 @@ export class PaymentRecoveryService {
         evidence.evidenceId,
       );
       if (receipt.processingStatus === 'processed') {
-        await this.tryDeliverConsumer(evidence.evidenceId);
-        return 'processed';
+        return (await this.deliverAfterProcessing(evidence.evidenceId))
+          ? 'processed'
+          : 'processedDeliveryFailed';
       }
       return 'skipped';
     }
@@ -219,8 +238,9 @@ export class PaymentRecoveryService {
         evidence.evidenceId,
       );
       if (receipt.processingStatus === 'processed') {
-        await this.tryDeliverConsumer(evidence.evidenceId);
-        return 'processed';
+        return (await this.deliverAfterProcessing(evidence.evidenceId))
+          ? 'processed'
+          : 'processedDeliveryFailed';
       }
     }
 
@@ -236,6 +256,19 @@ export class PaymentRecoveryService {
         PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
         `Evidence environment "${evidence.environment}" does not match requested "${environment}"`,
       );
+    }
+  }
+
+  /** Delivery right after processing: a consumer failure is reported, not thrown. */
+  private async deliverAfterProcessing(evidenceId: string): Promise<boolean> {
+    try {
+      await this.tryDeliverConsumer(evidenceId);
+      return true;
+    } catch (error) {
+      if (error instanceof ConsumerDeliveryFailedError) {
+        return false;
+      }
+      throw error;
     }
   }
 
@@ -285,10 +318,7 @@ export class PaymentRecoveryService {
         consumerDeliveryAttempts: failedAttempts,
         consumerDeliveryLastError: CONSUMER_DELIVERY_FAILURE_MESSAGE,
       });
-      throw new PaymentReliabilityError(
-        PAYMENT_RELIABILITY_ERROR.PERSISTENCE_FAILURE,
-        CONSUMER_DELIVERY_FAILURE_MESSAGE,
-      );
+      throw new ConsumerDeliveryFailedError();
     }
   }
 }

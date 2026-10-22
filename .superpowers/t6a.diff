@@ -1,0 +1,3309 @@
+diff --color -ruN .superpowers/snap-after-t5/src/contracts/lib/operations.ts .superpowers/snap-after-t6a/src/contracts/lib/operations.ts
+--- .superpowers/snap-after-t5/src/contracts/lib/operations.ts	2026-10-22 14:01:57.488243217 +0300
++++ .superpowers/snap-after-t6a/src/contracts/lib/operations.ts	2026-10-22 14:32:18.402830022 +0300
+@@ -74,6 +74,13 @@
+   lifecycleReason: string | null;
+   /** Last accepted PayPal subscription resource update/create time for webhook ordering. */
+   providerSubscriptionStateAt: string | null;
++  /**
++   * Engine-owned JSON text with the subscription reducer state that has no column of its own (last
++   * payment, failed-payment count, recent webhook and sale ids, effects not yet delivered to the host
++   * hook). Stores keep it verbatim in one nullable text/jsonb column; hosts read it with
++   * `readSubscriptionOperationState`. Absent (stores written before 0.3) means "no state yet".
++   */
++  subscriptionStateJson?: string | null;
+   sellerRef: string | null;
+   providerReferralId: string | null;
+   executionLeaseExpiresAt: string | null;
+@@ -125,6 +132,7 @@
+   nextBillingTime?: string | null;
+   lifecycleReason?: string | null;
+   providerSubscriptionStateAt?: string | null;
++  subscriptionStateJson?: string | null;
+   sellerRef?: string | null;
+   providerReferralId?: string | null;
+   executionLeaseExpiresAt?: string | null;
+@@ -171,6 +179,7 @@
+   nextBillingTime?: string | null;
+   lifecycleReason?: string | null;
+   providerSubscriptionStateAt?: string | null;
++  subscriptionStateJson?: string | null;
+   sellerRef?: string | null;
+   providerReferralId?: string | null;
+   executionLeaseExpiresAt?: string | null;
+@@ -221,6 +230,7 @@
+   nextBillingTime?: string | null;
+   lifecycleReason?: string | null;
+   providerSubscriptionStateAt?: string | null;
++  subscriptionStateJson?: string | null;
+   sellerRef?: string | null;
+   providerReferralId?: string | null;
+ };
+diff --color -ruN .superpowers/snap-after-t5/src/contracts/lib/subscription.ts .superpowers/snap-after-t6a/src/contracts/lib/subscription.ts
+--- .superpowers/snap-after-t5/src/contracts/lib/subscription.ts	2026-10-22 14:01:57.488546860 +0300
++++ .superpowers/snap-after-t6a/src/contracts/lib/subscription.ts	2026-10-22 14:32:18.403010145 +0300
+@@ -313,6 +313,12 @@
+   lifecycleReason: string | null;
+   providerDebugId?: string | null;
+   providerSubscriptionStateAt?: string | null;
++  /** `billing_info.last_payment`; `time` is null when PayPal sent none. */
++  lastPayment?: (CanonicalMoney & { time: string | null }) | null;
++  /** `billing_info.failed_payments_count`. */
++  failedPaymentsCount?: number | null;
++  /** `billing_info.outstanding_balance`. */
++  outstandingBalance?: CanonicalMoney | null;
+ };
+ 
+ export type ExecuteSubscriptionLifecycleRequest = SubscriptionProviderContext & {
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/persistence/memory-payment-reliability-store.ts .superpowers/snap-after-t6a/src/core/lib/persistence/memory-payment-reliability-store.ts
+--- .superpowers/snap-after-t5/src/core/lib/persistence/memory-payment-reliability-store.ts	2026-10-22 14:01:57.492090390 +0300
++++ .superpowers/snap-after-t6a/src/core/lib/persistence/memory-payment-reliability-store.ts	2026-10-22 14:32:18.405233101 +0300
+@@ -137,6 +137,7 @@
+       nextBillingTime: input.nextBillingTime ?? null,
+       lifecycleReason: input.lifecycleReason ?? null,
+       providerSubscriptionStateAt: input.providerSubscriptionStateAt ?? null,
++      subscriptionStateJson: input.subscriptionStateJson ?? null,
+       sellerRef: input.sellerRef ?? null,
+       providerReferralId: input.providerReferralId ?? null,
+       executionLeaseExpiresAt: input.executionLeaseExpiresAt ?? null,
+@@ -522,6 +523,10 @@
+         input.providerSubscriptionStateAt !== undefined
+           ? input.providerSubscriptionStateAt
+           : current.providerSubscriptionStateAt,
++      subscriptionStateJson:
++        input.subscriptionStateJson !== undefined
++          ? input.subscriptionStateJson
++          : (current.subscriptionStateJson ?? null),
+       sellerRef: input.sellerRef !== undefined ? input.sellerRef : current.sellerRef,
+       providerReferralId:
+         input.providerReferralId !== undefined
+@@ -645,6 +650,10 @@
+         input.providerSubscriptionStateAt !== undefined
+           ? input.providerSubscriptionStateAt
+           : current.providerSubscriptionStateAt,
++      subscriptionStateJson:
++        input.subscriptionStateJson !== undefined
++          ? input.subscriptionStateJson
++          : (current.subscriptionStateJson ?? null),
+       sellerRef: input.sellerRef !== undefined ? input.sellerRef : current.sellerRef,
+       providerReferralId:
+         input.providerReferralId !== undefined
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/persistence/payment-reliability-store.ts .superpowers/snap-after-t6a/src/core/lib/persistence/payment-reliability-store.ts
+--- .superpowers/snap-after-t5/src/core/lib/persistence/payment-reliability-store.ts	2026-10-22 14:01:57.492195113 +0300
++++ .superpowers/snap-after-t6a/src/core/lib/persistence/payment-reliability-store.ts	2026-10-22 14:32:18.405202377 +0300
+@@ -31,6 +31,9 @@
+  * - Errors are `PaymentReliabilityError` with the codes named below: services branch on `code`.
+  * - Patch semantics for every optional field of an update/transition input: `undefined` keeps the
+  *   stored value, `null` clears it. Exceptions are listed on the method.
++ * - `subscriptionStateJson` (one nullable text/jsonb column) is stored verbatim by create, update
++ *   and transition and returned on every read; the engine keeps the subscription reducer state
++ *   there (last payment, failed-payment count, recent ids, undelivered effects).
+  * - Each successful write of an operation increments `version` by exactly 1 and sets `updatedAt`.
+  * - Methods that check `expectedVersion` are compare-and-set: on a mismatch they change nothing.
+  *   Two concurrent calls with the same `expectedVersion` never both succeed (SQL:
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/reconciliation-service.ts .superpowers/snap-after-t6a/src/core/lib/reconciliation-service.ts
+--- .superpowers/snap-after-t5/src/core/lib/reconciliation-service.ts	2026-10-22 14:01:57.492279391 +0300
++++ .superpowers/snap-after-t6a/src/core/lib/reconciliation-service.ts	2026-10-22 14:32:18.405305323 +0300
+@@ -1,7 +1,9 @@
+ import type {
++  ExecuteGetSubscriptionResult,
+   ExecuteMarketplaceUnitSnapshot,
+   MarketplaceOrderStatus,
+   PaymentOperation,
++  PaymentOperationKind,
+   PaymentOperationStatus,
+   PayoutFinancialStatus,
+   PlanStatus,
+@@ -27,26 +29,27 @@
+   parsePaypalPayoutWebhookPayload,
+ } from './payout-webhook-correlation';
+ import {
++  SUBSCRIPTION_EFFECTS_HOOK_FAILED,
+   applyPlanTransition,
+-  applySubscriptionTransition,
++  applySubscriptionEvents,
++  deliverSubscriptionEffects,
++  normalizeSubscriptionEvidencePayload,
++  resolveExpectedSubscriptionPayment,
++  subscriptionEventFromProviderSnapshot,
++  type ApplySubscriptionEventsResult,
++  type SubscriptionEffectsHooks,
++  type SubscriptionEventStep,
+ } from './subscription-evidence-application';
+ import {
++  isSubscriptionPaymentEvidenceEvent,
++  isSubscriptionWebhookProviderRefreshEvent,
+   mapPlanWebhookEventToStatus,
+   mapSubscriptionWebhookEventToStatus,
+-  parseSubscriptionResourceStateTimestamp,
+   planStatusToOperationStatus,
+-  resolveSubscriptionStatusTransition,
+-  subscriptionStatusToOperationStatus,
+-  type SubscriptionStateApplySource,
+ } from './subscription-transition-policy';
+ import { isSellerOnboardingWebhookEvent } from './seller-transition-policy';
+ import { reconcileSellerConnectionAggregate } from './seller-connection-reconciliation';
+ import type { ReconciliationProviderLookup } from './checkout-provider-port';
+-import { subscriptionBillingFieldsFromProviderSnapshot } from './subscription-provider-snapshot-fields';
+-import {
+-  assertSubscriptionProviderPlanSnapshotConsistent,
+-  isSubscriptionProviderPlanMismatchError,
+-} from './subscription-provider-plan-consistency';
+ import { applyMarketplaceUnitSnapshots } from './marketplace-evidence-application';
+ import type {
+   MarketplaceStore,
+@@ -67,12 +70,6 @@
+ type ReconciliationOutcome = {
+   executionStatus: PaymentOperationStatus | null;
+   payoutStatus: PayoutFinancialStatus | null;
+-  subscriptionStatus?: SubscriptionStatus | null;
+-  subscriptionStartTime?: string | null;
+-  subscriptionNextBillingTime?: string | null;
+-  subscriptionProviderPlanId?: string | null;
+-  subscriptionApplySource?: SubscriptionStateApplySource;
+-  subscriptionProviderStateTimestamp?: string | null;
+   planStatus?: PlanStatus | null;
+   providerTransactionId?: string | null;
+   providerFeeMinor?: string | null;
+@@ -85,16 +82,37 @@
+   marketplaceCheckoutOperationId?: string;
+ };
+ 
+-function reconciliationSubscriptionBillingFieldsFromOutcome(outcome: ReconciliationOutcome): {
+-  startTime?: string;
+-  nextBillingTime?: string;
+-} {
+-  return subscriptionBillingFieldsFromProviderSnapshot({
+-    startTime: outcome.subscriptionStartTime,
+-    nextBillingTime: outcome.subscriptionNextBillingTime,
+-  });
++type SubscriptionCommandKind =
++  | 'subscription_cancel'
++  | 'subscription_suspend'
++  | 'subscription_activate';
++
++/** The subscription status an accepted lifecycle command leads to. */
++const SUBSCRIPTION_COMMAND_TARGET: Record<SubscriptionCommandKind, SubscriptionStatus> = {
++  subscription_cancel: 'cancelled',
++  subscription_suspend: 'suspended',
++  subscription_activate: 'active',
++};
++
++/** Failure code of an uncertain lifecycle command the provider lookup shows did not take effect. */
++export const SUBSCRIPTION_COMMAND_NOT_APPLIED = 'SUBSCRIPTION_COMMAND_NOT_APPLIED';
++
++function isSubscriptionCommandKind(kind: PaymentOperationKind): kind is SubscriptionCommandKind {
++  return kind in SUBSCRIPTION_COMMAND_TARGET;
++}
++
++function isSubscriptionEvidenceEvent(eventType: string): boolean {
++  return (
++    mapSubscriptionWebhookEventToStatus(eventType) !== null ||
++    isSubscriptionWebhookProviderRefreshEvent(eventType) ||
++    isSubscriptionPaymentEvidenceEvent(eventType)
++  );
+ }
+ 
++type SubscriptionLookup =
++  | { kind: 'found'; snapshot: ExecuteGetSubscriptionResult }
++  | { kind: 'unavailable' };
++
+ function mapMarketplaceStatusToOperationStatus(
+   marketplaceStatus: MarketplaceOrderStatus,
+   kind: PaymentOperation['kind'],
+@@ -174,6 +192,8 @@
+   constructor(
+     private readonly store: ReconciliationServiceStore,
+     private readonly providerLookup: ReconciliationProviderLookup,
++    /** Optional host hooks; `onSubscriptionEffects` gets the reducer's effects after each save. */
++    private readonly hooks: SubscriptionEffectsHooks = {},
+   ) {
+     assertStoreCapabilitiesComplete(store, ['payout', 'seller', 'marketplace']);
+   }
+@@ -242,9 +262,6 @@
+     const mappedPayoutFromEvent = evidence.eventType
+       ? mapPayoutWebhookEventToFinancialStatus(evidence.eventType)
+       : null;
+-    const mappedSubscriptionFromEvent = evidence.eventType
+-      ? mapSubscriptionWebhookEventToStatus(evidence.eventType)
+-      : null;
+     const mappedPlanFromEvent = evidence.eventType
+       ? mapPlanWebhookEventToStatus(evidence.eventType)
+       : null;
+@@ -268,45 +285,25 @@
+       return;
+     }
+ 
++    if (operation.kind === 'subscription') {
++      await this.reconcileSubscriptionEvidence(evidence, operation, result);
++      return;
++    }
++    if (isSubscriptionCommandKind(operation.kind)) {
++      await this.reconcileSubscriptionCommand(operation, result);
++      return;
++    }
++
+     const providerOutcome = await this.lookupProviderOutcome(operation, evidence.resourceId);
+-    const recognizedProviderSubscriptionStatus =
+-      providerOutcome.subscriptionStatus && providerOutcome.subscriptionStatus !== 'unknown'
+-        ? providerOutcome.subscriptionStatus
+-        : null;
+-    const subscriptionStatus = this.resolveReconciliationSubscriptionStatus(
+-      operation,
+-      mappedSubscriptionFromEvent,
+-      providerOutcome.subscriptionStatus,
+-    );
+-    const subscriptionApplySource: SubscriptionStateApplySource | undefined =
+-      mappedSubscriptionFromEvent || subscriptionStatus
+-        ? recognizedProviderSubscriptionStatus
+-          ? 'reconcile_provider'
+-          : mappedSubscriptionFromEvent
+-            ? 'reconcile_event'
+-            : undefined
+-        : undefined;
+-    const subscriptionProviderStateTimestamp =
+-      subscriptionApplySource === 'reconcile_event'
+-        ? parseSubscriptionResourceStateTimestamp(evidence.rawPayload)
+-        : null;
+     const outcome: ReconciliationOutcome = {
+       executionStatus:
+         mappedFromEvent ??
+         (mappedPayoutFromEvent
+           ? payoutFinancialStatusToOperationStatus(mappedPayoutFromEvent)
+-          : subscriptionStatus
+-            ? subscriptionStatusToOperationStatus(subscriptionStatus)
+-            : mappedPlanFromEvent
+-              ? planStatusToOperationStatus(mappedPlanFromEvent)
+-              : providerOutcome.executionStatus),
++          : mappedPlanFromEvent
++            ? planStatusToOperationStatus(mappedPlanFromEvent)
++            : providerOutcome.executionStatus),
+       payoutStatus: mappedPayoutFromEvent ?? providerOutcome.payoutStatus,
+-      subscriptionStatus,
+-      subscriptionStartTime: providerOutcome.subscriptionStartTime,
+-      subscriptionNextBillingTime: providerOutcome.subscriptionNextBillingTime,
+-      subscriptionProviderPlanId: providerOutcome.subscriptionProviderPlanId,
+-      subscriptionApplySource,
+-      subscriptionProviderStateTimestamp,
+       planStatus: mappedPlanFromEvent ?? providerOutcome.planStatus,
+     };
+ 
+@@ -325,6 +322,10 @@
+     operation: PaymentOperation,
+     result: ReconcileCounters,
+   ): Promise<void> {
++    if (isSubscriptionCommandKind(operation.kind)) {
++      await this.reconcileSubscriptionCommand(operation, result);
++      return;
++    }
+     const providerReferenceId = this.resolveProviderReferenceId(operation);
+ 
+     if (!providerReferenceId) {
+@@ -343,6 +344,22 @@
+       return;
+     }
+ 
++    if (operation.kind === 'subscription') {
++      const lookup = await this.lookupSubscription(operation, providerReferenceId);
++      const evidence = await this.insertReconciliationEvidence(operation, {
++        resourceId: providerReferenceId,
++        eventType: 'RECONCILIATION.PROVIDER_LOOKUP',
++      });
++      await this.applySubscriptionReconciliation({
++        evidence,
++        operation,
++        steps:
++          lookup.kind === 'found' ? [this.lookupStep(providerReferenceId, lookup.snapshot)] : [],
++        result,
++      });
++      return;
++    }
++
+     const outcome = await this.lookupProviderOutcome(operation, providerReferenceId);
+     const evidence = await this.insertReconciliationEvidence(operation, {
+       resourceId: providerReferenceId,
+@@ -412,23 +429,27 @@
+       return correlation?.operation ?? null;
+     }
+ 
++    if (evidence.eventType && isSubscriptionEvidenceEvent(evidence.eventType)) {
++      // Sales carry the subscription id in `billing_agreement_id`, never in `resource.id`.
++      const event = normalizeSubscriptionEvidencePayload(
++        evidence.rawPayload,
++        evidence.providerEventId,
++      );
++      return event
++        ? this.store.findOperationByProviderSubscriptionId(
++            evidence.providerCode,
++            evidence.accountRef,
++            evidence.environment,
++            event.providerSubscriptionId,
++          )
++        : null;
++    }
++
+     const resourceId = evidence.resourceId;
+     if (!resourceId) {
+       return null;
+     }
+ 
+-    const subscriptionStatus = evidence.eventType
+-      ? mapSubscriptionWebhookEventToStatus(evidence.eventType)
+-      : null;
+-    if (subscriptionStatus) {
+-      return this.store.findOperationByProviderSubscriptionId(
+-        evidence.providerCode,
+-        evidence.accountRef,
+-        evidence.environment,
+-        resourceId,
+-      );
+-    }
+-
+     const planStatus = evidence.eventType ? mapPlanWebhookEventToStatus(evidence.eventType) : null;
+     if (planStatus) {
+       return this.store.findOperationByProviderPlanId(
+@@ -459,22 +480,6 @@
+     );
+   }
+ 
+-  private resolveReconciliationSubscriptionStatus(
+-    operation: PaymentOperation,
+-    fromEvent: SubscriptionStatus | null,
+-    fromProvider: SubscriptionStatus | null | undefined,
+-  ): SubscriptionStatus | null | undefined {
+-    const stored = operation.subscriptionStatus ?? null;
+-    if (fromProvider && fromProvider !== 'unknown') {
+-      return fromProvider;
+-    }
+-    if (fromEvent) {
+-      const current = stored ?? 'approval_pending';
+-      return resolveSubscriptionStatusTransition(current, fromEvent);
+-    }
+-    return fromProvider ?? stored ?? null;
+-  }
+-
+   private async lookupProviderOutcome(
+     operation: PaymentOperation,
+     providerReferenceId: string | null | undefined,
+@@ -557,27 +562,6 @@
+         };
+       }
+ 
+-      if (
+-        operation.kind === 'subscription' ||
+-        operation.kind === 'subscription_cancel' ||
+-        operation.kind === 'subscription_suspend' ||
+-        operation.kind === 'subscription_activate'
+-      ) {
+-        const subscriptionId = operation.providerSubscriptionId ?? providerReferenceId;
+-        const lookup = await this.providerLookup.getSubscription({
+-          ...context,
+-          providerSubscriptionId: subscriptionId,
+-        });
+-        return {
+-          executionStatus: subscriptionStatusToOperationStatus(lookup.subscriptionStatus),
+-          payoutStatus: null,
+-          subscriptionStatus: lookup.subscriptionStatus,
+-          subscriptionStartTime: lookup.startTime,
+-          subscriptionNextBillingTime: lookup.nextBillingTime,
+-          subscriptionProviderPlanId: lookup.providerPlanId,
+-        };
+-      }
+-
+       if (operation.kind === 'seller_referral') {
+         const referralId = operation.providerReferralId ?? providerReferenceId;
+         const lookup = await this.providerLookup.getReferral({
+@@ -669,23 +653,6 @@
+       return;
+     }
+ 
+-    if (
+-      operation.kind === 'subscription' ||
+-      operation.kind === 'subscription_cancel' ||
+-      operation.kind === 'subscription_suspend' ||
+-      operation.kind === 'subscription_activate'
+-    ) {
+-      await this.applySubscriptionReconciliationOutcome({
+-        evidenceId,
+-        rawPayload,
+-        operation,
+-        outcome,
+-        result,
+-        providerReferenceId,
+-      });
+-      return;
+-    }
+-
+     if (operation.kind === 'billing_plan' || operation.kind === 'plan_lifecycle') {
+       await this.applyPlanReconciliationOutcome({
+         evidenceId,
+@@ -769,19 +736,93 @@
+     }
+   }
+ 
+-  private async applySubscriptionReconciliationOutcome(input: {
+-    evidenceId: string;
+-    rawPayload?: string;
++  /**
++   * Webhook evidence of a subscription: a payment event is reduced first (it records the payment),
++   * then the provider lookup as the current truth. Without a usable lookup a status event is
++   * reduced on its own, ordered by its resource time.
++   */
++  private async reconcileSubscriptionEvidence(
++    evidence: ProviderEvidenceRecord,
++    operation: PaymentOperation,
++    result: ReconcileCounters,
++  ): Promise<void> {
++    const event = normalizeSubscriptionEvidencePayload(
++      evidence.rawPayload,
++      evidence.providerEventId,
++    );
++    const steps: SubscriptionEventStep[] = [];
++    const isPayment =
++      event !== null &&
++      (event.resourceType === 'sale' || isSubscriptionPaymentEvidenceEvent(event.eventType));
++    if (event && isPayment) {
++      steps.push({
++        event,
++        options: {
++          source: 'webhook',
++          expectedPayment:
++            event.resourceType === 'sale'
++              ? await resolveExpectedSubscriptionPayment(this.store, operation)
++              : null,
++        },
++      });
++    }
++
++    // The subscription id comes from the operation, else from the event; never from a sale id.
++    const providerSubscriptionId =
++      operation.providerSubscriptionId ?? event?.providerSubscriptionId ?? null;
++    const lookup = providerSubscriptionId
++      ? await this.lookupSubscription(operation, providerSubscriptionId)
++      : ({ kind: 'unavailable' } as const);
++    if (lookup.kind === 'found' && providerSubscriptionId) {
++      steps.push(this.lookupStep(providerSubscriptionId, lookup.snapshot));
++    } else if (event && !isPayment) {
++      steps.push({ event, options: { source: 'webhook' } });
++    }
++
++    await this.applySubscriptionReconciliation({ evidence, operation, steps, result });
++  }
++
++  private lookupStep(
++    providerSubscriptionId: string,
++    snapshot: ExecuteGetSubscriptionResult,
++  ): SubscriptionEventStep {
++    return {
++      event: subscriptionEventFromProviderSnapshot(providerSubscriptionId, snapshot),
++      options: { source: 'lookup' },
++    };
++  }
++
++  /** A provider GET with a recognised status, or `unavailable` (failure, not found, unknown status). */
++  private async lookupSubscription(
++    operation: PaymentOperation,
++    providerSubscriptionId: string,
++  ): Promise<SubscriptionLookup> {
++    try {
++      const snapshot = await this.providerLookup.getSubscription({
++        providerCode: operation.providerCode,
++        accountRef: operation.accountRef,
++        applicationRef: operation.applicationRef,
++        environment: operation.environment,
++        providerSubscriptionId,
++      });
++      return snapshot.subscriptionStatus && snapshot.subscriptionStatus !== 'unknown'
++        ? { kind: 'found', snapshot }
++        : { kind: 'unavailable' };
++    } catch {
++      return { kind: 'unavailable' };
++    }
++  }
++
++  private async applySubscriptionReconciliation(input: {
++    evidence: ProviderEvidenceRecord;
+     operation: PaymentOperation;
+-    outcome: ReconciliationOutcome;
++    steps: SubscriptionEventStep[];
+     result: ReconcileCounters;
+-    providerReferenceId: string | null;
+   }): Promise<void> {
+-    const { evidenceId, operation, outcome, result, providerReferenceId } = input;
+-    const subscriptionStatus = outcome.subscriptionStatus;
+-    if (!subscriptionStatus || subscriptionStatus === 'unknown') {
++    const { evidence, operation, steps, result } = input;
++    if (steps.length === 0) {
+       await this.store.insertReconciliationAttempt({
+-        evidenceId,
++        evidenceId: evidence.evidenceId,
+         operationId: operation.operationId,
+         outcome: 'retryable_failure',
+         resultCode: 'UNKNOWN_OUTCOME',
+@@ -791,52 +832,174 @@
+       return;
+     }
+ 
++    let applied: ApplySubscriptionEventsResult;
+     try {
+-      assertSubscriptionProviderPlanSnapshotConsistent(operation, {
+-        providerPlanId: outcome.subscriptionProviderPlanId,
+-      });
+-      await applySubscriptionTransition(this.store, {
++      applied = await applySubscriptionEvents(this.store, {
+         operation,
+-        subscriptionStatus,
+-        evidenceId,
++        steps,
++        evidenceId: evidence.evidenceId,
+         reason: 'Reconciliation applied subscription transition',
+-        providerReferenceId,
+-        providerSubscriptionId: providerReferenceId ?? undefined,
+-        applySource: outcome.subscriptionApplySource ?? 'reconcile_provider',
+-        providerStateTimestamp:
+-          (outcome.subscriptionApplySource ?? 'reconcile_provider') === 'reconcile_provider'
+-            ? null
+-            : (outcome.subscriptionProviderStateTimestamp ??
+-              parseSubscriptionResourceStateTimestamp(input.rawPayload)),
+-        ...reconciliationSubscriptionBillingFieldsFromOutcome(outcome),
++        holdEffects: Boolean(this.hooks.onSubscriptionEffects),
+       });
++    } catch (error) {
++      await this.recordReconciliationFailure({
++        evidenceId: evidence.evidenceId,
++        operationId: operation.operationId,
++        result,
++        error,
++      });
++      return;
++    }
++    const delivered = await this.deliverSubscriptionEffects(evidence, applied);
++
++    if (applied.planMismatch) {
++      await this.store.insertReconciliationAttempt({
++        evidenceId: evidence.evidenceId,
++        operationId: operation.operationId,
++        outcome: 'terminal_failure',
++        resultCode: PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
++        resultMessage: 'Provider subscription plan does not match the stored plan',
++      });
++      result.terminalFailures += 1;
++      return;
++    }
++    if (delivered) {
+       await this.store.updateEvidence({
+-        evidenceId,
++        evidenceId: evidence.evidenceId,
+         relatedOperationId: operation.operationId,
+         processingStatus: 'processed',
+         processedAt: new Date().toISOString(),
+       });
++    }
++    await this.store.insertReconciliationAttempt({
++      evidenceId: evidence.evidenceId,
++      operationId: operation.operationId,
++      outcome: 'applied',
++      resultCode: 'APPLIED',
++    });
++    result.applied += 1;
++  }
++
++  /**
++   * Hand the effects to the host hook. When it throws, the evidence row is left `pending` with
++   * `SUBSCRIPTION_EFFECTS_HOOK_FAILED`: the effects stay held on the subscription operation and
++   * `PaymentRecoveryService` delivers them through the webhook service's hook.
++   */
++  private async deliverSubscriptionEffects(
++    evidence: ProviderEvidenceRecord,
++    applied: ApplySubscriptionEventsResult,
++  ): Promise<boolean> {
++    const delivery = await deliverSubscriptionEffects(this.store, this.hooks, applied, {
++      evidenceId: evidence.evidenceId,
++      eventType: evidence.eventType ?? 'RECONCILIATION.PROVIDER_LOOKUP',
++      source: 'reconciliation',
++    });
++    if (delivery.delivered) {
++      return true;
++    }
++    await this.store.updateEvidence({
++      evidenceId: evidence.evidenceId,
++      relatedOperationId: applied.operation.operationId,
++      processingStatus: 'pending',
++      errorCode: SUBSCRIPTION_EFFECTS_HOOK_FAILED,
++      errorMessage: 'Subscription effects hook failed; the effects are delivered again on retry',
++      processedAt: null,
++    });
++    return false;
++  }
++
++  /**
++   * An uncertain cancel/suspend/activate command. The provider lookup is applied to the parent
++   * subscription operation (which holds the provider ids); the command itself only ends
++   * `succeeded` (the subscription reached the command's target status) or `failed`
++   * (`SUBSCRIPTION_COMMAND_NOT_APPLIED`). No provider id is ever written onto the command.
++   */
++  private async reconcileSubscriptionCommand(
++    operation: PaymentOperation,
++    result: ReconcileCounters,
++  ): Promise<void> {
++    const parentCandidate = operation.parentOperationId
++      ? await this.store.findOperationById(operation.parentOperationId)
++      : null;
++    const parent = parentCandidate?.kind === 'subscription' ? parentCandidate : null;
++    const providerSubscriptionId =
++      parent?.providerSubscriptionId ?? operation.providerSubscriptionId ?? null;
++
++    const evidence = await this.insertReconciliationEvidence(operation, {
++      resourceId: providerSubscriptionId,
++      eventType: providerSubscriptionId
++        ? 'RECONCILIATION.PROVIDER_LOOKUP'
++        : 'RECONCILIATION.MISSING_PROVIDER_REFERENCE',
++    });
++    if (!providerSubscriptionId) {
++      await this.store.insertReconciliationAttempt({
++        evidenceId: evidence.evidenceId,
++        operationId: operation.operationId,
++        outcome: 'no_op',
++        resultCode: 'MISSING_PROVIDER_REFERENCE',
++        resultMessage: 'Provider lookup cannot run without a stored provider id',
++      });
++      result.noOps += 1;
++      return;
++    }
++
++    const lookup = await this.lookupSubscription(operation, providerSubscriptionId);
++    if (lookup.kind !== 'found' || !isSubscriptionCommandKind(operation.kind)) {
+       await this.store.insertReconciliationAttempt({
+-        evidenceId,
++        evidenceId: evidence.evidenceId,
++        operationId: operation.operationId,
++        outcome: 'retryable_failure',
++        resultCode: 'UNKNOWN_OUTCOME',
++        resultMessage: 'Subscription provider state remains unknown',
++      });
++      result.retryableFailures += 1;
++      return;
++    }
++
++    try {
++      let delivered = true;
++      if (parent) {
++        const applied = await applySubscriptionEvents(this.store, {
++          operation: parent,
++          steps: [this.lookupStep(providerSubscriptionId, lookup.snapshot)],
++          evidenceId: evidence.evidenceId,
++          reason: 'Reconciliation applied subscription transition',
++          holdEffects: Boolean(this.hooks.onSubscriptionEffects),
++        });
++        delivered = await this.deliverSubscriptionEffects(evidence, applied);
++      }
++
++      const providerStatus = lookup.snapshot.subscriptionStatus;
++      const reached = providerStatus === SUBSCRIPTION_COMMAND_TARGET[operation.kind];
++      assertTransitionAllowed(operation.status, reached ? 'succeeded' : 'failed');
++      await this.store.transitionOperation({
++        operationId: operation.operationId,
++        expectedVersion: operation.version,
++        nextStatus: reached ? 'succeeded' : 'failed',
++        failureCode: reached ? null : SUBSCRIPTION_COMMAND_NOT_APPLIED,
++        failureMessage: reached
++          ? null
++          : `Provider subscription status is ${providerStatus} after the uncertain command`,
++        evidenceId: evidence.evidenceId,
++        reason: 'Reconciliation resolved subscription command',
++      });
++      if (delivered) {
++        await this.store.updateEvidence({
++          evidenceId: evidence.evidenceId,
++          processingStatus: 'processed',
++          processedAt: new Date().toISOString(),
++        });
++      }
++      await this.store.insertReconciliationAttempt({
++        evidenceId: evidence.evidenceId,
+         operationId: operation.operationId,
+         outcome: 'applied',
+         resultCode: 'APPLIED',
+       });
+       result.applied += 1;
+     } catch (error) {
+-      if (isSubscriptionProviderPlanMismatchError(error)) {
+-        await this.store.insertReconciliationAttempt({
+-          evidenceId,
+-          operationId: operation.operationId,
+-          outcome: 'terminal_failure',
+-          resultCode: PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
+-          resultMessage: sanitizeOperationalErrorMessage(error, 'Subscription plan mismatch'),
+-        });
+-        result.terminalFailures += 1;
+-        return;
+-      }
+       await this.recordReconciliationFailure({
+-        evidenceId,
++        evidenceId: evidence.evidenceId,
+         operationId: operation.operationId,
+         result,
+         error,
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/subscription-evidence-application.ts .superpowers/snap-after-t6a/src/core/lib/subscription-evidence-application.ts
+--- .superpowers/snap-after-t5/src/core/lib/subscription-evidence-application.ts	2026-10-22 14:01:57.492783658 +0300
++++ .superpowers/snap-after-t6a/src/core/lib/subscription-evidence-application.ts	2026-10-22 14:32:18.405580616 +0300
+@@ -1,13 +1,26 @@
+ import {
+   PAYMENT_RELIABILITY_ERROR,
+   PaymentReliabilityError,
++  type ExecuteGetSubscriptionResult,
+   type PaymentOperation,
+   type PaymentOperationStatus,
+   type PlanStatus,
+   type SubscriptionStatus,
+ } from '../../contracts/index';
+ import {
+-  evaluateSubscriptionProviderStateOrdering,
++  SUBSCRIPTION_LOOKUP_EVENT_TYPE,
++  SUBSCRIPTION_RECENT_ID_LIMIT,
++  type NormalizedSubscriptionEvent,
++  type ReduceSubscriptionNoopReason,
++  type ReduceSubscriptionOptions,
++  type SubscriptionEffect,
++  type SubscriptionLastPayment,
++  type SubscriptionMoney,
++  type SubscriptionState,
++} from '../../subscription-core/lib/subscription-core-types';
++import { normalizePaypalSubscriptionEvent } from '../../subscription-core/lib/normalize-paypal-subscription-event';
++import { reduceSubscription } from '../../subscription-core/lib/reduce-subscription';
++import {
+   planStatusToOperationStatus,
+   readSubscriptionProviderStateWatermark,
+   resolveProviderTransactionIdAfterSubscriptionStateWatermarkPersist,
+@@ -161,88 +174,568 @@
+   providerPlanId?: string | null;
+ };
+ 
+-function isDuplicateSubscriptionEvidence(
++/** Event type of a status change the engine applies without a provider event (`applySubscriptionTransition`). */
++const ENGINE_TRANSITION_EVENT_TYPE = 'engine.subscription.transition';
++
++/** How many undelivered effect batches `subscriptionStateJson` keeps (one per evidence row). */
++const MAX_PENDING_EFFECT_BATCHES = 16;
++
++/** Code stored on evidence whose state was saved but whose host hook threw; the row stays retryable. */
++export const SUBSCRIPTION_EFFECTS_HOOK_FAILED = 'SUBSCRIPTION_EFFECTS_HOOK_FAILED';
++
++export type SubscriptionEffectsContext = {
++  /** Evidence row the effects come from (webhook or reconciliation evidence). */
++  evidenceId: string | null;
++  eventType: string;
++  source: 'webhook' | 'reconciliation';
++  /** `applied` when at least one event changed or confirmed the state. */
++  decision: 'applied' | 'noop';
++  /** Why nothing applied (`plan_mismatch`, `amount_mismatch`, ...); null when applied. */
++  reason: ReduceSubscriptionNoopReason | null;
++  /** The subscription operation after the state was persisted. */
++  operation: PaymentOperation;
++};
++
++/**
++ * Host hook for the reducer's effects. Called after the state is persisted, once per processed
++ * evidence row with at least one effect. The package puts no business logic here. If it throws,
++ * the evidence stays retryable (`pending`, `SUBSCRIPTION_EFFECTS_HOOK_FAILED`) and the same
++ * effects are delivered again when the row is reprocessed: make the hook idempotent.
++ */
++export type SubscriptionEffectsHook = (
++  operationId: string,
++  effects: SubscriptionEffect[],
++  context: SubscriptionEffectsContext,
++) => void | Promise<void>;
++
++export type SubscriptionEffectsHooks = {
++  onSubscriptionEffects?: SubscriptionEffectsHook;
++};
++
++type PendingSubscriptionEffects = { evidenceId: string; effects: SubscriptionEffect[] };
++
++/** Shape of `subscriptionStateJson` (version 1): the reducer state without a column of its own. */
++type StoredSubscriptionState = {
++  version: 1;
++  lastPayment: SubscriptionLastPayment | null;
++  failedPaymentsCount: number | null;
++  lastEventId: string | null;
++  recentEventIds: string[];
++  recentSaleIds: string[];
++  pendingEffects: PendingSubscriptionEffects[];
++};
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++function readStringList(value: unknown, limit: number): string[] {
++  return Array.isArray(value)
++    ? value.filter((item): item is string => typeof item === 'string').slice(-limit)
++    : [];
++}
++
++function readStoredLastPayment(value: unknown): SubscriptionLastPayment | null {
++  if (
++    !isRecord(value) ||
++    typeof value.amountMinor !== 'string' ||
++    typeof value.currency !== 'string' ||
++    (value.time !== null && typeof value.time !== 'string')
++  ) {
++    return null;
++  }
++  return { amountMinor: value.amountMinor, currency: value.currency, time: value.time };
++}
++
++function readPendingEffects(value: unknown): PendingSubscriptionEffects[] {
++  if (!Array.isArray(value)) {
++    return [];
++  }
++  return value
++    .filter(
++      (entry): entry is PendingSubscriptionEffects =>
++        isRecord(entry) &&
++        typeof entry.evidenceId === 'string' &&
++        Array.isArray(entry.effects) &&
++        entry.effects.every((effect) => isRecord(effect) && typeof effect.type === 'string'),
++    )
++    .slice(-MAX_PENDING_EFFECT_BATCHES);
++}
++
++/** Never throws: an unreadable value counts as "no state yet". */
++function parseStoredSubscriptionState(json: string | null | undefined): StoredSubscriptionState {
++  let parsed: unknown = null;
++  if (json) {
++    try {
++      parsed = JSON.parse(json);
++    } catch {
++      parsed = null;
++    }
++  }
++  const source = isRecord(parsed) ? parsed : {};
++  const count = source.failedPaymentsCount;
++  return {
++    version: 1,
++    lastPayment: readStoredLastPayment(source.lastPayment),
++    failedPaymentsCount:
++      typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : null,
++    lastEventId: typeof source.lastEventId === 'string' ? source.lastEventId : null,
++    recentEventIds: readStringList(source.recentEventIds, SUBSCRIPTION_RECENT_ID_LIMIT),
++    recentSaleIds: readStringList(source.recentSaleIds, SUBSCRIPTION_RECENT_ID_LIMIT),
++    pendingEffects: readPendingEffects(source.pendingEffects),
++  };
++}
++
++function serializeSubscriptionState(
++  state: SubscriptionState,
++  pendingEffects: PendingSubscriptionEffects[],
++): string {
++  const stored: StoredSubscriptionState = {
++    version: 1,
++    lastPayment: state.lastPayment,
++    failedPaymentsCount: state.failedPaymentsCount,
++    lastEventId: state.lastEventId,
++    recentEventIds: state.recentEventIds,
++    recentSaleIds: state.recentSaleIds,
++    pendingEffects,
++  };
++  return JSON.stringify(stored);
++}
++
++/**
++ * The `SubscriptionState` of a subscription operation: its columns (status, ids, watermark,
++ * billing dates) plus `subscriptionStateJson` (last payment, failed-payment count, recent ids).
++ * This is the state the engine feeds into `reduceSubscription`; hosts use it to read the last
++ * payment and the failed-payment count.
++ */
++export function readSubscriptionOperationState(operation: PaymentOperation): SubscriptionState {
++  const stored = parseStoredSubscriptionState(operation.subscriptionStateJson);
++  return {
++    status: operation.subscriptionStatus ?? 'approval_pending',
++    providerSubscriptionId: operation.providerSubscriptionId ?? null,
++    providerPlanId: operation.providerPlanId ?? null,
++    stateAt: readSubscriptionProviderStateWatermark(operation),
++    nextBillingTime: operation.nextBillingTime ?? null,
++    startTime: operation.startTime ?? null,
++    lastPayment: stored.lastPayment,
++    failedPaymentsCount: stored.failedPaymentsCount,
++    lastEventId: stored.lastEventId,
++    recentEventIds: stored.recentEventIds,
++    recentSaleIds: stored.recentSaleIds,
++  };
++}
++
++/**
++ * Normalise a stored webhook body for the reducer. A body without its own `id` (accepted at intake
++ * with a host-supplied event id) is read with the evidence's provider event id.
++ */
++export function normalizeSubscriptionEvidencePayload(
++  rawPayload: string | null | undefined,
++  providerEventId: string | null,
++): NormalizedSubscriptionEvent | null {
++  const raw = rawPayload ?? '';
++  const result = normalizePaypalSubscriptionEvent(raw);
++  if (result.ok) {
++    return result.event;
++  }
++  if (result.reason !== 'missing_event_id' || !providerEventId) {
++    return null;
++  }
++  try {
++    const body: unknown = JSON.parse(raw);
++    if (!isRecord(body) || Object.prototype.hasOwnProperty.call(body, 'id')) {
++      return null;
++    }
++    const withId = normalizePaypalSubscriptionEvent(
++      JSON.stringify({ ...body, id: providerEventId }),
++    );
++    return withId.ok ? withId.event : null;
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * A provider lookup (GET subscription) as a reducer event. `stateAt` is the snapshot's state time;
++ * `fallbackStatus` is used when the snapshot status is unknown.
++ */
++export function subscriptionEventFromProviderSnapshot(
++  providerSubscriptionId: string,
++  snapshot: Pick<ExecuteGetSubscriptionResult, 'providerPlanId' | 'subscriptionStatus'> &
++    Partial<ExecuteGetSubscriptionResult>,
++  input: {
++    providerEventId?: string | null;
++    eventType?: string;
++    fallbackStatus?: SubscriptionStatus | null;
++  } = {},
++): NormalizedSubscriptionEvent {
++  const status =
++    snapshot.subscriptionStatus && snapshot.subscriptionStatus !== 'unknown'
++      ? snapshot.subscriptionStatus
++      : (input.fallbackStatus ?? null);
++  const nonEmpty = (value: string | null | undefined) =>
++    value != null && value.trim().length > 0 ? value : null;
++  return {
++    providerEventId: input.providerEventId ?? null,
++    eventType: input.eventType ?? SUBSCRIPTION_LOOKUP_EVENT_TYPE,
++    resourceType: 'subscription',
++    providerSubscriptionId,
++    providerPlanId: nonEmpty(snapshot.providerPlanId)?.trim() ?? null,
++    providerStatus: null,
++    subscriptionStatus: status,
++    stateAt: nonEmpty(snapshot.providerSubscriptionStateAt),
++    nextBillingTime: nonEmpty(snapshot.nextBillingTime),
++    startTime: nonEmpty(snapshot.startTime),
++    lastPayment: snapshot.lastPayment ?? null,
++    failedPaymentsCount: snapshot.failedPaymentsCount ?? null,
++    outstandingBalance: snapshot.outstandingBalance ?? null,
++    payment: null,
++    eventTime: null,
++  };
++}
++
++/**
++ * Expected price of one billing cycle: the subscription's own `amountMinor`/`currencyCode` when a
++ * host set them, else those of its parent billing plan (stored by `createBillingPlan`). Null when
++ * no price is known: then only the plan id is checked.
++ */
++export async function resolveExpectedSubscriptionPayment(
++  store: Pick<OperationStore, 'findOperationById'>,
+   operation: PaymentOperation,
+-  subscriptionStatus: SubscriptionStatus,
+-): boolean {
+-  const current = operation.subscriptionStatus ?? 'approval_pending';
+-  const nextExecution = subscriptionStatusToOperationStatus(subscriptionStatus);
+-  return current === subscriptionStatus && operation.status === nextExecution;
++): Promise<SubscriptionMoney | null> {
++  if (operation.amountMinor && operation.currencyCode) {
++    return { amountMinor: operation.amountMinor, currency: operation.currencyCode };
++  }
++  if (!operation.parentOperationId) {
++    return null;
++  }
++  const plan = await store.findOperationById(operation.parentOperationId);
++  if (plan?.kind !== 'billing_plan' || !plan.amountMinor || !plan.currencyCode) {
++    return null;
++  }
++  return { amountMinor: plan.amountMinor, currency: plan.currencyCode };
++}
++
++export type SubscriptionEventStep = {
++  event: NormalizedSubscriptionEvent;
++  options: ReduceSubscriptionOptions;
++};
++
++export type ApplySubscriptionEventsInput = {
++  operation: PaymentOperation;
++  /** Reduced in order against the stored state, then persisted with one write. */
++  steps: SubscriptionEventStep[];
++  evidenceId: string | null;
++  reason: string;
++  /** Keep the effects in `subscriptionStateJson` until `clearPendingSubscriptionEffects` (a hook is set). */
++  holdEffects?: boolean;
++  approvalUrl?: string | null;
++  lifecycleReason?: string | null;
++};
++
++export type ApplySubscriptionEventsResult = {
++  operation: PaymentOperation;
++  decision: 'applied' | 'noop';
++  reason: ReduceSubscriptionNoopReason | null;
++  /** A plan mismatch kept the subscription from (staying) active: nothing was applied. */
++  planMismatch: boolean;
++  /** Effects to hand to the host: this run's, plus any held from an earlier failed delivery. */
++  effects: SubscriptionEffect[];
++  /** The effects are held in the stored state for `evidenceId`. */
++  effectsHeld: boolean;
++};
++
++/** Noop reasons after which the execution status is still synced to the stored subscription status. */
++const SYNC_EXECUTION_ON_NOOP: ReadonlySet<ReduceSubscriptionNoopReason> = new Set([
++  'transition_rejected',
++  'duplicate_event',
++]);
++
++function sameJson(left: unknown, right: unknown): boolean {
++  return JSON.stringify(left) === JSON.stringify(right);
+ }
+ 
+-async function applySubscriptionTransitionOnce(
++function hasMaterialChange(before: SubscriptionState, after: SubscriptionState): boolean {
++  return (
++    before.status !== after.status ||
++    before.providerSubscriptionId !== after.providerSubscriptionId ||
++    before.providerPlanId !== after.providerPlanId ||
++    before.stateAt !== after.stateAt ||
++    before.nextBillingTime !== after.nextBillingTime ||
++    before.startTime !== after.startTime ||
++    before.failedPaymentsCount !== after.failedPaymentsCount ||
++    !sameJson(before.lastPayment, after.lastPayment) ||
++    !sameJson(before.recentSaleIds, after.recentSaleIds)
++  );
++}
++
++async function applySubscriptionEventsOnce(
+   store: OperationStore,
+-  input: ApplySubscriptionTransitionInput,
+-): Promise<PaymentOperation> {
+-  const { operation, subscriptionStatus } = input;
+-  const current = operation.subscriptionStatus ?? 'approval_pending';
+-  const resolvedStatus = resolveSubscriptionStatusTransition(current, subscriptionStatus);
+-  const ordering = evaluateSubscriptionProviderStateOrdering({
+-    operation,
+-    desiredStatus: resolvedStatus,
+-    providerStateTimestamp: input.providerStateTimestamp ?? null,
+-    applySource: input.applySource ?? 'webhook',
+-  });
+-  if (ordering.action === 'noop') {
+-    return operation;
++  input: ApplySubscriptionEventsInput,
++): Promise<ApplySubscriptionEventsResult> {
++  const { operation } = input;
++  const before = readSubscriptionOperationState(operation);
++  const stored = parseStoredSubscriptionState(operation.subscriptionStateJson);
++
++  let state = before;
++  let applied = false;
++  let reason: ReduceSubscriptionNoopReason | null = null;
++  let planMismatch = false;
++  const fresh: SubscriptionEffect[] = [];
++  for (const step of input.steps) {
++    const result = reduceSubscription(state, step.event, step.options);
++    fresh.push(...result.effects);
++    if (result.decision === 'applied') {
++      state = result.state;
++      applied = true;
++    } else {
++      // A reducer noop reason (typed), not a free-text transition reason.
++      const noopReason = result.reason;
++      reason ??= noopReason;
++      planMismatch ||= noopReason === 'plan_mismatch';
++    }
+   }
+ 
+-  const watermarkUnchanged =
+-    ordering.providerStateWatermark !== null &&
+-    ordering.providerStateWatermark === readSubscriptionProviderStateWatermark(operation);
+-
+-  if (
+-    isDuplicateSubscriptionEvidence(operation, resolvedStatus) &&
+-    (ordering.providerStateWatermark === null || watermarkUnchanged)
+-  ) {
+-    return operation;
++  if (!state.providerSubscriptionId) {
++    // An engine transition without any id must not store an empty one.
++    state = { ...state, providerSubscriptionId: before.providerSubscriptionId };
+   }
+ 
+-  const nextExecution = resolveExecutionTransition(
+-    operation.status,
+-    subscriptionStatusToOperationStatus(resolvedStatus),
++  const held = input.evidenceId
++    ? stored.pendingEffects.find((entry) => entry.evidenceId === input.evidenceId)
++    : undefined;
++  const effects = held
++    ? [...held.effects, ...fresh.filter((effect) => !held.effects.some((h) => sameJson(h, effect)))]
++    : fresh;
++
++  const syncExecution =
++    !planMismatch && (applied || (reason !== null && SYNC_EXECUTION_ON_NOOP.has(reason)));
++  const nextExecution = syncExecution
++    ? resolveExecutionTransition(
++        operation.status,
++        subscriptionStatusToOperationStatus(state.status),
++      )
++    : operation.status;
++  const stateChanged = hasMaterialChange(before, state);
++  const holdNow = Boolean(
++    input.holdEffects && input.evidenceId && effects.length > 0 && stateChanged,
+   );
++  const pendingEffects =
++    holdNow && input.evidenceId
++      ? [
++          ...stored.pendingEffects.filter((entry) => entry.evidenceId !== input.evidenceId),
++          { evidenceId: input.evidenceId, effects },
++        ].slice(-MAX_PENDING_EFFECT_BATCHES)
++      : stored.pendingEffects;
++  const extrasChanged =
++    (input.approvalUrl != null && input.approvalUrl !== operation.approvalUrl) ||
++    (input.lifecycleReason != null && input.lifecycleReason !== operation.lifecycleReason);
++
++  const result = {
++    decision: applied ? ('applied' as const) : ('noop' as const),
++    reason: applied ? null : reason,
++    planMismatch: !applied && planMismatch,
++    effects,
++    effectsHeld: holdNow || held !== undefined,
++  };
++  if (!stateChanged && !extrasChanged && nextExecution === operation.status) {
++    return { ...result, operation };
++  }
+ 
+-  return persistDomainAwareOperationUpdate(store, operation, {
+-    nextExecution,
+-    subscriptionStatus: resolvedStatus,
+-    ...(ordering.providerStateWatermark !== null
+-      ? { providerStateWatermark: ordering.providerStateWatermark }
+-      : {}),
+-    providerReferenceId: input.providerReferenceId ?? operation.providerReferenceId,
+-    providerSubscriptionId: input.providerSubscriptionId ?? undefined,
+-    providerPlanId: input.providerPlanId ?? undefined,
++  const watermarkChanged = state.stateAt !== before.stateAt;
++  const isSubscriptionKind = operation.kind === 'subscription';
++  const patch = {
++    subscriptionStatus: state.status !== before.status ? state.status : undefined,
++    providerPlanId:
++      state.providerPlanId !== before.providerPlanId ? state.providerPlanId : undefined,
++    // Ids are only ever filled in, never replaced (a sale or payment id is never a subscription id).
++    providerSubscriptionId:
++      !operation.providerSubscriptionId && state.providerSubscriptionId
++        ? state.providerSubscriptionId
++        : undefined,
++    providerReferenceId:
++      isSubscriptionKind && !operation.providerReferenceId && state.providerSubscriptionId
++        ? state.providerSubscriptionId
++        : undefined,
++    providerSubscriptionStateAt: watermarkChanged ? state.stateAt : undefined,
++    providerTransactionId: watermarkChanged
++      ? resolveProviderTransactionIdAfterSubscriptionStateWatermarkPersist(operation)
++      : undefined,
++    nextBillingTime:
++      state.nextBillingTime !== before.nextBillingTime ? state.nextBillingTime : undefined,
++    startTime: state.startTime !== before.startTime ? state.startTime : undefined,
+     approvalUrl: input.approvalUrl ?? undefined,
+-    startTime: input.startTime ?? undefined,
+-    nextBillingTime: input.nextBillingTime ?? undefined,
+     lifecycleReason: input.lifecycleReason ?? undefined,
+-    evidenceId: input.evidenceId ?? null,
+-    reason: input.reason,
+-  });
++    subscriptionStateJson: stateChanged
++      ? serializeSubscriptionState(state, pendingEffects)
++      : undefined,
++  };
++
++  const persisted =
++    nextExecution === operation.status
++      ? await store.updateOperation({
++          operationId: operation.operationId,
++          expectedVersion: operation.version,
++          ...patch,
++        })
++      : await store.transitionOperation({
++          operationId: operation.operationId,
++          expectedVersion: operation.version,
++          nextStatus: nextExecution,
++          ...patch,
++          evidenceId: input.evidenceId,
++          reason: input.reason,
++        });
++  return { ...result, operation: persisted };
+ }
+ 
+-export async function applySubscriptionTransition(
++/**
++ * Run events through the pure reducer (`reduceSubscription`) against the operation's stored state
++ * and persist the result: status (and the execution status it implies), plan, watermark, billing
++ * dates and `subscriptionStateJson`. The single place where the engine changes subscription state
++ * from provider evidence. Retries on a version conflict with the fresh row. Writes nothing when
++ * only the recent event ids would change (evidence rows are unique per provider event already).
++ */
++export async function applySubscriptionEvents(
+   store: OperationStore,
+-  input: ApplySubscriptionTransitionInput,
+-): Promise<PaymentOperation> {
++  input: ApplySubscriptionEventsInput,
++): Promise<ApplySubscriptionEventsResult> {
+   let operation = input.operation;
+-
+   for (let attempt = 0; attempt < SUBSCRIPTION_TRANSITION_MAX_VERSION_RETRIES; attempt += 1) {
+     try {
+-      return await applySubscriptionTransitionOnce(store, { ...input, operation });
++      return await applySubscriptionEventsOnce(store, { ...input, operation });
+     } catch (error) {
+       if (!isTransitionVersionConflict(error)) {
+         throw error;
+       }
+       const fresh = await store.findOperationById(operation.operationId);
+       if (!fresh) {
+-        return operation;
++        throw error;
+       }
+       operation = fresh;
+     }
+   }
++  throw new PaymentReliabilityError(
++    PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT,
++    'Subscription state kept changing while it was applied',
++  );
++}
++
++/** Effects held on a subscription operation for `evidenceId` (an earlier hook call failed). */
++export function readHeldSubscriptionEffects(
++  operation: PaymentOperation,
++  evidenceId: string,
++): SubscriptionEffect[] {
++  return (
++    parseStoredSubscriptionState(operation.subscriptionStateJson).pendingEffects.find(
++      (entry) => entry.evidenceId === evidenceId,
++    )?.effects ?? []
++  );
++}
+ 
+-  return operation;
++/** Drop the effects held for `evidenceId` once the host hook accepted them. */
++export async function clearPendingSubscriptionEffects(
++  store: OperationStore,
++  operationId: string,
++  evidenceId: string,
++): Promise<void> {
++  for (let attempt = 0; attempt < SUBSCRIPTION_TRANSITION_MAX_VERSION_RETRIES; attempt += 1) {
++    const operation = await store.findOperationById(operationId);
++    if (!operation) {
++      return;
++    }
++    const stored = parseStoredSubscriptionState(operation.subscriptionStateJson);
++    const remaining = stored.pendingEffects.filter((entry) => entry.evidenceId !== evidenceId);
++    if (remaining.length === stored.pendingEffects.length) {
++      return;
++    }
++    try {
++      await store.updateOperation({
++        operationId,
++        expectedVersion: operation.version,
++        subscriptionStateJson: serializeSubscriptionState(
++          readSubscriptionOperationState(operation),
++          remaining,
++        ),
++      });
++      return;
++    } catch (error) {
++      if (!isTransitionVersionConflict(error)) {
++        throw error;
++      }
++    }
++  }
++}
++
++/**
++ * Hand the effects to the host hook (after the state was persisted) and release them once it
++ * returns. Returns the hook's error instead of throwing, so the caller can keep its evidence row
++ * retryable.
++ */
++export async function deliverSubscriptionEffects(
++  store: OperationStore,
++  hooks: SubscriptionEffectsHooks,
++  applied: ApplySubscriptionEventsResult,
++  context: Omit<SubscriptionEffectsContext, 'decision' | 'reason' | 'operation'>,
++): Promise<{ delivered: true } | { delivered: false; error: unknown }> {
++  const hook = hooks.onSubscriptionEffects;
++  if (!hook || applied.effects.length === 0) {
++    return { delivered: true };
++  }
++  try {
++    await hook(applied.operation.operationId, applied.effects, {
++      ...context,
++      decision: applied.decision,
++      reason: applied.reason,
++      operation: applied.operation,
++    });
++  } catch (error) {
++    return { delivered: false, error };
++  }
++  if (applied.effectsHeld && context.evidenceId) {
++    await clearPendingSubscriptionEffects(store, applied.operation.operationId, context.evidenceId);
++  }
++  return { delivered: true };
++}
++
++function applySourceToReduceSource(source: SubscriptionStateApplySource): 'webhook' | 'lookup' {
++  return source === 'webhook' || source === 'reconcile_event' ? 'webhook' : 'lookup';
++}
++
++/**
++ * Apply one status (with optional billing dates) to a subscription operation through the pure
++ * reducer. `webhook`/`reconcile_event` follow the provider-state ordering by
++ * `providerStateTimestamp`; `reconcile_provider`/`provider_mutation` are authoritative and leave the
++ * watermark as it is. Provider ids are only filled in when the operation has none.
++ */
++export async function applySubscriptionTransition(
++  store: OperationStore,
++  input: ApplySubscriptionTransitionInput,
++): Promise<PaymentOperation> {
++  const source = applySourceToReduceSource(input.applySource ?? 'webhook');
++  const operation = input.operation;
++  const event: NormalizedSubscriptionEvent = {
++    ...subscriptionEventFromProviderSnapshot(
++      input.providerSubscriptionId ?? operation.providerSubscriptionId ?? '',
++      {
++        providerPlanId: input.providerPlanId ?? null,
++        subscriptionStatus: input.subscriptionStatus,
++        startTime: input.startTime ?? null,
++        nextBillingTime: input.nextBillingTime ?? null,
++      },
++      { eventType: ENGINE_TRANSITION_EVENT_TYPE },
++    ),
++    stateAt: source === 'webhook' ? (input.providerStateTimestamp ?? null) : null,
++  };
++  const applied = await applySubscriptionEvents(store, {
++    operation,
++    steps: [{ event, options: { source } }],
++    evidenceId: input.evidenceId ?? null,
++    reason: input.reason,
++    approvalUrl: input.approvalUrl,
++    lifecycleReason: input.lifecycleReason,
++  });
++  return applied.operation;
+ }
+ 
+ export async function applyPlanTransition(
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/subscription-lifecycle-service.ts .superpowers/snap-after-t6a/src/core/lib/subscription-lifecycle-service.ts
+--- .superpowers/snap-after-t5/src/core/lib/subscription-lifecycle-service.ts	2026-10-22 14:01:57.492836621 +0300
++++ .superpowers/snap-after-t6a/src/core/lib/subscription-lifecycle-service.ts	2026-10-22 14:32:18.405609349 +0300
+@@ -3,7 +3,9 @@
+   PAYMENT_TRANSITION_REJECTION_REASON,
+   PaymentReliabilityError,
+   type PaymentReliabilityErrorCode,
++  type BillingCycleInput,
+   type BillingPlanResult,
++  type CanonicalMoney,
+   type CatalogProductResult,
+   type CreateBillingPlanRequest,
+   type CreateCatalogProductRequest,
+@@ -15,6 +17,7 @@
+   type GetSubscriptionRequest,
+   type GetSubscriptionResult,
+   type PaymentOperation,
++  type PaymentPreferencesInput,
+   type PlanLifecycleRequest,
+   type PlanLifecycleResult,
+   type ExecuteSubscriptionLifecycleResult,
+@@ -37,6 +40,10 @@
+ import { buildOperationIdempotencyScope } from './operation-idempotency';
+ import { validateBillingCycles } from './subscription-billing-cycles';
+ import {
++  compareMinorUnits,
++  isMinorUnitString,
++} from '../../subscription-core/lib/subscription-money';
++import {
+   resolveSubscriptionCreateOptions,
+   subscriptionCreateFingerprintFields,
+ } from './subscription-create-options';
+@@ -59,6 +66,30 @@
+   isSubscriptionProviderPlanMismatchError,
+ } from './subscription-provider-plan-consistency';
+ 
++/**
++ * Lowest price PayPal can charge in one payment of this plan: the smallest positive cycle price or
++ * setup fee. Stored on the plan operation (`amountMinor`/`currencyCode`) so a `PAYMENT.SALE.COMPLETED`
++ * below it is reported as `amount_mismatch` (#4). Null when the plan has no paid amount or mixes
++ * currencies.
++ */
++function expectedPlanPayment(
++  cycles: BillingCycleInput[],
++  paymentPreferences: PaymentPreferencesInput,
++): CanonicalMoney | null {
++  const prices = [...cycles.map((cycle) => cycle.price), paymentPreferences.setupFee].filter(
++    (price): price is CanonicalMoney =>
++      price != null && isMinorUnitString(price.amountMinor) && BigInt(price.amountMinor) > 0n,
++  );
++  const currencies = new Set(prices.map((price) => price.currency.trim().toUpperCase()));
++  if (prices.length === 0 || currencies.size !== 1) {
++    return null;
++  }
++  const lowest = prices.reduce((min, price) =>
++    compareMinorUnits(price.amountMinor, min.amountMinor) < 0 ? price : min,
++  );
++  return { amountMinor: lowest.amountMinor, currency: [...currencies][0] as string };
++}
++
+ function isTerminal(status: PaymentOperation['status']): boolean {
+   return status === 'succeeded' || status === 'failed';
+ }
+@@ -326,6 +357,7 @@
+     }
+ 
+     const cycles = validateBillingCycles(input.billingCycles);
++    const expectedPayment = expectedPlanPayment(cycles, input.paymentPreferences);
+     const fingerprint = buildCommandFingerprint({
+       productOperationId: input.productOperationId,
+       offeringRef: input.offeringRef ?? null,
+@@ -355,6 +387,8 @@
+       offeringRef: input.offeringRef ?? null,
+       itemRef: input.name,
+       planStatus: input.status === 'ACTIVE' ? 'active' : 'created',
++      amountMinor: expectedPayment?.amountMinor ?? null,
++      currencyCode: expectedPayment?.currency ?? null,
+     });
+ 
+     if (
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/subscription-provider-snapshot-fields.ts .superpowers/snap-after-t6a/src/core/lib/subscription-provider-snapshot-fields.ts
+--- .superpowers/snap-after-t5/src/core/lib/subscription-provider-snapshot-fields.ts	2026-10-22 14:01:57.492993515 +0300
++++ .superpowers/snap-after-t6a/src/core/lib/subscription-provider-snapshot-fields.ts	2026-10-22 14:32:18.405692932 +0300
+@@ -1,3 +1,7 @@
++/**
++ * @deprecated The engine maps provider snapshots with `subscriptionEventFromProviderSnapshot` and
++ * the pure reducer. Kept for existing callers.
++ */
+ export function subscriptionBillingFieldsFromProviderSnapshot(snapshot: {
+   startTime?: string | null;
+   nextBillingTime?: string | null;
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/subscription-transition-policy.ts .superpowers/snap-after-t6a/src/core/lib/subscription-transition-policy.ts
+--- .superpowers/snap-after-t5/src/core/lib/subscription-transition-policy.ts	2026-10-22 14:01:57.493025018 +0300
++++ .superpowers/snap-after-t6a/src/core/lib/subscription-transition-policy.ts	2026-10-22 14:32:18.405710544 +0300
+@@ -33,6 +33,10 @@
+   | 'reconcile_event'
+   | 'provider_mutation';
+ 
++/**
++ * @deprecated The engine reads webhook bodies with `normalizePaypalSubscriptionEvent` (`stateAt`)
++ * from `@idevconn/payment-providers/subscription`. Kept for existing callers.
++ */
+ export function parseSubscriptionResourceStateTimestamp(
+   rawPayload: string | null | undefined,
+ ): string | null {
+@@ -86,6 +90,11 @@
+   | { action: 'apply'; providerStateWatermark: string | null }
+   | { action: 'noop'; reason: 'stale' | 'equal_conflict' | 'missing_timestamp' };
+ 
++/**
++ * @deprecated The engine orders subscription state with `reduceSubscription` (via
++ * `applySubscriptionEvents`); use `evaluateSubscriptionStateOrdering` from
++ * `@idevconn/payment-providers/subscription`. Kept for existing callers.
++ */
+ export function evaluateSubscriptionProviderStateOrdering(input: {
+   operation: {
+     subscriptionStatus: SubscriptionStatus | null;
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/__tests__/reconciliation-subscription-core.unit.test.ts .superpowers/snap-after-t6a/src/core/lib/__tests__/reconciliation-subscription-core.unit.test.ts
+--- .superpowers/snap-after-t5/src/core/lib/__tests__/reconciliation-subscription-core.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6a/src/core/lib/__tests__/reconciliation-subscription-core.unit.test.ts	2026-10-22 14:32:18.404427082 +0300
+@@ -0,0 +1,387 @@
++import { describe, expect, it, vi } from 'vitest';
++import type { ExecuteGetSubscriptionResult, PaymentOperation } from '../../../contracts/index';
++import type { ReconciliationProviderLookup } from '../checkout-provider-port';
++import { buildOperationIdempotencyScope } from '../operation-idempotency';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import { PaymentRecoveryService } from '../payment-recovery-service';
++import { ReconciliationService } from '../reconciliation-service';
++import {
++  readSubscriptionOperationState,
++  type SubscriptionEffectsHook,
++} from '../subscription-evidence-application';
++import type { SubscriptionProviderPort } from '../subscription-provider-port';
++import { SubscriptionLifecycleService } from '../subscription-lifecycle-service';
++import { sha256Payload } from '../sha256-payload';
++import { WebhookProcessingService } from '../webhook-processing-service';
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'app',
++  environment: 'sandbox' as const,
++};
++
++function snapshot(over: Partial<ExecuteGetSubscriptionResult> = {}): ExecuteGetSubscriptionResult {
++  return {
++    providerSubscriptionId: 'I-1',
++    providerPlanId: 'P-1',
++    subscriptionStatus: 'active',
++    approvalUrl: null,
++    startTime: null,
++    nextBillingTime: null,
++    lifecycleReason: null,
++    ...over,
++  };
++}
++
++function lookupOf(
++  getSubscription: ReconciliationProviderLookup['getSubscription'],
++): ReconciliationProviderLookup {
++  return { getSubscription } as unknown as ReconciliationProviderLookup;
++}
++
++function findBySubscriptionId(store: MemoryPaymentReliabilityStore, id: string) {
++  return store.findOperationByProviderSubscriptionId(
++    ctx.providerCode,
++    ctx.accountRef,
++    ctx.environment,
++    id,
++  );
++}
++
++describe('ReconciliationService on the pure core', () => {
++  // T5 review finding 1 (probe t5review/tools/p-sale.mjs).
++  it('never takes the subscription id from a PAYMENT.SALE resource', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    let operation = await store.createOperation({
++      ...ctx,
++      idempotencyKey: 'k',
++      idempotencyScope: 's',
++      commandFingerprint: 'fp',
++      kind: 'subscription',
++      subscriptionStatus: 'active',
++      providerSubscriptionId: 'I-1',
++      providerPlanId: 'P-1',
++    });
++    operation = await store.claimOperationForExecution({
++      operationId: operation.operationId,
++      expectedVersion: operation.version,
++    });
++    operation = await store.transitionOperation({
++      operationId: operation.operationId,
++      expectedVersion: operation.version,
++      nextStatus: 'unknown',
++      providerReferenceId: 'I-1',
++      reason: 'uncertain',
++    });
++    const rawPayload = JSON.stringify({
++      id: 'WH-S',
++      event_type: 'PAYMENT.SALE.COMPLETED',
++      resource: {
++        id: 'SALE-1',
++        billing_agreement_id: 'I-1',
++        amount: { total: '10.00', currency: 'USD' },
++      },
++    });
++    const evidence = await store.insertEvidence({
++      ...ctx,
++      evidenceKind: 'webhook',
++      providerEventId: 'WH-S',
++      rawPayload,
++      payloadSha256: sha256Payload(rawPayload),
++      eventType: 'PAYMENT.SALE.COMPLETED',
++      resourceId: 'SALE-1',
++    });
++    await store.updateEvidence({
++      evidenceId: evidence.evidenceId,
++      verificationStatus: 'verified',
++      processingStatus: 'unmatched',
++      relatedOperationId: operation.operationId,
++    });
++    const service = new ReconciliationService(
++      store,
++      lookupOf(async () => snapshot()),
++    );
++
++    await service.reconcile(10);
++
++    const after = await store.findOperationById(operation.operationId);
++    expect(after?.providerSubscriptionId).toBe('I-1');
++    expect(after?.providerReferenceId).toBe('I-1');
++    expect(after?.subscriptionStatus).toBe('active');
++    expect((await findBySubscriptionId(store, 'I-1'))?.operationId).toBe(operation.operationId);
++    expect(
++      (
++        await store.findOperationByProviderReference(
++          ctx.providerCode,
++          ctx.accountRef,
++          ctx.environment,
++          'I-1',
++        )
++      )?.operationId,
++    ).toBe(operation.operationId);
++    expect(readSubscriptionOperationState(after!).lastPayment?.amountMinor).toBe('1000');
++
++    const webhooks = new WebhookProcessingService(store);
++    const cancelled = await webhooks.receiveWebhook({
++      ...ctx,
++      rawBody: JSON.stringify({
++        id: 'WH-C',
++        event_type: 'BILLING.SUBSCRIPTION.CANCELLED',
++        resource: { id: 'I-1' },
++      }),
++      verify: async () => ({
++        verified: true,
++        transmissionId: 'WH-C',
++        eventType: 'BILLING.SUBSCRIPTION.CANCELLED',
++        resourceId: 'I-1',
++      }),
++    });
++    expect(cancelled.processingStatus).toBe('processed');
++    expect((await findBySubscriptionId(store, 'I-1'))?.subscriptionStatus).toBe('cancelled');
++  });
++
++  // T5 review finding 2 (probe t5review/tools/p-cancel.mjs).
++  it('reconciles an uncertain cancel command without binding the subscription reference to it', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const provider = {
++      getPlan: async () => ({
++        providerPlanId: 'P-1',
++        providerProductId: 'PROD-1',
++        planStatus: 'active',
++      }),
++      createSubscription: async () => ({
++        providerSubscriptionId: 'I-1',
++        providerPlanId: 'P-1',
++        subscriptionStatus: 'active',
++        approvalUrl: null,
++        startTime: null,
++        nextBillingTime: null,
++      }),
++      cancelSubscription: async () => {
++        throw { code: 'PROVIDER_UNCERTAIN', message: 'timeout', retryable: true, uncertain: true };
++      },
++      getSubscription: async () => snapshot({ subscriptionStatus: 'cancelled' }),
++    } as unknown as SubscriptionProviderPort;
++    const lifecycle = new SubscriptionLifecycleService(store, provider);
++    const created = await lifecycle.createSubscription({
++      ...ctx,
++      idempotencyKey: 'k',
++      providerPlanId: 'P-1',
++      offeringRef: 'pro',
++      subscriber: { subscriberRef: 'u1' },
++    });
++    await expect(
++      lifecycle.cancelSubscription({
++        ...ctx,
++        idempotencyKey: 'c1',
++        subscriptionOperationId: created.subscriptionOperationId,
++        reason: 'x',
++      }),
++    ).rejects.toMatchObject({ code: 'PROVIDER_UNCERTAIN' });
++    const [command] = await store.listUncertainOperations(10);
++    expect(command?.kind).toBe('subscription_cancel');
++
++    const result = await new ReconciliationService(
++      store,
++      provider as unknown as ReconciliationProviderLookup,
++    ).reconcile(10);
++
++    expect(result.applied).toBe(1);
++    expect(result.retryableFailures).toBe(0);
++    const reconciled = await store.findOperationById(command!.operationId);
++    expect(reconciled?.status).toBe('succeeded');
++    expect(reconciled?.providerReferenceId).toBeNull();
++    const subscription = await store.findOperationById(created.subscriptionOperationId);
++    expect(subscription?.subscriptionStatus).toBe('cancelled');
++    expect(
++      (
++        await store.findOperationByProviderReference(
++          ctx.providerCode,
++          ctx.accountRef,
++          ctx.environment,
++          'I-1',
++        )
++      )?.kind,
++    ).toBe('subscription');
++    expect(await store.listUncertainOperations(10)).toEqual([]);
++  });
++
++  it('fails an uncertain command when the provider shows it did not take effect', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const subscription = await seedSubscription(store, 'active');
++    const command = await seedUncertainCommand(store, subscription, 'subscription_suspend');
++
++    const result = await new ReconciliationService(
++      store,
++      lookupOf(async () => snapshot({ subscriptionStatus: 'active' })),
++    ).reconcile(10);
++
++    expect(result.retryableFailures).toBe(0);
++    const reconciled = await store.findOperationById(command.operationId);
++    expect(reconciled?.status).toBe('failed');
++    expect(reconciled?.failureCode).toBe('SUBSCRIPTION_COMMAND_NOT_APPLIED');
++    expect(reconciled?.providerReferenceId).toBeNull();
++    expect((await store.findOperationById(subscription.operationId))?.subscriptionStatus).toBe(
++      'active',
++    );
++  });
++
++  it('persists last payment and failed payment count from the provider lookup', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const created = await store.createOperation({
++      ...ctx,
++      idempotencyKey: 'sub-lookup-billing',
++      idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++      commandFingerprint: 'fp',
++      kind: 'subscription',
++      subscriptionStatus: 'approval_pending',
++      providerSubscriptionId: 'I-1',
++      providerPlanId: 'P-1',
++    });
++    const uncertain = await store.transitionOperation({
++      operationId: created.operationId,
++      expectedVersion: created.version,
++      nextStatus: 'unknown',
++      reason: 'seed uncertain',
++    });
++    const hook = vi.fn<SubscriptionEffectsHook>();
++
++    const result = await new ReconciliationService(
++      store,
++      lookupOf(async () =>
++        snapshot({
++          nextBillingTime: '2026-11-22T10:00:00Z',
++          lastPayment: { amountMinor: '999', currency: 'USD', time: '2026-10-22T10:00:00.000Z' },
++          failedPaymentsCount: 1,
++        }),
++      ),
++      { onSubscriptionEffects: hook },
++    ).reconcile(10);
++
++    expect(result.applied).toBe(1);
++    const after = await store.findOperationById(uncertain.operationId);
++    expect(after?.status).toBe('succeeded');
++    expect(after?.subscriptionStatus).toBe('active');
++    expect(after?.nextBillingTime).toBe('2026-11-22T10:00:00Z');
++    const state = readSubscriptionOperationState(after!);
++    expect(state.lastPayment).toEqual({
++      amountMinor: '999',
++      currency: 'USD',
++      time: '2026-10-22T10:00:00.000Z',
++    });
++    expect(state.failedPaymentsCount).toBe(1);
++    expect(hook).toHaveBeenCalledWith(
++      uncertain.operationId,
++      expect.arrayContaining([{ type: 'status_changed', from: 'approval_pending', to: 'active' }]),
++      expect.objectContaining({ source: 'reconciliation' }),
++    );
++  });
++
++  it('delivers effects held after a failed reconciliation hook through recovery', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const created = await store.createOperation({
++      ...ctx,
++      idempotencyKey: 'sub-held',
++      idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++      commandFingerprint: 'fp',
++      kind: 'subscription',
++      subscriptionStatus: 'approval_pending',
++      providerSubscriptionId: 'I-1',
++      providerPlanId: 'P-1',
++    });
++    const uncertain = await store.transitionOperation({
++      operationId: created.operationId,
++      expectedVersion: created.version,
++      nextStatus: 'unknown',
++      reason: 'seed uncertain',
++    });
++    const failingHook = vi.fn<SubscriptionEffectsHook>().mockRejectedValue(new Error('down'));
++
++    await new ReconciliationService(
++      store,
++      lookupOf(async () => snapshot()),
++      { onSubscriptionEffects: failingHook },
++    ).reconcile(10);
++
++    expect(failingHook).toHaveBeenCalledTimes(1);
++    expect((await store.findOperationById(uncertain.operationId))?.subscriptionStatus).toBe(
++      'active',
++    );
++    const hook = vi.fn<SubscriptionEffectsHook>();
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: new WebhookProcessingService(
++        store,
++        undefined,
++        {},
++        {
++          onSubscriptionEffects: hook,
++        },
++      ),
++      consumer: null,
++    });
++
++    await recovery.recover({ workerId: 'w1' });
++
++    expect(hook).toHaveBeenCalledTimes(1);
++    expect(hook.mock.calls[0]?.[1]).toEqual(failingHook.mock.calls[0]?.[1]);
++    const [held] = failingHook.mock.calls;
++    const evidence = await store.findEvidenceById(held![2].evidenceId!);
++    expect(evidence?.processingStatus).toBe('processed');
++    expect(evidence?.errorCode).toBeNull();
++
++    await recovery.recover({ workerId: 'w1' });
++    expect(hook).toHaveBeenCalledTimes(1);
++  });
++});
++
++async function seedSubscription(
++  store: MemoryPaymentReliabilityStore,
++  subscriptionStatus: 'active',
++): Promise<PaymentOperation> {
++  const created = await store.createOperation({
++    ...ctx,
++    idempotencyKey: 'sub-seed',
++    idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++    commandFingerprint: 'fp',
++    kind: 'subscription',
++    subscriptionStatus,
++    providerSubscriptionId: 'I-1',
++    providerReferenceId: 'I-1',
++    providerPlanId: 'P-1',
++  });
++  return store.transitionOperation({
++    operationId: created.operationId,
++    expectedVersion: created.version,
++    nextStatus: 'succeeded',
++    reason: 'seed',
++  });
++}
++
++async function seedUncertainCommand(
++  store: MemoryPaymentReliabilityStore,
++  subscription: PaymentOperation,
++  kind: 'subscription_suspend',
++): Promise<PaymentOperation> {
++  const created = await store.createOperation({
++    ...ctx,
++    idempotencyKey: 'cmd-seed',
++    idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind }),
++    commandFingerprint: 'fp-cmd',
++    kind,
++    parentOperationId: subscription.operationId,
++    providerSubscriptionId: 'I-1',
++    lifecycleReason: 'x',
++  });
++  const claimed = await store.claimOperationForExecution({
++    operationId: created.operationId,
++    expectedVersion: created.version,
++  });
++  return store.transitionOperation({
++    operationId: claimed.operationId,
++    expectedVersion: claimed.version,
++    nextStatus: 'unknown',
++    reason: 'timeout',
++  });
++}
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/__tests__/subscription-core-wiring.unit.test.ts .superpowers/snap-after-t6a/src/core/lib/__tests__/subscription-core-wiring.unit.test.ts
+--- .superpowers/snap-after-t5/src/core/lib/__tests__/subscription-core-wiring.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6a/src/core/lib/__tests__/subscription-core-wiring.unit.test.ts	2026-10-22 14:32:18.404387131 +0300
+@@ -0,0 +1,543 @@
++import { describe, expect, it, vi } from 'vitest';
++import { PAYMENT_RELIABILITY_ERROR, type PaymentOperation } from '../../../contracts/index';
++import type { SubscriptionEffect } from '../../../subscription-core/index';
++import { buildOperationIdempotencyScope } from '../operation-idempotency';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import {
++  SUBSCRIPTION_EFFECTS_HOOK_FAILED,
++  readSubscriptionOperationState,
++  type SubscriptionEffectsHook,
++} from '../subscription-evidence-application';
++import type { SubscriptionProviderPort } from '../subscription-provider-port';
++import { SubscriptionLifecycleService } from '../subscription-lifecycle-service';
++import { WebhookProcessingService } from '../webhook-processing-service';
++
++/*
++ * Issue #4: the engine runs every subscription webhook through the pure core
++ * (normalise -> reduce), persists what the reducer returns and hands the
++ * effects to an optional host hook after the state is stored.
++ */
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'test-app',
++  environment: 'sandbox' as const,
++};
++
++let sequence = 0;
++
++async function seedPlan(
++  store: MemoryPaymentReliabilityStore,
++  price: { amountMinor: string; currencyCode: string } | null = {
++    amountMinor: '999',
++    currencyCode: 'USD',
++  },
++): Promise<PaymentOperation> {
++  sequence += 1;
++  return store.createOperation({
++    ...ctx,
++    idempotencyKey: `plan-${sequence}`,
++    idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'billing_plan' }),
++    commandFingerprint: 'fp-plan',
++    kind: 'billing_plan',
++    planStatus: 'active',
++    providerPlanId: `P-${sequence}`,
++    amountMinor: price?.amountMinor ?? null,
++    currencyCode: price?.currencyCode ?? null,
++  });
++}
++
++async function seedActiveSubscription(
++  store: MemoryPaymentReliabilityStore,
++  options: { plan?: PaymentOperation | null; providerPlanId?: string } = {},
++): Promise<PaymentOperation> {
++  const plan = options.plan === undefined ? await seedPlan(store) : options.plan;
++  sequence += 1;
++  const created = await store.createOperation({
++    ...ctx,
++    idempotencyKey: `sub-${sequence}`,
++    idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++    commandFingerprint: 'fp-sub',
++    kind: 'subscription',
++    parentOperationId: plan?.operationId ?? null,
++    subscriptionStatus: 'approval_pending',
++    providerSubscriptionId: 'I-1',
++    providerReferenceId: 'I-1',
++    providerPlanId: options.providerPlanId ?? plan?.providerPlanId ?? 'P-STORED',
++  });
++  return store.transitionOperation({
++    operationId: created.operationId,
++    expectedVersion: created.version,
++    nextStatus: 'succeeded',
++    subscriptionStatus: 'active',
++    reason: 'seed active',
++  });
++}
++
++function receive(service: WebhookProcessingService, body: Record<string, unknown>) {
++  const rawBody = JSON.stringify(body);
++  return service.receiveWebhook({
++    ...ctx,
++    rawBody,
++    verify: async () => ({
++      verified: true,
++      transmissionId: String(body.id),
++      eventType: String(body.event_type),
++      resourceId: String((body.resource as { id?: string }).id ?? ''),
++    }),
++  });
++}
++
++function saleBody(id: string, saleId: string, total: string, currency = 'USD') {
++  return {
++    id,
++    event_type: 'PAYMENT.SALE.COMPLETED',
++    create_time: '2026-10-22T10:00:00Z',
++    resource: {
++      id: saleId,
++      billing_agreement_id: 'I-1',
++      amount: { total, currency },
++      update_time: '2026-10-22T10:00:00Z',
++    },
++  };
++}
++
++function find(store: MemoryPaymentReliabilityStore) {
++  return store.findOperationByProviderSubscriptionId(
++    ctx.providerCode,
++    ctx.accountRef,
++    ctx.environment,
++    'I-1',
++  );
++}
++
++function recordingHook() {
++  const calls: Array<{ operationId: string; effects: SubscriptionEffect[]; eventType: string }> =
++    [];
++  const hook: SubscriptionEffectsHook = (operationId, effects, context) => {
++    calls.push({ operationId, effects, eventType: context.eventType });
++  };
++  return { calls, hook };
++}
++
++describe('subscription webhooks on the pure core (#4)', () => {
++  it('persists billing fields of an ACTIVATED body without a provider lookup', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const service = new WebhookProcessingService(store);
++    const plan = await seedPlan(store);
++    sequence += 1;
++    const created = await store.createOperation({
++      ...ctx,
++      idempotencyKey: `sub-${sequence}`,
++      idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++      commandFingerprint: 'fp-sub',
++      kind: 'subscription',
++      parentOperationId: plan.operationId,
++      subscriptionStatus: 'approval_pending',
++      providerSubscriptionId: 'I-1',
++      providerPlanId: plan.providerPlanId,
++    });
++    await store.transitionOperation({
++      operationId: created.operationId,
++      expectedVersion: created.version,
++      nextStatus: 'submitted',
++      reason: 'seed',
++    });
++
++    const receipt = await receive(service, {
++      id: 'WH-ACT',
++      event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++      resource: {
++        id: 'I-1',
++        plan_id: plan.providerPlanId,
++        status: 'ACTIVE',
++        start_time: '2026-10-22T00:00:00Z',
++        update_time: '2026-10-22T10:00:00Z',
++        billing_info: {
++          next_billing_time: '2026-11-22T10:00:00Z',
++          last_payment: {
++            amount: { currency_code: 'USD', value: '9.99' },
++            time: '2026-10-22T10:00:00Z',
++          },
++          failed_payments_count: 0,
++        },
++      },
++    });
++
++    expect(receipt.processingStatus).toBe('processed');
++    const operation = await find(store);
++    expect(operation?.subscriptionStatus).toBe('active');
++    expect(operation?.status).toBe('succeeded');
++    expect(operation?.nextBillingTime).toBe('2026-11-22T10:00:00.000Z');
++    expect(operation?.startTime).toBe('2026-10-22T00:00:00.000Z');
++    expect(operation?.subscriptionStateJson).toEqual(expect.any(String));
++    const state = readSubscriptionOperationState(operation as PaymentOperation);
++    expect(state.lastPayment).toEqual({
++      amountMinor: '999',
++      currency: 'USD',
++      time: '2026-10-22T10:00:00.000Z',
++    });
++    expect(state.failedPaymentsCount).toBe(0);
++    expect(state.stateAt).toBe('2026-10-22T10:00:00.000Z');
++  });
++
++  it('applies BILLING.SUBSCRIPTION.UPDATED billing fields without a provider lookup', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const service = new WebhookProcessingService(store);
++    const seeded = await seedActiveSubscription(store);
++
++    const receipt = await receive(service, {
++      id: 'WH-UPD',
++      event_type: 'BILLING.SUBSCRIPTION.UPDATED',
++      resource: {
++        id: 'I-1',
++        status: 'ACTIVE',
++        update_time: '2026-10-23T10:00:00Z',
++        billing_info: { next_billing_time: '2026-12-22T10:00:00Z' },
++      },
++    });
++
++    expect(receipt.processingStatus).toBe('processed');
++    const operation = await store.findOperationById(seeded.operationId);
++    expect(operation?.subscriptionStatus).toBe('active');
++    expect(operation?.nextBillingTime).toBe('2026-12-22T10:00:00.000Z');
++  });
++
++  it('records a completed sale as the last payment and calls the hook after persisting', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const seeded = await seedActiveSubscription(store);
++    const seenInHook: Array<unknown> = [];
++    const hook: SubscriptionEffectsHook = async (operationId, effects, context) => {
++      const stored = await store.findOperationById(operationId);
++      seenInHook.push({
++        lastPayment: readSubscriptionOperationState(stored as PaymentOperation).lastPayment,
++        effects,
++        evidenceId: context.evidenceId,
++        source: context.source,
++      });
++    };
++    const service = new WebhookProcessingService(
++      store,
++      undefined,
++      {},
++      {
++        onSubscriptionEffects: hook,
++      },
++    );
++
++    const receipt = await receive(service, saleBody('WH-S1', 'SALE-1', '9.99'));
++
++    expect(receipt.processingStatus).toBe('processed');
++    const lastPayment = {
++      amountMinor: '999',
++      currency: 'USD',
++      time: '2026-10-22T10:00:00.000Z',
++    };
++    expect(
++      readSubscriptionOperationState((await store.findOperationById(seeded.operationId))!)
++        .lastPayment,
++    ).toEqual(lastPayment);
++    expect(seenInHook).toEqual([
++      {
++        lastPayment,
++        effects: [
++          {
++            type: 'payment_completed',
++            amountMinor: '999',
++            currency: 'USD',
++            saleId: 'SALE-1',
++            time: '2026-10-22T10:00:00.000Z',
++          },
++        ],
++        evidenceId: receipt.evidenceId,
++        source: 'webhook',
++      },
++    ]);
++  });
++
++  it('reports a sale in another currency than the stored plan price and does not record it', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const seeded = await seedActiveSubscription(store);
++    const { calls, hook } = recordingHook();
++    const service = new WebhookProcessingService(
++      store,
++      undefined,
++      {},
++      {
++        onSubscriptionEffects: hook,
++      },
++    );
++
++    const receipt = await receive(service, saleBody('WH-JPY', 'SALE-JPY', '1', 'JPY'));
++
++    expect(receipt.processingStatus).toBe('processed');
++    const stored = await store.findOperationById(seeded.operationId);
++    expect(readSubscriptionOperationState(stored!).lastPayment).toBeNull();
++    expect(calls.map((call) => call.effects)).toEqual([
++      [
++        {
++          type: 'currency_mismatch',
++          expectedCurrency: 'USD',
++          actualCurrency: 'JPY',
++          saleId: 'SALE-JPY',
++        },
++      ],
++    ]);
++  });
++
++  it('reports a sale below the stored plan price as amount_mismatch', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const seeded = await seedActiveSubscription(store);
++    const { calls, hook } = recordingHook();
++    const service = new WebhookProcessingService(
++      store,
++      undefined,
++      {},
++      {
++        onSubscriptionEffects: hook,
++      },
++    );
++
++    await receive(service, saleBody('WH-LOW', 'SALE-LOW', '0.01'));
++
++    const stored = await store.findOperationById(seeded.operationId);
++    expect(readSubscriptionOperationState(stored!).lastPayment).toBeNull();
++    expect(calls[0]?.effects).toEqual([
++      {
++        type: 'amount_mismatch',
++        expected: { amountMinor: '999', currency: 'USD' },
++        actual: { amountMinor: '1', currency: 'USD' },
++        saleId: 'SALE-LOW',
++      },
++    ]);
++  });
++
++  it('counts BILLING.SUBSCRIPTION.PAYMENT.FAILED and reports payment_failed', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const seeded = await seedActiveSubscription(store);
++    const { calls, hook } = recordingHook();
++    const service = new WebhookProcessingService(
++      store,
++      undefined,
++      {},
++      {
++        onSubscriptionEffects: hook,
++      },
++    );
++
++    for (const id of ['WH-F1', 'WH-F2']) {
++      const receipt = await receive(service, {
++        id,
++        event_type: 'BILLING.SUBSCRIPTION.PAYMENT.FAILED',
++        resource: { id: 'I-1' },
++      });
++      expect(receipt.processingStatus).toBe('processed');
++    }
++
++    const stored = await store.findOperationById(seeded.operationId);
++    expect(readSubscriptionOperationState(stored!).failedPaymentsCount).toBe(2);
++    expect(stored?.subscriptionStatus).toBe('active');
++    expect(calls.map((call) => call.effects)).toEqual([
++      [{ type: 'payment_failed', failedPaymentsCount: 1, outstandingBalance: null }],
++      [{ type: 'payment_failed', failedPaymentsCount: 2, outstandingBalance: null }],
++    ]);
++  });
++
++  it('reports a refund as refund_or_reversal', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    await seedActiveSubscription(store);
++    const { calls, hook } = recordingHook();
++    const service = new WebhookProcessingService(
++      store,
++      undefined,
++      {},
++      {
++        onSubscriptionEffects: hook,
++      },
++    );
++
++    const receipt = await receive(service, {
++      id: 'WH-REF',
++      event_type: 'PAYMENT.SALE.REFUNDED',
++      resource: {
++        id: 'REFUND-1',
++        sale_id: 'SALE-1',
++        billing_agreement_id: 'I-1',
++        amount: { total: '-9.99', currency: 'USD' },
++      },
++    });
++
++    expect(receipt.processingStatus).toBe('processed');
++    expect(calls[0]?.effects).toEqual([
++      {
++        type: 'refund_or_reversal',
++        eventType: 'PAYMENT.SALE.REFUNDED',
++        amountMinor: '-999',
++        currency: 'USD',
++        saleId: 'SALE-1',
++      },
++    ]);
++  });
++
++  it('a completed sale redelivered under a new webhook id is not recorded twice', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    await seedActiveSubscription(store);
++    const { calls, hook } = recordingHook();
++    const service = new WebhookProcessingService(
++      store,
++      undefined,
++      {},
++      {
++        onSubscriptionEffects: hook,
++      },
++    );
++
++    await receive(service, saleBody('WH-D1', 'SALE-D', '9.99'));
++    const second = await receive(service, saleBody('WH-D2', 'SALE-D', '9.99'));
++
++    expect(second.processingStatus).toBe('processed');
++    expect(calls).toHaveLength(1);
++  });
++
++  it('detects a plan mismatch from the event body without a provider lookup', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const plan = await seedPlan(store);
++    sequence += 1;
++    const created = await store.createOperation({
++      ...ctx,
++      idempotencyKey: `sub-${sequence}`,
++      idempotencyScope: buildOperationIdempotencyScope({ ...ctx, kind: 'subscription' }),
++      commandFingerprint: 'fp-sub',
++      kind: 'subscription',
++      parentOperationId: plan.operationId,
++      subscriptionStatus: 'approval_pending',
++      providerSubscriptionId: 'I-1',
++      providerPlanId: plan.providerPlanId,
++    });
++    const seeded = await store.transitionOperation({
++      operationId: created.operationId,
++      expectedVersion: created.version,
++      nextStatus: 'submitted',
++      reason: 'seed',
++    });
++    const { calls, hook } = recordingHook();
++    const service = new WebhookProcessingService(
++      store,
++      undefined,
++      {},
++      {
++        onSubscriptionEffects: hook,
++      },
++    );
++
++    const receipt = await receive(service, {
++      id: 'WH-PLAN',
++      event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++      resource: { id: 'I-1', plan_id: 'P-OTHER', status: 'ACTIVE' },
++    });
++
++    expect(receipt.processingStatus).toBe('pending');
++    const evidence = await store.findEvidenceById(receipt.evidenceId);
++    expect(evidence?.errorCode).toBe(PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH);
++    const after = await store.findOperationById(seeded.operationId);
++    expect(after?.subscriptionStatus).toBe('approval_pending');
++    expect(after?.providerPlanId).toBe(plan.providerPlanId);
++    expect(after?.version).toBe(seeded.version);
++    expect(calls[0]?.effects).toEqual([
++      { type: 'plan_mismatch', expectedPlanId: plan.providerPlanId, actualPlanId: 'P-OTHER' },
++    ]);
++  });
++
++  it('keeps the evidence retryable when the hook throws and delivers the effects on reprocessing', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const seeded = await seedActiveSubscription(store);
++    const hook = vi
++      .fn<SubscriptionEffectsHook>()
++      .mockRejectedValueOnce(new Error('host database is down'))
++      .mockResolvedValue(undefined);
++    const service = new WebhookProcessingService(
++      store,
++      undefined,
++      {},
++      {
++        onSubscriptionEffects: hook,
++      },
++    );
++
++    const receipt = await receive(service, saleBody('WH-H', 'SALE-H', '9.99'));
++
++    expect(receipt.processingStatus).toBe('pending');
++    const failed = await store.findEvidenceById(receipt.evidenceId);
++    expect(failed?.errorCode).toBe(SUBSCRIPTION_EFFECTS_HOOK_FAILED);
++    expect(failed?.errorMessage ?? '').not.toContain('host database');
++    expect(
++      readSubscriptionOperationState((await store.findOperationById(seeded.operationId))!)
++        .lastPayment?.amountMinor,
++    ).toBe('999');
++
++    const retried = await service.reprocessStoredWebhookEvidence(receipt.evidenceId);
++
++    expect(retried.processingStatus).toBe('processed');
++    expect(hook).toHaveBeenCalledTimes(2);
++    expect(hook.mock.calls[1]?.[1]).toEqual(hook.mock.calls[0]?.[1]);
++    expect(hook.mock.calls[1]?.[1]).toEqual([
++      expect.objectContaining({ type: 'payment_completed', saleId: 'SALE-H' }),
++    ]);
++    const evidence = await store.findEvidenceById(receipt.evidenceId);
++    expect(evidence?.errorCode).toBeNull();
++
++    // Once delivered, the effects are not delivered again.
++    await service.reprocessStoredWebhookEvidence(receipt.evidenceId);
++    expect(hook).toHaveBeenCalledTimes(2);
++  });
++
++  it('createBillingPlan stores the lowest paid cycle price as the expected payment', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const provider = {
++      createProduct: async () => ({ providerProductId: 'PROD-1', productStatus: 'created' }),
++      createPlan: async () => ({
++        providerPlanId: 'P-PRICED',
++        providerProductId: 'PROD-1',
++        planStatus: 'active',
++      }),
++    } as unknown as SubscriptionProviderPort;
++    const service = new SubscriptionLifecycleService(store, provider);
++    const product = await service.createCatalogProduct({
++      ...ctx,
++      idempotencyKey: 'prod-priced',
++      name: 'Premium',
++      type: 'SERVICE',
++    });
++
++    const plan = await service.createBillingPlan({
++      ...ctx,
++      idempotencyKey: 'plan-priced',
++      productOperationId: product.productOperationId,
++      name: 'Monthly',
++      billingCycles: [
++        {
++          tenureType: 'TRIAL',
++          intervalUnit: 'MONTH',
++          intervalCount: 1,
++          sequence: 1,
++          totalCycles: 1,
++          price: { currency: 'USD', amountMinor: '0' },
++        },
++        {
++          tenureType: 'REGULAR',
++          intervalUnit: 'MONTH',
++          intervalCount: 1,
++          sequence: 2,
++          totalCycles: 0,
++          price: { currency: 'USD', amountMinor: '999' },
++        },
++      ],
++      paymentPreferences: {},
++    });
++
++    const stored = await store.findOperationById(plan.planOperationId);
++    expect(stored?.amountMinor).toBe('999');
++    expect(stored?.currencyCode).toBe('USD');
++  });
++});
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/__tests__/webhook-payload-hash-resume.unit.test.ts .superpowers/snap-after-t6a/src/core/lib/__tests__/webhook-payload-hash-resume.unit.test.ts
+--- .superpowers/snap-after-t5/src/core/lib/__tests__/webhook-payload-hash-resume.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t6a/src/core/lib/__tests__/webhook-payload-hash-resume.unit.test.ts	2026-10-22 14:32:18.404458787 +0300
+@@ -0,0 +1,108 @@
++import { describe, expect, it, vi } from 'vitest';
++import { PAYMENT_RELIABILITY_ERROR, PaymentReliabilityError } from '../../../contracts/index';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import {
++  WebhookEventPayloadMismatchError,
++  WebhookProcessingService,
++} from '../webhook-processing-service';
++
++/* T3 review finding 7: a stored event id is resumed only with the body it was stored with. */
++
++const ctx = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'test-app',
++  environment: 'sandbox' as const,
++};
++
++const original = JSON.stringify({
++  id: 'WH-HASH',
++  event_type: 'BILLING.SUBSCRIPTION.CANCELLED',
++  resource: { id: 'I-HASH' },
++});
++
++const tampered = JSON.stringify({
++  id: 'WH-HASH',
++  event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++  resource: { id: 'I-HASH' },
++});
++
++function unavailable() {
++  return vi.fn(async () => ({
++    verified: false,
++    transmissionId: 't',
++    failureKind: 'verification_unavailable' as const,
++    unavailableReason: 'PayPal verify endpoint unavailable',
++  }));
++}
++
++describe('receiveWebhook resume compares the payload hash', () => {
++  it('rejects a different body under a stored event id before any processing', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const service = new WebhookProcessingService(store);
++    await expect(
++      service.receiveWebhook({ ...ctx, rawBody: original, verify: unavailable() }),
++    ).rejects.toMatchObject({ code: PAYMENT_RELIABILITY_ERROR.VERIFICATION_UNAVAILABLE });
++    const stored = await store.findEvidenceByProviderEvent(
++      ctx.providerCode,
++      ctx.accountRef,
++      ctx.environment,
++      'WH-HASH',
++    );
++    const updateSpy = vi.spyOn(store, 'updateEvidence');
++    const verify = vi.fn();
++
++    const rejection = await service
++      .receiveWebhook({ ...ctx, rawBody: tampered, verify })
++      .catch((error: unknown) => error);
++
++    expect(rejection).toBeInstanceOf(WebhookEventPayloadMismatchError);
++    expect(rejection).toBeInstanceOf(PaymentReliabilityError);
++    expect((rejection as PaymentReliabilityError).code).toBe(
++      PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
++    );
++    expect(verify).not.toHaveBeenCalled();
++    expect(updateSpy).not.toHaveBeenCalled();
++    const after = await store.findEvidenceById(stored!.evidenceId);
++    expect(after?.rawPayload).toBe(original);
++    expect(after?.payloadSha256).toBe(stored?.payloadSha256);
++  });
++
++  it('rejects a different body even when the stored event was already processed', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const service = new WebhookProcessingService(store);
++    const verified = async () => ({
++      verified: true,
++      transmissionId: 't',
++      eventType: 'BILLING.SUBSCRIPTION.CANCELLED',
++      resourceId: 'I-HASH',
++    });
++    await service.receiveWebhook({ ...ctx, rawBody: original, verify: verified });
++
++    await expect(
++      service.receiveWebhook({ ...ctx, rawBody: tampered, verify: verified }),
++    ).rejects.toBeInstanceOf(WebhookEventPayloadMismatchError);
++  });
++
++  it('resumes the stored event when the same body is redelivered', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const service = new WebhookProcessingService(store);
++    await expect(
++      service.receiveWebhook({ ...ctx, rawBody: original, verify: unavailable() }),
++    ).rejects.toMatchObject({ code: PAYMENT_RELIABILITY_ERROR.VERIFICATION_UNAVAILABLE });
++
++    const receipt = await service.receiveWebhook({
++      ...ctx,
++      rawBody: original,
++      verify: async () => ({
++        verified: true,
++        transmissionId: 't',
++        eventType: 'BILLING.SUBSCRIPTION.CANCELLED',
++        resourceId: 'I-HASH',
++      }),
++    });
++
++    expect(receipt.verificationStatus).toBe('verified');
++    expect(receipt.processingStatus).toBe('unmatched');
++  });
++});
+diff --color -ruN .superpowers/snap-after-t5/src/core/lib/webhook-processing-service.ts .superpowers/snap-after-t6a/src/core/lib/webhook-processing-service.ts
+--- .superpowers/snap-after-t5/src/core/lib/webhook-processing-service.ts	2026-10-22 14:01:57.493167995 +0300
++++ .superpowers/snap-after-t6a/src/core/lib/webhook-processing-service.ts	2026-10-22 14:32:18.405784296 +0300
+@@ -4,7 +4,6 @@
+   type PaymentOperationStatus,
+   type PaypalWebhookTransmissionHeaders,
+   type ProviderEvidenceRecord,
+-  type SubscriptionStatus,
+   type VerifyWebhookResult,
+   type WebhookReceiptResponse,
+ } from '../../contracts/index';
+@@ -22,19 +21,24 @@
+   parsePaypalPayoutWebhookPayload,
+ } from './payout-webhook-correlation';
+ import {
++  SUBSCRIPTION_EFFECTS_HOOK_FAILED,
+   applyPlanTransition,
+-  applySubscriptionTransition,
++  applySubscriptionEvents,
++  deliverSubscriptionEffects,
++  normalizeSubscriptionEvidencePayload,
++  readHeldSubscriptionEffects,
++  resolveExpectedSubscriptionPayment,
++  subscriptionEventFromProviderSnapshot,
++  type SubscriptionEffectsHooks,
++  type SubscriptionEventStep,
+ } from './subscription-evidence-application';
+ import {
+   isSubscriptionPaymentEvidenceEvent,
+   isSubscriptionWebhookProviderRefreshEvent,
+   mapPlanWebhookEventToStatus,
+   mapSubscriptionWebhookEventToStatus,
+-  parseSubscriptionResourceStateTimestamp,
+ } from './subscription-transition-policy';
+ import type { ReconciliationProviderLookup } from './checkout-provider-port';
+-import { subscriptionBillingFieldsFromProviderSnapshot } from './subscription-provider-snapshot-fields';
+-import { assertSubscriptionProviderPlanSnapshotConsistent } from './subscription-provider-plan-consistency';
+ import { resolveProviderFailure } from './resolve-provider-failure';
+ import { sanitizeOperationalErrorMessage } from './public-error-sanitizer';
+ import {
+@@ -62,6 +66,7 @@
+ } from './persistence/store-capabilities';
+ import { sha256Payload } from './sha256-payload';
+ import { deriveProviderEventId } from '../../subscription-core/lib/normalize-paypal-subscription-event';
++import type { NormalizedSubscriptionEvent } from '../../subscription-core/lib/subscription-core-types';
+ import { parseProviderTimestamp } from '../../subscription-core/lib/subscription-status-rules';
+ import { PaymentConfigurationError } from './payment-configuration-error';
+ import {
+@@ -202,11 +207,54 @@
+   return new TextEncoder().encode(text).byteLength > maxBytes;
+ }
+ 
++/**
++ * A known provider event id was received again with a different body. Rejected before any
++ * processing: the stored body is the one that was (or will be) verified and applied.
++ */
++export class WebhookEventPayloadMismatchError extends PaymentReliabilityError {
++  constructor() {
++    super(
++      PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
++      'Webhook body differs from the stored body of the same provider event id',
++    );
++    this.name = 'WebhookEventPayloadMismatchError';
++  }
++}
++
+ export type WebhookSubscriptionProviderLookup = Pick<
+   ReconciliationProviderLookup,
+   'getSubscription'
+ >;
+ 
++/** Events the pure subscription core reduces: subscription lifecycle, failed payments and sales. */
++function isSubscriptionEvidenceEvent(eventType: string): boolean {
++  return (
++    mapSubscriptionWebhookEventToStatus(eventType) !== null ||
++    isSubscriptionWebhookProviderRefreshEvent(eventType) ||
++    isSubscriptionPaymentEvidenceEvent(eventType)
++  );
++}
++
++function isSubscriptionPaymentEvent(event: NormalizedSubscriptionEvent): boolean {
++  return event.resourceType === 'sale' || isSubscriptionPaymentEvidenceEvent(event.eventType);
++}
++
++/** Billing fields the snapshot lacks are taken from the webhook body. */
++function snapshotWithWebhookFallbacks(
++  snapshot: NormalizedSubscriptionEvent,
++  webhook: NormalizedSubscriptionEvent,
++): NormalizedSubscriptionEvent {
++  return {
++    ...snapshot,
++    providerPlanId: snapshot.providerPlanId ?? webhook.providerPlanId,
++    nextBillingTime: snapshot.nextBillingTime ?? webhook.nextBillingTime,
++    startTime: snapshot.startTime ?? webhook.startTime,
++    lastPayment: snapshot.lastPayment ?? webhook.lastPayment,
++    failedPaymentsCount: snapshot.failedPaymentsCount ?? webhook.failedPaymentsCount,
++    outstandingBalance: snapshot.outstandingBalance ?? webhook.outstandingBalance,
++  };
++}
++
+ /**
+  * A `SubscriptionStore` is enough. Checkout, payout, seller and marketplace events are applied only
+  * when the store has that capability; otherwise their evidence is recorded as `unsupported`. A
+@@ -223,6 +271,8 @@
+     private readonly store: WebhookProcessingStore,
+     private readonly subscriptionProviderLookup?: WebhookSubscriptionProviderLookup,
+     private readonly intakeOptions: WebhookIntakeOptions = {},
++    /** Optional host hooks; `onSubscriptionEffects` gets the reducer's effects after each save. */
++    private readonly hooks: SubscriptionEffectsHooks = {},
+   ) {
+     assertStoreCapabilitiesComplete(store);
+     this.transmissionWindow = resolveTransmissionWindow(intakeOptions);
+@@ -340,6 +390,9 @@
+     evidence: ProviderEvidenceRecord,
+     input: AcceptedWebhookInput,
+   ): Promise<WebhookReceiptResponse> {
++    if (sha256Payload(input.rawBody) !== evidence.payloadSha256) {
++      throw new WebhookEventPayloadMismatchError();
++    }
+     const action = classifyWebhookEvidenceResume(evidence);
+     if (action === 'ack_duplicate') {
+       return Promise.resolve(this.toReceipt(evidence, true));
+@@ -474,13 +527,11 @@
+       return this.processPayoutWebhook(this.store, current, payoutFinancialStatus, rawBody);
+     }
+ 
+-    const subscriptionRefreshOnly =
+-      current.eventType != null && isSubscriptionWebhookProviderRefreshEvent(current.eventType);
+-    const subscriptionStatus = current.eventType
+-      ? mapSubscriptionWebhookEventToStatus(current.eventType)
+-      : null;
+-    if (subscriptionStatus || subscriptionRefreshOnly) {
+-      return this.processSubscriptionWebhook(current, subscriptionStatus, rawBody);
++    if (current.eventType && isSubscriptionEvidenceEvent(current.eventType)) {
++      return this.processSubscriptionEvidence(current, rawBody);
++    }
++    if (current.errorCode === SUBSCRIPTION_EFFECTS_HOOK_FAILED && current.relatedOperationId) {
++      return this.redeliverHeldSubscriptionEffects(current, current.relatedOperationId);
+     }
+ 
+     const planStatus = current.eventType ? mapPlanWebhookEventToStatus(current.eventType) : null;
+@@ -488,13 +539,6 @@
+       return this.processPlanWebhook(current, planStatus);
+     }
+ 
+-    if (current.eventType && isSubscriptionPaymentEvidenceEvent(current.eventType)) {
+-      return this.processSubscriptionPaymentEvidence({
+-        ...current,
+-        rawPayload: rawBody,
+-      });
+-    }
+-
+     if (current.eventType && isSellerOnboardingWebhookEvent(current.eventType)) {
+       if (!hasSellerStore(this.store)) {
+         return this.markUnsupported(current.evidenceId);
+@@ -560,6 +604,8 @@
+     input: {
+       relatedOperationId?: string | null;
+       resourceId?: string | null;
++      /** Clear the error of an earlier failed attempt (subscription evidence). */
++      clearError?: boolean;
+     } = {},
+   ): Promise<ProviderEvidenceRecord> {
+     const existing = await this.store.findEvidenceById(evidenceId);
+@@ -576,6 +622,7 @@
+       resourceId: input.resourceId,
+       processingStatus: 'processed',
+       processedAt: new Date().toISOString(),
++      ...(input.clearError ? { errorCode: null, errorMessage: null } : {}),
+       ...deliveryFields,
+     });
+   }
+@@ -924,25 +971,28 @@
+     );
+   }
+ 
+-  private async processSubscriptionWebhook(
+-    evidence: {
+-      evidenceId: string;
+-      providerCode: string;
+-      accountRef: string;
+-      applicationRef: string;
+-      environment: 'sandbox' | 'live';
+-      eventType: string | null;
+-      resourceId: string | null;
+-      verificationStatus: WebhookReceiptResponse['verificationStatus'];
+-      processingStatus: WebhookReceiptResponse['processingStatus'];
+-    },
+-    eventSubscriptionStatus: SubscriptionStatus | null,
++  /**
++   * Subscription and subscription-payment events (`BILLING.SUBSCRIPTION.*`, `PAYMENT.SALE.*`): the
++   * stored body is normalised and reduced by the pure core, the result persisted, then the effects
++   * go to the host hook. With a provider lookup, a status event is applied as the provider's
++   * current snapshot (ordered by the snapshot's state time); payment events never need a lookup.
++   */
++  private async processSubscriptionEvidence(
++    evidence: ProviderEvidenceRecord,
+     rawPayload: string,
+   ): Promise<WebhookReceiptResponse> {
+     assertVerifiedEvidence(evidence.verificationStatus);
+ 
+-    const operation = await this.findCorrelatedSubscriptionOperation(evidence);
+-    if (!operation) {
++    const event = normalizeSubscriptionEvidencePayload(rawPayload, evidence.providerEventId);
++    const operation = event
++      ? await this.store.findOperationByProviderSubscriptionId(
++          evidence.providerCode,
++          evidence.accountRef,
++          evidence.environment,
++          event.providerSubscriptionId,
++        )
++      : null;
++    if (!event || !operation) {
+       const updated = await this.store.updateEvidence({
+         evidenceId: evidence.evidenceId,
+         processingStatus: 'unmatched',
+@@ -951,118 +1001,149 @@
+       return this.toReceipt(updated, false);
+     }
+ 
+-    if (!this.subscriptionProviderLookup) {
+-      if (!eventSubscriptionStatus) {
+-        const updated = await this.store.updateEvidence({
+-          evidenceId: evidence.evidenceId,
+-          processingStatus: 'unsupported',
+-          processedAt: new Date().toISOString(),
++    let step: SubscriptionEventStep;
++    if (isSubscriptionPaymentEvent(event) || !this.subscriptionProviderLookup) {
++      step = {
++        event,
++        options: {
++          source: 'webhook',
++          expectedPayment:
++            event.resourceType === 'sale'
++              ? await resolveExpectedSubscriptionPayment(this.store, operation)
++              : null,
++        },
++      };
++    } else {
++      let lookup;
++      try {
++        lookup = await this.subscriptionProviderLookup.getSubscription({
++          providerCode: evidence.providerCode,
++          accountRef: evidence.accountRef,
++          applicationRef: evidence.applicationRef,
++          environment: evidence.environment,
++          providerSubscriptionId: operation.providerSubscriptionId ?? event.providerSubscriptionId,
+         });
+-        return this.toReceipt(updated, false);
++      } catch (error) {
++        return this.leaveSubscriptionWebhookRefreshRecoverable(
++          evidence.evidenceId,
++          operation.operationId,
++          error,
++        );
+       }
+-
+-      await applySubscriptionTransition(this.store, {
+-        operation,
+-        subscriptionStatus: eventSubscriptionStatus,
+-        evidenceId: evidence.evidenceId,
+-        reason: `Webhook ${evidence.eventType ?? 'unknown'}`,
+-        providerReferenceId: evidence.resourceId,
+-        providerSubscriptionId: evidence.resourceId,
+-        providerStateTimestamp: parseSubscriptionResourceStateTimestamp(rawPayload),
+-        applySource: 'webhook',
+-      });
+-
+-      const updatedEvidence = await this.markFinancialProcessed(evidence.evidenceId, {
+-        relatedOperationId: operation.operationId,
+-      });
+-
+-      return this.toReceipt(updatedEvidence, false);
+-    }
+-
+-    const providerSubscriptionId =
+-      operation.providerSubscriptionId ?? evidence.resourceId ?? undefined;
+-    if (!providerSubscriptionId) {
+-      const updated = await this.store.updateEvidence({
+-        evidenceId: evidence.evidenceId,
+-        processingStatus: 'unmatched',
+-        processedAt: new Date().toISOString(),
+-      });
+-      return this.toReceipt(updated, false);
+-    }
+-
+-    let lookup;
+-    try {
+-      lookup = await this.subscriptionProviderLookup.getSubscription({
+-        providerCode: evidence.providerCode,
+-        accountRef: evidence.accountRef,
+-        applicationRef: evidence.applicationRef,
+-        environment: evidence.environment,
+-        providerSubscriptionId,
+-      });
+-    } catch (error) {
+-      return this.leaveSubscriptionWebhookRefreshRecoverable(
+-        evidence.evidenceId,
+-        operation.operationId,
+-        error,
++      const snapshotEvent = snapshotWithWebhookFallbacks(
++        subscriptionEventFromProviderSnapshot(
++          operation.providerSubscriptionId ?? event.providerSubscriptionId,
++          lookup,
++          {
++            providerEventId: event.providerEventId,
++            eventType: event.eventType,
++            fallbackStatus: event.subscriptionStatus,
++          },
++        ),
++        event,
+       );
++      if (!snapshotEvent.subscriptionStatus && operation.subscriptionStatus === 'unknown') {
++        return this.leaveSubscriptionWebhookRefreshRecoverable(
++          evidence.evidenceId,
++          operation.operationId,
++          new PaymentReliabilityError(
++            PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
++            'Subscription provider state remains unknown',
++          ),
++        );
++      }
++      // Ordered as a webhook by the snapshot's own state time, as the event body's time may be older.
++      step = { event: snapshotEvent, options: { source: 'webhook' } };
+     }
+ 
+-    const recognizedProviderStatus =
+-      lookup.subscriptionStatus && lookup.subscriptionStatus !== 'unknown'
+-        ? lookup.subscriptionStatus
+-        : null;
+-    const subscriptionStatus =
+-      recognizedProviderStatus ??
+-      eventSubscriptionStatus ??
+-      operation.subscriptionStatus ??
+-      'approval_pending';
++    const applied = await applySubscriptionEvents(this.store, {
++      operation,
++      steps: [step],
++      evidenceId: evidence.evidenceId,
++      reason: `Webhook ${event.eventType}`,
++      holdEffects: Boolean(this.hooks.onSubscriptionEffects),
++    });
++    const delivery = await deliverSubscriptionEffects(this.store, this.hooks, applied, {
++      evidenceId: evidence.evidenceId,
++      eventType: event.eventType,
++      source: 'webhook',
++    });
+ 
+-    if (subscriptionStatus === 'unknown') {
++    if (applied.planMismatch) {
+       return this.leaveSubscriptionWebhookRefreshRecoverable(
+         evidence.evidenceId,
+         operation.operationId,
+         new PaymentReliabilityError(
+-          PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+-          'Subscription provider state remains unknown',
++          PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
++          'Subscription event plan does not match the stored plan',
+         ),
+       );
+     }
+-
+-    try {
+-      assertSubscriptionProviderPlanSnapshotConsistent(operation, lookup);
+-    } catch (error) {
+-      return this.leaveSubscriptionWebhookRefreshRecoverable(
+-        evidence.evidenceId,
+-        operation.operationId,
+-        error,
+-      );
++    if (!delivery.delivered) {
++      return this.markSubscriptionEffectsHookFailed(evidence.evidenceId, operation.operationId);
+     }
+ 
+-    const providerStateTimestamp =
+-      lookup.providerSubscriptionStateAt != null &&
+-      lookup.providerSubscriptionStateAt.trim().length > 0
+-        ? lookup.providerSubscriptionStateAt
+-        : null;
+-
+-    await applySubscriptionTransition(this.store, {
+-      operation,
+-      subscriptionStatus,
+-      evidenceId: evidence.evidenceId,
+-      reason: `Webhook ${evidence.eventType ?? 'unknown'}`,
+-      providerReferenceId: evidence.resourceId,
+-      providerSubscriptionId: evidence.resourceId,
+-      providerStateTimestamp,
+-      applySource: 'webhook',
+-      ...subscriptionBillingFieldsFromProviderSnapshot(lookup),
+-    });
+-
+     const updatedEvidence = await this.markFinancialProcessed(evidence.evidenceId, {
+       relatedOperationId: operation.operationId,
++      clearError: true,
+     });
+-
+     return this.toReceipt(updatedEvidence, false);
+   }
+ 
++  /**
++   * Evidence that is not a webhook event (a reconciliation lookup) whose state was saved but whose
++   * hook failed: deliver the effects held on the subscription operation, then mark it processed.
++   */
++  private async redeliverHeldSubscriptionEffects(
++    evidence: ProviderEvidenceRecord,
++    operationId: string,
++  ): Promise<WebhookReceiptResponse> {
++    const operation = await this.store.findOperationById(operationId);
++    const effects = operation ? readHeldSubscriptionEffects(operation, evidence.evidenceId) : [];
++    if (operation && effects.length > 0) {
++      const delivery = await deliverSubscriptionEffects(
++        this.store,
++        this.hooks,
++        {
++          operation,
++          decision: 'applied',
++          reason: null,
++          planMismatch: false,
++          effects,
++          effectsHeld: true,
++        },
++        {
++          evidenceId: evidence.evidenceId,
++          eventType: evidence.eventType ?? 'unknown',
++          source: 'reconciliation',
++        },
++      );
++      if (!delivery.delivered) {
++        return this.markSubscriptionEffectsHookFailed(evidence.evidenceId, operationId);
++      }
++    }
++    const processed = await this.markFinancialProcessed(evidence.evidenceId, {
++      relatedOperationId: operationId,
++      clearError: true,
++    });
++    return this.toReceipt(processed, false);
++  }
++
++  private async markSubscriptionEffectsHookFailed(
++    evidenceId: string,
++    operationId: string,
++  ): Promise<WebhookReceiptResponse> {
++    const updated = await this.store.updateEvidence({
++      evidenceId,
++      relatedOperationId: operationId,
++      processingStatus: 'pending',
++      errorCode: SUBSCRIPTION_EFFECTS_HOOK_FAILED,
++      errorMessage: 'Subscription effects hook failed; the effects are delivered again on retry',
++      processedAt: null,
++    });
++    return this.toReceipt(updated, false);
++  }
++
+   private async leaveSubscriptionWebhookRefreshRecoverable(
+     evidenceId: string,
+     operationId: string,
+@@ -1121,82 +1202,6 @@
+     return this.toReceipt(updatedEvidence, false);
+   }
+ 
+-  private async processSubscriptionPaymentEvidence(evidence: {
+-    evidenceId: string;
+-    providerCode: string;
+-    accountRef: string;
+-    environment: 'sandbox' | 'live';
+-    eventType: string | null;
+-    resourceId: string | null;
+-    verificationStatus: WebhookReceiptResponse['verificationStatus'];
+-    processingStatus: WebhookReceiptResponse['processingStatus'];
+-    rawPayload?: string;
+-  }): Promise<WebhookReceiptResponse> {
+-    assertVerifiedEvidence(evidence.verificationStatus);
+-
+-    const billingAgreementId = this.resolveBillingAgreementId(evidence);
+-    const operation = billingAgreementId
+-      ? await this.store.findOperationByProviderSubscriptionId(
+-          evidence.providerCode,
+-          evidence.accountRef,
+-          evidence.environment,
+-          billingAgreementId,
+-        )
+-      : null;
+-
+-    if (!operation) {
+-      const updated = await this.store.updateEvidence({
+-        evidenceId: evidence.evidenceId,
+-        processingStatus: 'unmatched',
+-        processedAt: new Date().toISOString(),
+-      });
+-      return this.toReceipt(updated, false);
+-    }
+-
+-    const updatedEvidence = await this.markFinancialProcessed(evidence.evidenceId, {
+-      relatedOperationId: operation.operationId,
+-    });
+-
+-    return this.toReceipt(updatedEvidence, false);
+-  }
+-
+-  private resolveBillingAgreementId(evidence: {
+-    resourceId: string | null;
+-    rawPayload?: string;
+-  }): string | null {
+-    if (evidence.rawPayload) {
+-      try {
+-        const parsed = JSON.parse(evidence.rawPayload) as {
+-          resource?: { billing_agreement_id?: string; id?: string };
+-        };
+-        if (parsed.resource?.billing_agreement_id) {
+-          return parsed.resource.billing_agreement_id;
+-        }
+-      } catch {
+-        // fall through
+-      }
+-    }
+-    return evidence.resourceId;
+-  }
+-
+-  private async findCorrelatedSubscriptionOperation(evidence: {
+-    providerCode: string;
+-    accountRef: string;
+-    environment: 'sandbox' | 'live';
+-    resourceId: string | null;
+-  }) {
+-    const resourceId = evidence.resourceId;
+-    if (!resourceId) {
+-      return null;
+-    }
+-    return this.store.findOperationByProviderSubscriptionId(
+-      evidence.providerCode,
+-      evidence.accountRef,
+-      evidence.environment,
+-      resourceId,
+-    );
+-  }
+-
+   private async findCorrelatedPlanOperation(evidence: {
+     providerCode: string;
+     accountRef: string;
+diff --color -ruN .superpowers/snap-after-t5/src/paypal/lib/paypal-subscription-executor.ts .superpowers/snap-after-t6a/src/paypal/lib/paypal-subscription-executor.ts
+--- .superpowers/snap-after-t5/src/paypal/lib/paypal-subscription-executor.ts	2026-10-22 14:01:57.495344110 +0300
++++ .superpowers/snap-after-t6a/src/paypal/lib/paypal-subscription-executor.ts	2026-10-22 14:32:18.408860695 +0300
+@@ -31,6 +31,10 @@
+   mapPaypalSubscriptionStatus,
+ } from '../../core/index';
+ import {
++  normalizePaypalSubscriptionResource,
++  parseProviderTimestamp,
++} from '../../subscription-core/index';
++import {
+   resendWithFreshPaypalTokenOn401,
+   type PaypalAccessTokenScope,
+ } from './paypal-access-token-retry';
+@@ -45,16 +49,9 @@
+   return environment === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
+ }
+ 
++/** `update_time ?? create_time`, read by the core's strict provider timestamp parser. */
+ function parsePaypalSubscriptionBodyStateTimestamp(body: Record<string, unknown>): string | null {
+-  const candidate = body['update_time'] ?? body['create_time'];
+-  if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+-    return null;
+-  }
+-  const epochMs = Date.parse(candidate);
+-  if (Number.isNaN(epochMs)) {
+-    return null;
+-  }
+-  return new Date(epochMs).toISOString();
++  return parseProviderTimestamp(body['update_time'] ?? body['create_time']);
+ }
+ 
+ function mapHttpError(response: { status: number; debugId?: string | null }, message: string) {
+@@ -351,6 +348,11 @@
+     });
+     mapHttpError(response, 'PayPal subscription lookup failed');
+     const billingInfo = response.body['billing_info'] as Record<string, unknown> | undefined;
++    // Billing amounts go through the pure core: integer minor units, never floats.
++    const normalized = normalizePaypalSubscriptionResource(
++      JSON.stringify({ ...response.body, id: input.providerSubscriptionId }),
++    );
++    const billing = normalized.ok ? normalized.event : null;
+     return {
+       providerSubscriptionId: input.providerSubscriptionId,
+       providerPlanId: response.body['plan_id'] ? String(response.body['plan_id']) : null,
+@@ -363,6 +365,9 @@
+       lifecycleReason: null,
+       providerDebugId: response.debugId ?? null,
+       providerSubscriptionStateAt: parsePaypalSubscriptionBodyStateTimestamp(response.body),
++      lastPayment: billing?.lastPayment ?? null,
++      failedPaymentsCount: billing?.failedPaymentsCount ?? null,
++      outstandingBalance: billing?.outstandingBalance ?? null,
+     };
+   }
+ 
+diff --color -ruN .superpowers/snap-after-t5/src/paypal/lib/__tests__/paypal-subscription-executor.unit.test.ts .superpowers/snap-after-t6a/src/paypal/lib/__tests__/paypal-subscription-executor.unit.test.ts
+--- .superpowers/snap-after-t5/src/paypal/lib/__tests__/paypal-subscription-executor.unit.test.ts	2026-10-22 14:01:57.494242893 +0300
++++ .superpowers/snap-after-t6a/src/paypal/lib/__tests__/paypal-subscription-executor.unit.test.ts	2026-10-22 14:32:18.406369869 +0300
+@@ -460,4 +460,43 @@
+       }),
+     ).rejects.toMatchObject({ providerDebugId: 'dbg-no-id' });
+   });
++
++  it('returns last payment, failed payment count and outstanding balance from GET (#4)', async () => {
++    const httpClient: PaypalSubscriptionHttpClient = {
++      request: vi.fn(async () => ({
++        status: 200,
++        body: {
++          id: 'I-BILLING',
++          plan_id: 'P-1',
++          status: 'ACTIVE',
++          billing_info: {
++            next_billing_time: '2026-11-22T10:00:00Z',
++            last_payment: {
++              amount: { currency_code: 'USD', value: '9.99' },
++              time: '2026-10-22T10:00:00Z',
++            },
++            failed_payments_count: 2,
++            outstanding_balance: { currency_code: 'USD', value: '19.98' },
++          },
++        },
++      })),
++    };
++    const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
++
++    const result = await executor.getSubscription({
++      providerCode: 'paypal',
++      accountRef: 'default',
++      applicationRef: 'test-app',
++      environment: 'sandbox',
++      providerSubscriptionId: 'I-BILLING',
++    });
++
++    expect(result.lastPayment).toEqual({
++      amountMinor: '999',
++      currency: 'USD',
++      time: '2026-10-22T10:00:00.000Z',
++    });
++    expect(result.failedPaymentsCount).toBe(2);
++    expect(result.outstandingBalance).toEqual({ amountMinor: '1998', currency: 'USD' });
++  });
+ });
+diff --color -ruN .superpowers/snap-after-t5/src/testing/lib/run-store-conformance.ts .superpowers/snap-after-t6a/src/testing/lib/run-store-conformance.ts
+--- .superpowers/snap-after-t5/src/testing/lib/run-store-conformance.ts	2026-10-22 14:01:57.496625353 +0300
++++ .superpowers/snap-after-t6a/src/testing/lib/run-store-conformance.ts	2026-10-22 14:32:18.409530248 +0300
+@@ -114,8 +114,9 @@
+  * Covers: idempotency by fingerprint, optimistic `version` compare-and-set, the `prepared ->
+  * submitted` claim and the create execution lease (one winner under concurrency, typed
+  * `transitionKind`), transition + history atomicity, provider-id uniqueness per kind, patch
+- * semantics (`undefined` keeps, `null` clears), evidence uniqueness, recovery lease exclusivity and
+- * expiry, the oldest-first ORDER BY of the candidate lists, and the consumer-delivery fields.
++ * semantics (`undefined` keeps, `null` clears; also for `subscriptionStateJson`), evidence
++ * uniqueness, recovery lease exclusivity and expiry, the oldest-first ORDER BY of the candidate
++ * lists, and the consumer-delivery fields.
+  */
+ export function runStoreConformance<TStore extends SubscriptionStore>(
+   options: StoreConformanceOptions<TStore>,
+@@ -693,6 +694,46 @@
+         expect((await store.findOperationById(created.operationId))?.approvalUrl).toBe(null);
+       });
+ 
++      it('subscriptionStateJson is stored by create, update and transition (undefined keeps, null clears)', async (store, ctx) => {
++        const stateJson = (failedPaymentsCount: number) =>
++          JSON.stringify({ version: 1, failedPaymentsCount, recentEventIds: ['WH-1'] });
++        const created = await createOperation(store, ctx, {
++          subscriptionStateJson: stateJson(1),
++        });
++        expect(created.subscriptionStateJson ?? null, 'subscriptionStateJson after create').toBe(
++          stateJson(1),
++        );
++        const updated = await store.updateOperation({
++          operationId: created.operationId,
++          expectedVersion: created.version,
++          subscriptionStateJson: stateJson(2),
++        });
++        const kept = await store.updateOperation({
++          operationId: updated.operationId,
++          expectedVersion: updated.version,
++          lifecycleReason: 'other field',
++        });
++        expect(kept.subscriptionStateJson ?? null, 'subscriptionStateJson kept').toBe(stateJson(2));
++        const claimed = await claim(store, kept);
++        const transitioned = await store.transitionOperation({
++          operationId: claimed.operationId,
++          expectedVersion: claimed.version,
++          nextStatus: 'succeeded',
++          subscriptionStateJson: stateJson(3),
++          reason: 'conformance: state from the reducer',
++        });
++        expect(
++          (await store.findOperationById(created.operationId))?.subscriptionStateJson ?? null,
++          'subscriptionStateJson after transition',
++        ).toBe(stateJson(3));
++        const cleared = await store.updateOperation({
++          operationId: transitioned.operationId,
++          expectedVersion: transitioned.version,
++          subscriptionStateJson: null,
++        });
++        expect(cleared.subscriptionStateJson ?? null, 'subscriptionStateJson cleared').toBe(null);
++      });
++
+       it('transitionOperation: failureCode and failureMessage, undefined keeps and null clears', async (store, ctx) => {
+         const claimed = await claim(store, await createOperation(store, ctx));
+         const failed = await store.transitionOperation({
+diff --color -ruN .superpowers/snap-after-t5/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts .superpowers/snap-after-t6a/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts
+--- .superpowers/snap-after-t5/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts	2026-10-22 14:01:57.496771724 +0300
++++ .superpowers/snap-after-t6a/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts	2026-10-22 14:32:18.409587758 +0300
+@@ -155,6 +155,23 @@
+   }
+ }
+ 
++/** A store whose table has no `subscription_state_json` column (issue #4). */
++class DropsSubscriptionStateJson extends MemoryPaymentReliabilityStore {
++  override async createOperation(input: CreatePaymentOperationInput): Promise<PaymentOperation> {
++    return super.createOperation({ ...input, subscriptionStateJson: undefined });
++  }
++
++  override async updateOperation(input: UpdatePaymentOperationInput): Promise<PaymentOperation> {
++    return super.updateOperation({ ...input, subscriptionStateJson: undefined });
++  }
++
++  override async transitionOperation(
++    input: TransitionPaymentOperationInput,
++  ): Promise<PaymentOperation> {
++    return super.transitionOperation({ ...input, subscriptionStateJson: undefined });
++  }
++}
++
+ class IgnoresConsumerDeliveryFlag extends MemoryPaymentReliabilityStore {
+   override async claimPendingEvidence(input: ClaimPendingEvidenceInput) {
+     return super.claimPendingEvidence({ ...input, includeConsumerDelivery: undefined });
+@@ -234,6 +251,11 @@
+       () => new OverwritesProviderSubscriptionId(),
+       /provider id/,
+     ],
++    [
++      'drops subscriptionStateJson',
++      () => new DropsSubscriptionStateJson(),
++      /subscriptionStateJson/,
++    ],
+   ])('fails a store that %s', async (_label, createStore, expectedCase) => {
+     const failures = await failingCases(createStore);
+     expect(failures.length).toBeGreaterThan(0);

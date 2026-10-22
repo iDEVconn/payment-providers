@@ -1439,6 +1439,44 @@ export function runStoreConformance<TStore extends SubscriptionStore>(
         });
         expect(await read()).toEqual(['confirmed', 10, null, '2026-01-02T00:00:00.000Z']);
       });
+
+      it('a new row has no consumerDeliveryStatus, and a processed reconciliation row is never claimed for delivery', async (store, ctx) => {
+        // The engine sets `pending` on webhook rows when it processes them; a column default of
+        // 'pending' would turn every reconciliation lookup row into a consumer delivery.
+        const webhookRow = await insertEvidence(store, ctx, 'WH-FRESH');
+        const lookupRow = await store.insertEvidence({
+          ...ctx,
+          evidenceKind: 'reconciliation',
+          providerEventId: uniqueId('reconcile'),
+          rawPayload: '{"eventType":"RECONCILIATION.PROVIDER_LOOKUP"}',
+          payloadSha256: 'sha-conformance',
+          eventType: 'RECONCILIATION.PROVIDER_LOOKUP',
+          resourceId: 'I-CONFORMANCE',
+        });
+        for (const [label, row] of [
+          ['webhook insert', webhookRow],
+          ['reconciliation insert', lookupRow],
+          ['webhook read', await store.findEvidenceById(webhookRow.evidenceId)],
+        ] as const) {
+          expect(row?.consumerDeliveryStatus ?? null, `consumerDeliveryStatus after ${label}`).toBe(
+            null,
+          );
+        }
+        await store.updateEvidence({
+          evidenceId: lookupRow.evidenceId,
+          verificationStatus: 'verified',
+          processingStatus: 'processed',
+        });
+        const claimed = await store.claimPendingEvidence({
+          limit: 5,
+          leaseMs: 60_000,
+          workerId: 'w1',
+        });
+        expect(
+          claimed.some((row) => row.evidenceId === lookupRow.evidenceId),
+          'processed reconciliation row claimed for consumer delivery',
+        ).toBe(false);
+      });
     });
 
     describe('reconciliation attempts', () => {

@@ -186,8 +186,12 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
   const clientSecret = config.credentials?.clientSecret?.trim();
   const missingCredentialFields = missingCheckoutCredentialFields(clientId, clientSecret);
 
-  if (refuseRejectOnly && missingCredentialFields.length > 0 && !executionStatus) {
-    throw productionCredentialsError(providerCode, [...missingCredentialFields, 'executionStatus']);
+  // A configured executionStatus never stands in for credentials (the kill switch returned above).
+  if (refuseRejectOnly && missingCredentialFields.length > 0) {
+    throw productionCredentialsError(
+      providerCode,
+      executionStatus ? missingCredentialFields : [...missingCredentialFields, 'executionStatus'],
+    );
   }
 
   if (!checkoutEnabled(config)) {

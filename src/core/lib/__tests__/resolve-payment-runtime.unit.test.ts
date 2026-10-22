@@ -157,6 +157,25 @@ describe('resolvePaymentRuntime in production (#7)', () => {
     ).toThrow(PaymentConfigurationError);
   });
 
+  it('throws when credentials are absent, checkout is disabled and executionStatus is configured (final review F7)', () => {
+    const error = captureError(() =>
+      resolvePaymentRuntime({
+        config: {
+          environment: 'live',
+          applicationRef: 'app',
+          capabilityFlags: { checkout: false, subscription: true },
+        },
+        executionStatus: configuredStatus,
+        nodeEnv: 'production',
+      }),
+    );
+    expect(error).toBeInstanceOf(PaymentConfigurationError);
+    expect((error as PaymentConfigurationError).missingFields).toEqual([
+      'credentials.clientId',
+      'credentials.clientSecret',
+    ]);
+  });
+
   it('throws when executionStatus is unconfigured', () => {
     const error = captureError(() =>
       resolvePaymentRuntime({

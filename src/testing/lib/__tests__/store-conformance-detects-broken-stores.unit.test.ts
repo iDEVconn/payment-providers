@@ -8,6 +8,7 @@ import {
   type ProviderEvidenceRecord,
   type ClaimPendingEvidenceInput,
   type CreatePaymentOperationInput,
+  type InsertProviderEvidenceInput,
 } from '../../../contracts/index';
 import { MemoryPaymentReliabilityStore } from '../../../core/lib/persistence/memory-payment-reliability-store';
 import type { SubscriptionStore } from '../../../core/lib/persistence/payment-reliability-store';
@@ -194,6 +195,16 @@ class ReturnsSubscriptionStateAsObject extends MemoryPaymentReliabilityStore {
   }
 }
 
+/** `consumer_delivery_status DEFAULT 'pending'`: every new row starts as a consumer delivery. */
+class DefaultsConsumerDeliveryPending extends MemoryPaymentReliabilityStore {
+  override async insertEvidence(
+    input: InsertProviderEvidenceInput,
+  ): Promise<ProviderEvidenceRecord> {
+    const row = await super.insertEvidence(input);
+    return super.updateEvidence({ evidenceId: row.evidenceId, consumerDeliveryStatus: 'pending' });
+  }
+}
+
 class IgnoresConsumerDeliveryFlag extends MemoryPaymentReliabilityStore {
   override async claimPendingEvidence(input: ClaimPendingEvidenceInput) {
     return super.claimPendingEvidence({ ...input, includeConsumerDelivery: undefined });
@@ -331,6 +342,11 @@ describe('runStoreConformance detects broken stores', () => {
       'silently ignores a provider subscription id bound elsewhere',
       () => new OverwritesProviderSubscriptionId(),
       /provider id/,
+    ],
+    [
+      'defaults consumerDeliveryStatus to pending on insert',
+      () => new DefaultsConsumerDeliveryPending(),
+      /new row has no consumerDeliveryStatus/,
     ],
     [
       'drops subscriptionStateJson',
