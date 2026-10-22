@@ -4,7 +4,7 @@ import {
   deriveBatchPayoutStatus,
   payoutFinancialStatusToOperationStatus,
 } from './payout-transition-policy';
-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
+import type { OperationStore, PayoutStore } from './persistence/payment-reliability-store';
 import { assertTransitionAllowed } from './transition-policy';
 import { persistValidatedPayoutProviderIds } from './payout-webhook-correlation';
 
@@ -50,7 +50,7 @@ export function isPayoutFinancialTransitionRejected(
 }
 
 export async function applyPayoutTransition(
-  store: PaymentReliabilityStore,
+  store: OperationStore & PayoutStore,
   input: ApplyPayoutTransitionInput,
 ): Promise<ApplyPayoutTransitionResult> {
   const { operation, payoutStatus } = input;
@@ -105,7 +105,7 @@ export async function applyPayoutTransition(
 }
 
 export async function refreshPayoutBatchAggregate(
-  store: PaymentReliabilityStore,
+  store: OperationStore & PayoutStore,
   batch: PaymentOperation,
   evidenceId?: string | null,
   reason = 'Derived payout batch aggregate status',

@@ -23,3 +23,14 @@ describe('token cache scope isolation', () => {
     expect(registry.size()).toBe(2);
   });
 });
+
+describe('token cache scope client id', () => {
+  it('uses distinct keys for different OAuth client ids and keeps the legacy key without one', () => {
+    const scope = { accountRef: 'default', environment: 'sandbox' as const };
+    expect(tokenCacheScope({ ...scope, clientId: 'client-a' })).not.toBe(
+      tokenCacheScope({ ...scope, clientId: 'client-b' }),
+    );
+    expect(tokenCacheScope({ ...scope, clientId: 'client-a' })).not.toBe(tokenCacheScope(scope));
+    expect(tokenCacheScope(scope)).toBe('default::sandbox');
+  });
+});

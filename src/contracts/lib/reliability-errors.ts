@@ -35,6 +35,14 @@ export const PAYMENT_RELIABILITY_ERROR = {
   PROVIDER_ACTION_REQUIRED: 'PROVIDER_ACTION_REQUIRED',
   PERSISTENCE_FAILURE: 'PERSISTENCE_FAILURE',
   SUBSCRIPTION_PLAN_MISMATCH: 'SUBSCRIPTION_PLAN_MISMATCH',
+  /** A stored provider event id was received again with a different body (not retryable as sent). */
+  WEBHOOK_PAYLOAD_MISMATCH: 'WEBHOOK_PAYLOAD_MISMATCH',
+  /** `subscriptionStateJson` cannot be read; nothing is applied until it is repaired. */
+  SUBSCRIPTION_STATE_UNREADABLE: 'SUBSCRIPTION_STATE_UNREADABLE',
+  /** `subscriptionStateJson` was written by a newer package version; nothing is applied. */
+  SUBSCRIPTION_STATE_VERSION_UNSUPPORTED: 'SUBSCRIPTION_STATE_VERSION_UNSUPPORTED',
+  /** The host's `onSubscriptionEffects` hook threw after the state was saved. */
+  SUBSCRIPTION_EFFECTS_HOOK_FAILED: 'SUBSCRIPTION_EFFECTS_HOOK_FAILED',
 } as const;
 
 export type PaymentReliabilityErrorCode =
@@ -47,6 +55,8 @@ export type PaymentReliabilityErrorOptions = {
   rejectionReason?: PaymentTransitionRejectionReason;
   operationId?: string;
   paymentOutcome?: PaymentReliabilityErrorPaymentOutcome;
+  /** Provider diagnostic id (PayPal `debug_id`) for support and tracing. */
+  providerDebugId?: string | null;
 };
 
 export class PaymentReliabilityError extends Error {
@@ -54,6 +64,7 @@ export class PaymentReliabilityError extends Error {
   readonly rejectionReason?: PaymentTransitionRejectionReason;
   readonly operationId?: string;
   readonly paymentOutcome?: PaymentReliabilityErrorPaymentOutcome;
+  readonly providerDebugId?: string | null;
 
   constructor(
     code: PaymentReliabilityErrorCode,
@@ -66,5 +77,6 @@ export class PaymentReliabilityError extends Error {
     this.rejectionReason = options?.rejectionReason;
     this.operationId = options?.operationId;
     this.paymentOutcome = options?.paymentOutcome;
+    this.providerDebugId = options?.providerDebugId;
   }
 }

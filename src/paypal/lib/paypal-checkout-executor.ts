@@ -1,4 +1,4 @@
-import { PaymentError, type OrderResult, type PaymentStrategy } from '@idevconn/payment';
+import type { OrderResult, PaymentStrategy } from '../../contracts/lib/legacy-checkout';
 import {
   PAYMENT_CAPABILITY_UNAVAILABLE,
   PAYMENT_RELIABILITY_ERROR,
@@ -16,10 +16,16 @@ import {
 } from '../../contracts/index';
 import {
   assertCapabilityReady,
+  pathSegment,
   canonicalMoneyToLegacyMajorAmount,
   type CheckoutProviderPort,
   type ResolvedPaymentRuntime,
 } from '../../core/index';
+import {
+  resendWithFreshPaypalTokenOn401,
+  type PaypalAccessTokenScope,
+} from './paypal-access-token-retry';
+import type { PaypalAccessTokenRequestOptions } from './paypal-oauth-client';
 import { extractPaypalCheckoutApprovalUrl } from './paypal-checkout-approval-url';
 import {
   extractPaypalIssueCodes,
@@ -27,7 +33,11 @@ import {
   parsePurchaseUnitCaptures,
   resolveCheckoutStatusFromOrder,
 } from './paypal-checkout-order-parsing';
-import type { PaypalOrdersHttpClient } from './paypal-orders-http-client';
+import type {
+  PaypalOrdersHttpClient,
+  PaypalOrdersHttpRequest,
+  PaypalOrdersHttpResponse,
+} from './paypal-orders-http-client';
 import { UnconfiguredFakeCheckoutStrategy } from './unconfigured-fake-checkout.strategy';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -78,10 +88,13 @@ function buildCaptureResultFromBody(
   };
 }
 
-export type PaypalCheckoutTokenProvider = (scope: {
-  accountRef: string;
-  environment: PaymentEnvironment;
-}) => Promise<string>;
+export type PaypalCheckoutTokenProvider = (
+  scope: {
+    accountRef: string;
+    environment: PaymentEnvironment;
+  },
+  options?: PaypalAccessTokenRequestOptions,
+) => Promise<string>;
 
 export class PaypalCheckoutExecutor implements CheckoutProviderPort {
   constructor(
@@ -90,6 +103,16 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
     private readonly httpClient: PaypalOrdersHttpClient,
     private readonly tokenProvider: PaypalCheckoutTokenProvider,
   ) {}
+
+  private authorizedRequest(
+    scope: PaypalAccessTokenScope,
+    token: string,
+    request: Omit<PaypalOrdersHttpRequest, 'accessToken'>,
+  ): Promise<PaypalOrdersHttpResponse> {
+    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
+      this.httpClient.request({ ...request, accessToken }),
+    );
+  }
 
   async createOrder(
     input: ExecuteCreateCheckoutOrderRequest,
@@ -133,18 +156,15 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
 
   async getOrder(input: ExecuteGetCheckoutOrderRequest): Promise<ExecuteGetCheckoutOrderResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'checkout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl}/v2/checkout/orders/${input.providerOrderId}`,
-      accessToken: token,
+      path: `${baseUrl}/v2/checkout/orders/${pathSegment(input.providerOrderId, 'providerOrderId')}`,
     });
 
     if (response.status === 404) {
@@ -200,18 +220,15 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
       await this.rejectUnconfigured(strategy.captureOrder(input.providerOrderId));
     }
 
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
-      path: `${baseUrl}/v2/checkout/orders/${input.providerOrderId}/capture`,
-      accessToken: token,
+      path: `${baseUrl}/v2/checkout/orders/${pathSegment(input.providerOrderId, 'providerOrderId')}/capture`,
       requestId: input.providerRequestId,
       preferRepresentation: true,
     });
@@ -269,18 +286,15 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
   private async createOrderWithExperienceContext(
     input: ExecuteCreateCheckoutOrderRequest,
   ): Promise<ExecuteCreateCheckoutOrderResult> {
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
       path: `${baseUrl}/v2/checkout/orders`,
-      accessToken: token,
       requestId: input.providerRequestId,
       preferRepresentation: true,
       body: {
@@ -333,10 +347,8 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
 
   async refundCapture(input: ExecuteRefundCaptureRequest): Promise<ExecuteRefundCaptureResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'refund');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
@@ -351,10 +363,9 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
           }
         : undefined;
 
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
-      path: `${baseUrl}/v2/payments/captures/${input.providerCaptureId}/refund`,
-      accessToken: token,
+      path: `${baseUrl}/v2/payments/captures/${pathSegment(input.providerCaptureId, 'providerCaptureId')}/refund`,
       body,
       requestId: input.providerRequestId,
     });
@@ -404,18 +415,15 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
 
   async getRefund(input: ExecuteGetRefundRequest): Promise<ExecuteGetRefundResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'refund');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl}/v2/payments/refunds/${input.providerRefundId}`,
-      accessToken: token,
+      path: `${baseUrl}/v2/payments/refunds/${pathSegment(input.providerRefundId, 'providerRefundId')}`,
     });
 
     if (response.status === 404) {
@@ -469,7 +477,7 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
       if (isRecord(error) && error['code'] === PAYMENT_CAPABILITY_UNAVAILABLE) {
         throw error;
       }
-      if (error instanceof PaymentError) {
+      if (isLegacyPaymentError(error)) {
         throw {
           code: PAYMENT_RELIABILITY_ERROR.PROVIDER_AUTH_FAILURE,
           message: 'Payment provider rejected authentication',
@@ -481,4 +489,9 @@ export class PaypalCheckoutExecutor implements CheckoutProviderPort {
       throw error;
     }
   }
+}
+
+/** Structural check: `@idevconn/payment` is an optional peer and is not loaded at runtime here. */
+function isLegacyPaymentError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'PaymentError';
 }

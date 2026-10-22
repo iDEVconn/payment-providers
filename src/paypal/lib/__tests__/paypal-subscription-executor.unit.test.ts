@@ -332,4 +332,171 @@ describe('PaypalSubscriptionExecutor', () => {
       uncertain: true,
     });
   });
+  describe('createSubscription request body', () => {
+    const base = {
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox' as const,
+      providerRequestId: 'req-body',
+      providerPlanId: 'PLAN-1',
+    };
+
+    async function sentBody(extra: Record<string, unknown> = {}) {
+      let body: Record<string, unknown> | undefined;
+      const httpClient: PaypalSubscriptionHttpClient = {
+        request: vi.fn(async (input) => {
+          body = input.body;
+          return { status: 201, body: { id: 'I-SUB', status: 'APPROVAL_PENDING' } };
+        }),
+      };
+      const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
+      await executor.createSubscription({ ...base, ...extra });
+      return body as { custom_id?: string; application_context?: Record<string, unknown> };
+    }
+
+    it('defaults to NO_SHIPPING and sends no custom_id when nothing is set', async () => {
+      const body = await sentBody();
+      expect(body.custom_id).toBeUndefined();
+      expect(body.application_context).toMatchObject({ shipping_preference: 'NO_SHIPPING' });
+    });
+
+    it.each(['DIGITAL', 'SERVICE'] as const)('defaults to NO_SHIPPING for %s products', async (productType) => {
+      const body = await sentBody({ productType });
+      expect(body.application_context?.['shipping_preference']).toBe('NO_SHIPPING');
+    });
+
+    it('leaves the PayPal shipping default for physical products', async () => {
+      const body = await sentBody({ productType: 'PHYSICAL' });
+      expect(body.application_context?.['shipping_preference']).toBeUndefined();
+    });
+
+    it('maps customId, brandName, userAction and return URLs', async () => {
+      const body = await sentBody({
+        customId: 'user-1:pro',
+        brandName: 'Acme',
+        userAction: 'SUBSCRIBE_NOW',
+        returnUrl: 'https://app.test/ok',
+        cancelUrl: 'https://app.test/no',
+      });
+      expect(body.custom_id).toBe('user-1:pro');
+      expect(body.application_context).toEqual({
+        brand_name: 'Acme',
+        user_action: 'SUBSCRIBE_NOW',
+        shipping_preference: 'NO_SHIPPING',
+        return_url: 'https://app.test/ok',
+        cancel_url: 'https://app.test/no',
+      });
+    });
+
+    it('lets an explicit shipping preference win over the default', async () => {
+      const body = await sentBody({ shippingPreference: 'GET_FROM_FILE', productType: 'DIGITAL' });
+      expect(body.application_context?.['shipping_preference']).toBe('GET_FROM_FILE');
+    });
+  });
+
+  it('sends a free trial with a zero price and rejects a regular cycle without one', async () => {
+    let body: { billing_cycles?: Array<Record<string, unknown>> } | undefined;
+    const httpClient: PaypalSubscriptionHttpClient = {
+      request: vi.fn(async (input) => {
+        body = input.body as typeof body;
+        return { status: 201, body: { id: 'P-1', status: 'CREATED' } };
+      }),
+    };
+    const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
+    await executor.createPlan({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      providerRequestId: 'req-trial',
+      providerProductId: 'PROD-1',
+      name: 'Trial plan',
+      billingCycles: [
+        {
+          tenureType: 'TRIAL',
+          sequence: 1,
+          totalCycles: 1,
+          intervalUnit: 'WEEK',
+          intervalCount: 1,
+          price: { currency: 'USD', amountMinor: '0' },
+        },
+        {
+          tenureType: 'REGULAR',
+          sequence: 2,
+          totalCycles: 0,
+          intervalUnit: 'MONTH',
+          intervalCount: 1,
+          price: { currency: 'USD', amountMinor: '999' },
+        },
+      ],
+      paymentPreferences: {},
+    });
+    expect(body?.billing_cycles?.[0]?.['pricing_scheme']).toEqual({
+      fixed_price: { currency_code: 'USD', value: '0' },
+    });
+    expect(body?.billing_cycles?.[1]?.['pricing_scheme']).toEqual({
+      fixed_price: { currency_code: 'USD', value: '9.99' },
+    });
+  });
+
+  it('keeps the PayPal debug id when a create response has no provider id', async () => {
+    const httpClient: PaypalSubscriptionHttpClient = {
+      request: vi.fn(async () => ({
+        status: 201,
+        body: { status: 'APPROVAL_PENDING' },
+        debugId: 'dbg-no-id',
+      })),
+    };
+    const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
+    await expect(
+      executor.createSubscription({
+        providerCode: 'paypal',
+        accountRef: 'default',
+        applicationRef: 'test-app',
+        environment: 'sandbox',
+        providerRequestId: 'req-no-id',
+        providerPlanId: 'PLAN-1',
+      }),
+    ).rejects.toMatchObject({ providerDebugId: 'dbg-no-id' });
+  });
+
+  it('returns last payment, failed payment count and outstanding balance from GET (#4)', async () => {
+    const httpClient: PaypalSubscriptionHttpClient = {
+      request: vi.fn(async () => ({
+        status: 200,
+        body: {
+          id: 'I-BILLING',
+          plan_id: 'P-1',
+          status: 'ACTIVE',
+          billing_info: {
+            next_billing_time: '2026-11-22T10:00:00Z',
+            last_payment: {
+              amount: { currency_code: 'USD', value: '9.99' },
+              time: '2026-10-22T10:00:00Z',
+            },
+            failed_payments_count: 2,
+            outstanding_balance: { currency_code: 'USD', value: '19.98' },
+          },
+        },
+      })),
+    };
+    const executor = new PaypalSubscriptionExecutor(runtime(true), httpClient, async () => 'token');
+
+    const result = await executor.getSubscription({
+      providerCode: 'paypal',
+      accountRef: 'default',
+      applicationRef: 'test-app',
+      environment: 'sandbox',
+      providerSubscriptionId: 'I-BILLING',
+    });
+
+    expect(result.lastPayment).toEqual({
+      amountMinor: '999',
+      currency: 'USD',
+      time: '2026-10-22T10:00:00.000Z',
+    });
+    expect(result.failedPaymentsCount).toBe(2);
+    expect(result.outstandingBalance).toEqual({ amountMinor: '1998', currency: 'USD' });
+  });
 });

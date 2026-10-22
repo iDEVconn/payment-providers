@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ResolvedPaymentRuntime } from '../../../core/index';
+import { PaymentConfigurationError } from '../../../core/lib/payment-configuration-error';
 import { buildPaypalCheckoutExecutor } from '../paypal-checkout-executor.factory';
 
 function runtime(overrides: Partial<ResolvedPaymentRuntime> = {}): ResolvedPaymentRuntime {
@@ -28,11 +29,21 @@ function runtime(overrides: Partial<ResolvedPaymentRuntime> = {}): ResolvedPayme
 }
 
 describe('buildPaypalCheckoutExecutor', () => {
-  it('builds a reject-mode executor in production when checkout credentials are missing', () => {
+  it('refuses a reject-mode executor in production when checkout credentials are missing', () => {
+    expect(() =>
+      buildPaypalCheckoutExecutor({
+        runtime: runtime({ mode: 'fake', checkoutCredentials: undefined }),
+        strategyFactory: vi.fn(),
+        nodeEnv: 'production',
+      }),
+    ).toThrow(PaymentConfigurationError);
+  });
+
+  it('builds a reject-mode executor outside production when checkout credentials are missing', () => {
     const executor = buildPaypalCheckoutExecutor({
       runtime: runtime({ mode: 'fake', checkoutCredentials: undefined }),
       strategyFactory: vi.fn(),
-      nodeEnv: 'production',
+      nodeEnv: 'development',
     });
     expect(executor).toBeDefined();
   });

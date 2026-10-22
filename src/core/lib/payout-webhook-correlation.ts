@@ -2,7 +2,7 @@ import type { PaymentOperation } from '../../contracts/index';
 import { majorUnitsToMinorString } from './money';
 import type { PayoutFinancialStatus } from '../../contracts/index';
 import { mapPayoutWebhookEventToOperationKind } from './payout-transition-policy';
-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
+import type { OperationStore, PayoutStore } from './persistence/payment-reliability-store';
 
 export type ParsedPaypalPayoutWebhook = {
   payoutScope: 'payout_batch' | 'payout_item';
@@ -141,7 +141,7 @@ function normalizeRecipient(value: string | null | undefined): string | null {
 }
 
 export async function validatePayoutEvidenceMatch(
-  store: PaymentReliabilityStore,
+  store: OperationStore & PayoutStore,
   operation: PaymentOperation,
   parsed: ParsedPaypalPayoutWebhook,
   evidence: Pick<PayoutEvidenceCorrelationContext, 'applicationRef'>,
@@ -218,7 +218,7 @@ export async function validatePayoutEvidenceMatch(
 }
 
 async function findPrimaryPayoutOperation(
-  store: PaymentReliabilityStore,
+  store: OperationStore & PayoutStore,
   context: Pick<PayoutEvidenceCorrelationContext, 'providerCode' | 'accountRef' | 'environment'>,
   parsed: ParsedPaypalPayoutWebhook,
 ): Promise<PaymentOperation | null> {
@@ -242,7 +242,7 @@ async function findPrimaryPayoutOperation(
 }
 
 async function findFallbackPayoutOperation(
-  store: PaymentReliabilityStore,
+  store: OperationStore & PayoutStore,
   context: Pick<PayoutEvidenceCorrelationContext, 'providerCode' | 'accountRef' | 'environment'>,
   parsed: ParsedPaypalPayoutWebhook,
 ): Promise<PaymentOperation | null> {
@@ -266,7 +266,7 @@ async function findFallbackPayoutOperation(
 }
 
 export async function correlatePayoutOperation(
-  store: PaymentReliabilityStore,
+  store: OperationStore & PayoutStore,
   evidence: PayoutEvidenceCorrelationContext,
 ): Promise<PayoutCorrelationResult | null> {
   const parsed = parsePaypalPayoutWebhookPayload(evidence.rawPayload, evidence.eventType);
@@ -312,7 +312,7 @@ export type PersistValidatedPayoutProviderIdsInput = {
 };
 
 export async function persistValidatedPayoutProviderIds(
-  store: PaymentReliabilityStore,
+  store: OperationStore & PayoutStore,
   operation: PaymentOperation,
   ids: PersistValidatedPayoutProviderIdsInput,
   allowRetry = true,

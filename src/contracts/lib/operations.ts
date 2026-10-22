@@ -1,5 +1,6 @@
 import type { PaymentEnvironment } from './capabilities';
 import type { PayoutFinancialStatus, PayoutRecipientType } from './payout';
+import type { RetryStatus } from './retry';
 import type { PlanStatus, ProductStatus, SubscriptionStatus } from './subscription';
 
 /** Operation kinds. M4 payout; M5 subscription; M6 seller referral mutation. */
@@ -74,10 +75,26 @@ export type PaymentOperation = {
   lifecycleReason: string | null;
   /** Last accepted PayPal subscription resource update/create time for webhook ordering. */
   providerSubscriptionStateAt: string | null;
+  /**
+   * Engine-owned JSON text with the subscription reducer state that has no column of its own (last
+   * payment, failed-payment count, recent webhook and sale ids, effects not yet delivered to the host
+   * hook). Stores keep it verbatim in one nullable text/jsonb column; hosts read it with
+   * `readSubscriptionOperationState`. Absent (stores written before 0.3) means "no state yet". The
+   * engine writes JSON text; a `jsonb` column may return it as text or as the parsed object.
+   */
+  subscriptionStateJson?: string | Record<string, unknown> | null;
   sellerRef: string | null;
   providerReferralId: string | null;
   executionLeaseExpiresAt: string | null;
   executionOwnerToken: string | null;
+  /*
+   * Reconciliation retry bookkeeping (issue #8): unsuccessful attempts, the earliest time the
+   * operation is listed again, and `'gave_up'` after the attempt cap. Nullable columns; absent on
+   * stores written before 0.3 (read as "never attempted").
+   */
+  attempts?: number | null;
+  nextAttemptAt?: string | null;
+  retryStatus?: RetryStatus | null;
   version: number;
   createdAt: string;
   updatedAt: string;
@@ -125,6 +142,7 @@ export type CreatePaymentOperationInput = {
   nextBillingTime?: string | null;
   lifecycleReason?: string | null;
   providerSubscriptionStateAt?: string | null;
+  subscriptionStateJson?: string | null;
   sellerRef?: string | null;
   providerReferralId?: string | null;
   executionLeaseExpiresAt?: string | null;
@@ -171,12 +189,19 @@ export type TransitionPaymentOperationInput = {
   nextBillingTime?: string | null;
   lifecycleReason?: string | null;
   providerSubscriptionStateAt?: string | null;
+  subscriptionStateJson?: string | null;
   sellerRef?: string | null;
   providerReferralId?: string | null;
   executionLeaseExpiresAt?: string | null;
   executionOwnerToken?: string | null;
   expectedExecutionOwnerToken?: string | null;
+  /** Free text for people; never read by the services (issue #23). */
   reason: string;
+  /**
+   * Typed marker of a claim transition. Stores persist it on the history row as given (`null`
+   * when absent); services identify claims by it, never by `reason`.
+   */
+  transitionKind?: OperationTransitionKind | null;
 };
 
 export type UpdatePaymentOperationInput = {
@@ -215,9 +240,48 @@ export type UpdatePaymentOperationInput = {
   nextBillingTime?: string | null;
   lifecycleReason?: string | null;
   providerSubscriptionStateAt?: string | null;
+  subscriptionStateJson?: string | null;
   sellerRef?: string | null;
   providerReferralId?: string | null;
+  attempts?: number | null;
+  nextAttemptAt?: string | null;
+  retryStatus?: RetryStatus | null;
 };
+
+/** Optional filters of `listUncertainOperations`. */
+export type ListUncertainOperationsOptions = {
+  /**
+   * Also list `submitted` operations of a kind in `submittedStaleKinds` without a
+   * `providerReferenceId` whose `updatedAt` is at or before this ISO time and whose execution lease
+   * is missing or expired: a create that crashed between the claim and the result write
+   * (issue #12). Omitted: only `unknown` operations.
+   */
+  submittedStaleBefore?: string;
+  /**
+   * Kinds `submittedStaleBefore` applies to. Default `['subscription', 'checkout']` (the creates
+   * with a retry path); other kinds may wait in `submitted` without a reference by design (payout
+   * items before PayPal assigns their ids).
+   */
+  submittedStaleKinds?: PaymentOperationKind[];
+};
+
+/** Kinds whose stale `submitted` creates `listUncertainOperations` lists by default. */
+export const DEFAULT_SUBMITTED_STALE_KINDS: ReadonlyArray<PaymentOperationKind> = [
+  'subscription',
+  'checkout',
+];
+
+/**
+ * Kind of a claim transition: `claim_execution` is the first claim of a `prepared` operation for a
+ * provider call (`claimOperationForExecution`, or a create execution lease taken from `prepared`);
+ * `claim_retry` is a create execution lease taken from `unknown` or a stale `submitted`.
+ */
+export type OperationTransitionKind = 'claim_execution' | 'claim_retry';
+
+export const OPERATION_TRANSITION_KIND = {
+  CLAIM_EXECUTION: 'claim_execution',
+  CLAIM_RETRY: 'claim_retry',
+} as const satisfies Record<string, OperationTransitionKind>;
 
 export type PaymentOperationTransitionRecord = {
   transitionId: string;
@@ -226,5 +290,7 @@ export type PaymentOperationTransitionRecord = {
   toStatus: PaymentOperationStatus;
   evidenceId: string | null;
   reason: string;
+  /** Absent or `null` for ordinary transitions and for rows written before 0.3. */
+  transitionKind?: OperationTransitionKind | null;
   createdAt: string;
 };

@@ -20,6 +20,7 @@ import {
 } from '../../contracts/index';
 import {
   assertCapabilityReady,
+  pathSegment,
   canonicalMoneyToLegacyMajorAmount,
   type SubscriptionProviderPort,
   type ResolvedPaymentRuntime,
@@ -29,23 +30,28 @@ import {
   mapPaypalProductStatus,
   mapPaypalSubscriptionStatus,
 } from '../../core/index';
+import {
+  normalizePaypalSubscriptionResource,
+  parseProviderTimestamp,
+} from '../../subscription-core/index';
+import {
+  resendWithFreshPaypalTokenOn401,
+  type PaypalAccessTokenScope,
+} from './paypal-access-token-retry';
 import type { PaypalCheckoutTokenProvider } from './paypal-checkout-executor';
-import type { PaypalSubscriptionHttpClient } from './paypal-subscription-http-client';
+import type {
+  PaypalSubscriptionHttpClient,
+  PaypalSubscriptionHttpRequest,
+  PaypalSubscriptionHttpResponse,
+} from './paypal-subscription-http-client';
 
 function baseUrl(environment: 'sandbox' | 'live'): string {
   return environment === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
 }
 
+/** `update_time ?? create_time`, read by the core's strict provider timestamp parser. */
 function parsePaypalSubscriptionBodyStateTimestamp(body: Record<string, unknown>): string | null {
-  const candidate = body['update_time'] ?? body['create_time'];
-  if (typeof candidate !== 'string' || candidate.trim().length === 0) {
-    return null;
-  }
-  const epochMs = Date.parse(candidate);
-  if (Number.isNaN(epochMs)) {
-    return null;
-  }
-  return new Date(epochMs).toISOString();
+  return parseProviderTimestamp(body['update_time'] ?? body['create_time']);
 }
 
 function mapHttpError(response: { status: number; debugId?: string | null }, message: string) {
@@ -100,32 +106,42 @@ function mapBillingCycles(cycles: BillingCycleInput[]) {
       ? {
           fixed_price: {
             currency_code: cycle.price.currency,
-            value: canonicalMoneyToLegacyMajorAmount(cycle.price),
+            value: canonicalMoneyToLegacyMajorAmount(cycle.price, {
+              allowZero: cycle.tenureType === 'TRIAL',
+            }),
           },
         }
       : undefined,
   }));
 }
 
-function requireProviderResourceId(value: unknown, message: string): string {
-  if (typeof value !== 'string') {
-    throw {
-      code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
-      message,
-      retryable: true,
-      uncertain: true,
-    };
-  }
-  const trimmed = value.trim();
+function requireProviderResourceId(
+  value: unknown,
+  message: string,
+  providerDebugId: string | null | undefined,
+): string {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
   if (!trimmed) {
     throw {
       code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
       message,
       retryable: true,
       uncertain: true,
+      providerDebugId: providerDebugId ?? null,
     };
   }
   return trimmed;
+}
+
+/**
+ * Digital buyers are never asked for a shipping address: `NO_SHIPPING` is the default unless
+ * the caller chose a preference or the plan's product is physical.
+ */
+function resolveShippingPreference(input: ExecuteCreateSubscriptionRequest): string | undefined {
+  if (input.shippingPreference) {
+    return input.shippingPreference;
+  }
+  return input.productType === 'PHYSICAL' ? undefined : 'NO_SHIPPING';
 }
 
 function extractApproveUrl(body: Record<string, unknown>): string | null {
@@ -143,18 +159,25 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
     private readonly tokenProvider: PaypalCheckoutTokenProvider,
   ) {}
 
+  private authorizedRequest(
+    scope: PaypalAccessTokenScope,
+    token: string,
+    request: Omit<PaypalSubscriptionHttpRequest, 'accessToken'>,
+  ): Promise<PaypalSubscriptionHttpResponse> {
+    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
+      this.httpClient.request({ ...request, accessToken }),
+    );
+  }
+
   async createProduct(
     input: ExecuteCreateCatalogProductRequest,
   ): Promise<ExecuteCreateCatalogProductResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
       path: `${baseUrl(input.environment)}/v1/catalogs/products`,
-      accessToken: token,
       requestId: input.providerRequestId,
       body: {
         name: input.name,
@@ -170,6 +193,7 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
       providerProductId: requireProviderResourceId(
         response.body['id'],
         'PayPal catalog product response did not include a provider id',
+        response.debugId,
       ),
       productStatus: mapPaypalProductStatus(),
       providerDebugId: response.debugId ?? null,
@@ -180,14 +204,11 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
     input: ExecuteGetCatalogProductRequest,
   ): Promise<ExecuteGetCatalogProductResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl(input.environment)}/v1/catalogs/products/${input.providerProductId}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v1/catalogs/products/${pathSegment(input.providerProductId, 'providerProductId')}`,
     });
     mapHttpError(response, 'PayPal catalog product lookup failed');
     return {
@@ -203,14 +224,11 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
     input: ExecuteCreateBillingPlanRequest,
   ): Promise<ExecuteCreateBillingPlanResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
       path: `${baseUrl(input.environment)}/v1/billing/plans`,
-      accessToken: token,
       requestId: input.providerRequestId,
       body: {
         product_id: input.providerProductId,
@@ -240,6 +258,7 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
       providerPlanId: requireProviderResourceId(
         response.body['id'],
         'PayPal billing plan response did not include a provider id',
+        response.debugId,
       ),
       providerProductId: input.providerProductId,
       planStatus: mapPaypalPlanStatus(String(response.body['status'] ?? 'CREATED')),
@@ -249,14 +268,11 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
 
   async getPlan(input: ExecuteGetBillingPlanRequest): Promise<ExecuteGetBillingPlanResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl(input.environment)}/v1/billing/plans/${input.providerPlanId}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v1/billing/plans/${pathSegment(input.providerPlanId, 'providerPlanId')}`,
     });
     mapHttpError(response, 'PayPal billing plan lookup failed');
     return {
@@ -280,19 +296,20 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
     input: ExecuteCreateSubscriptionRequest,
   ): Promise<ExecuteCreateSubscriptionResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
       path: `${baseUrl(input.environment)}/v1/billing/subscriptions`,
-      accessToken: token,
       requestId: input.providerRequestId,
       body: {
         plan_id: input.providerPlanId,
         subscriber: input.subscriberEmail ? { email_address: input.subscriberEmail } : undefined,
+        custom_id: input.customId ?? undefined,
         application_context: {
+          brand_name: input.brandName ?? undefined,
+          user_action: input.userAction ?? undefined,
+          shipping_preference: resolveShippingPreference(input),
           return_url: input.returnUrl ?? undefined,
           cancel_url: input.cancelUrl ?? undefined,
         },
@@ -304,6 +321,7 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
       providerSubscriptionId: requireProviderResourceId(
         response.body['id'],
         'PayPal subscription response did not include a provider id',
+        response.debugId,
       ),
       providerPlanId: input.providerPlanId,
       subscriptionStatus: mapPaypalSubscriptionStatus(
@@ -322,17 +340,19 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
     input: ExecuteGetSubscriptionRequest,
   ): Promise<ExecuteGetSubscriptionResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl(input.environment)}/v1/billing/subscriptions/${input.providerSubscriptionId}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v1/billing/subscriptions/${pathSegment(input.providerSubscriptionId, 'providerSubscriptionId')}`,
     });
     mapHttpError(response, 'PayPal subscription lookup failed');
     const billingInfo = response.body['billing_info'] as Record<string, unknown> | undefined;
+    // Billing amounts go through the pure core: integer minor units, never floats.
+    const normalized = normalizePaypalSubscriptionResource(
+      JSON.stringify({ ...response.body, id: input.providerSubscriptionId }),
+    );
+    const billing = normalized.ok ? normalized.event : null;
     return {
       providerSubscriptionId: input.providerSubscriptionId,
       providerPlanId: response.body['plan_id'] ? String(response.body['plan_id']) : null,
@@ -345,6 +365,9 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
       lifecycleReason: null,
       providerDebugId: response.debugId ?? null,
       providerSubscriptionStateAt: parsePaypalSubscriptionBodyStateTimestamp(response.body),
+      lastPayment: billing?.lastPayment ?? null,
+      failedPaymentsCount: billing?.failedPaymentsCount ?? null,
+      outstandingBalance: billing?.outstandingBalance ?? null,
     };
   }
 
@@ -371,14 +394,11 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
     action: 'activate' | 'deactivate',
   ): Promise<ExecutePlanLifecycleResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
-      path: `${baseUrl(input.environment)}/v1/billing/plans/${input.providerPlanId}/${action}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v1/billing/plans/${pathSegment(input.providerPlanId, 'providerPlanId')}/${action}`,
       body: {},
     });
     mapHttpError(response, `PayPal billing plan ${action} failed`);
@@ -401,14 +421,11 @@ export class PaypalSubscriptionExecutor implements SubscriptionProviderPort {
     action: 'cancel' | 'suspend' | 'activate',
   ): Promise<ExecuteSubscriptionLifecycleResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'subscription');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
-      path: `${baseUrl(input.environment)}/v1/billing/subscriptions/${input.providerSubscriptionId}/${action}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v1/billing/subscriptions/${pathSegment(input.providerSubscriptionId, 'providerSubscriptionId')}/${action}`,
       body: { reason: input.reason },
     });
     mapHttpError(response, `PayPal subscription ${action} failed`);

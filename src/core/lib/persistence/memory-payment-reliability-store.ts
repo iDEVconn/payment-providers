@@ -1,7 +1,12 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { checkoutCreateExecutionLeaseExpiresAt } from '../checkout-create-execution-lease';
-import type { AcquireCheckoutCreateExecutionLeaseResult } from './payment-reliability-store';
+import type {
+  AcquireCheckoutCreateExecutionLeaseResult,
+  ReviveUnmatchedEvidenceInput,
+} from './payment-reliability-store';
 import {
+  DEFAULT_SUBMITTED_STALE_KINDS,
+  OPERATION_TRANSITION_KIND,
   PAYMENT_RELIABILITY_ERROR,
   PAYMENT_RPC_TRANSITION_DETAIL,
   PAYMENT_TRANSITION_REJECTION_REASON,
@@ -26,13 +31,43 @@ import {
   type ListPaymentEvidenceForRecoveryInput,
   type ListPaymentEvidenceForRecoveryResult,
   type PaymentEvidenceAdminView,
+  type ListUncertainOperationsOptions,
 } from '../../../contracts/index';
+import { CLEARED_RETRY_STATE, hasRetryState, isRetryDue } from '../retry-backoff';
+import { sha256Payload } from '../sha256-payload';
 import { assertTransitionAllowed } from '../transition-policy';
-import { isRecoverableEvidenceRow } from '../webhook-evidence-resume';
+import {
+  isAwaitingConsumerDeliveryOnly,
+  isRecoverableEvidenceRow,
+} from '../webhook-evidence-resume';
 import type { PaymentReliabilityStore } from './payment-reliability-store';
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** `ORDER BY COALESCE(next_attempt_at, received_at), evidence_id`. */
+function byNextAttemptAt(left: ProviderEvidenceRecord, right: ProviderEvidenceRecord): number {
+  return (
+    compareIsoTimes(
+      left.nextAttemptAt ?? left.receivedAt,
+      right.nextAttemptAt ?? right.receivedAt,
+    ) || left.evidenceId.localeCompare(right.evidenceId)
+  );
+}
+
+/** `ORDER BY COALESCE(next_attempt_at, created_at), operation_id`. */
+function operationsByNextAttemptAt(left: PaymentOperation, right: PaymentOperation): number {
+  return (
+    compareIsoTimes(left.nextAttemptAt ?? left.createdAt, right.nextAttemptAt ?? right.createdAt) ||
+    left.operationId.localeCompare(right.operationId)
+  );
+}
+
+/** Compares instants, so `nextAttemptAt` written with another offset or precision still sorts. */
+function compareIsoTimes(left: string, right: string): number {
+  const difference = Date.parse(left) - Date.parse(right);
+  return Number.isFinite(difference) ? Math.sign(difference) : left.localeCompare(right);
 }
 
 export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
@@ -57,6 +92,11 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
   private readonly sellerConnections = new Map<string, SellerConnectionRecord>();
   private readonly marketplaceUnits = new Map<string, MarketplacePurchaseUnitRecord>();
   private readonly marketplaceUnitsByCaptureId = new Map<string, MarketplacePurchaseUnitRecord>();
+  /** Index entries each operation occupies, so a cleared or changed provider id stops matching. */
+  private readonly operationIndexEntries = new Map<
+    string,
+    Array<[Map<string, PaymentOperation>, string]>
+  >();
 
   async createOperation(input: CreatePaymentOperationInput): Promise<PaymentOperation> {
     const idempotencyKey = `${input.idempotencyScope}::${input.idempotencyKey}`;
@@ -120,6 +160,7 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
       nextBillingTime: input.nextBillingTime ?? null,
       lifecycleReason: input.lifecycleReason ?? null,
       providerSubscriptionStateAt: input.providerSubscriptionStateAt ?? null,
+      subscriptionStateJson: input.subscriptionStateJson ?? null,
       sellerRef: input.sellerRef ?? null,
       providerReferralId: input.providerReferralId ?? null,
       executionLeaseExpiresAt: input.executionLeaseExpiresAt ?? null,
@@ -128,6 +169,7 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
       createdAt: timestamp,
       updatedAt: timestamp,
     };
+    this.assertProviderIdsUnbound(operation);
     this.operations.set(operation.operationId, operation);
     this.operationsByIdempotency.set(idempotencyKey, operation);
     this.indexOperationReferences(operation);
@@ -326,6 +368,7 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
       expectedVersion: current.version,
       nextStatus: 'submitted',
       reason: 'Claimed for provider execution',
+      transitionKind: OPERATION_TRANSITION_KIND.CLAIM_EXECUTION,
     });
   }
 
@@ -406,6 +449,9 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
       executionOwnerToken,
       executionLeaseExpiresAt,
       reason,
+      transitionKind: claimableFromPrepared
+        ? OPERATION_TRANSITION_KIND.CLAIM_EXECUTION
+        : OPERATION_TRANSITION_KIND.CLAIM_RETRY,
     });
 
     return { kind: 'acquired', operation, executionOwnerToken };
@@ -500,14 +546,23 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
         input.providerSubscriptionStateAt !== undefined
           ? input.providerSubscriptionStateAt
           : current.providerSubscriptionStateAt,
+      subscriptionStateJson:
+        input.subscriptionStateJson !== undefined
+          ? input.subscriptionStateJson
+          : (current.subscriptionStateJson ?? null),
       sellerRef: input.sellerRef !== undefined ? input.sellerRef : current.sellerRef,
       providerReferralId:
         input.providerReferralId !== undefined
           ? input.providerReferralId
           : current.providerReferralId,
+      attempts: input.attempts !== undefined ? input.attempts : current.attempts,
+      nextAttemptAt:
+        input.nextAttemptAt !== undefined ? input.nextAttemptAt : current.nextAttemptAt,
+      retryStatus: input.retryStatus !== undefined ? input.retryStatus : current.retryStatus,
       version: current.version + 1,
       updatedAt: nowIso(),
     };
+    this.assertProviderIdsUnbound(updated);
     this.operations.set(updated.operationId, updated);
     this.operationsByIdempotency.set(
       `${updated.idempotencyScope}::${updated.idempotencyKey}`,
@@ -545,32 +600,14 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
       );
     }
 
-    if (input.providerReferenceId) {
-      const bound = await this.findOperationByProviderReference(
-        current.providerCode,
-        current.accountRef,
-        current.environment,
-        input.providerReferenceId,
-      );
-      if (bound && bound.operationId !== current.operationId) {
-        throw new PaymentReliabilityError(
-          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
-          PAYMENT_RPC_TRANSITION_DETAIL.PROVIDER_REFERENCE_BOUND,
-          {
-            rejectionReason: PAYMENT_TRANSITION_REJECTION_REASON.PROVIDER_REFERENCE_BOUND,
-          },
-        );
-      }
-    }
-
-    assertTransitionAllowed(current.status, input.nextStatus);
-
     const updated: PaymentOperation = {
       ...current,
       status: input.nextStatus,
+      // A transition never unbinds a provider reference: `null` keeps it too.
       providerReferenceId: input.providerReferenceId ?? current.providerReferenceId,
-      failureCode: input.failureCode ?? current.failureCode,
-      failureMessage: input.failureMessage ?? current.failureMessage,
+      failureCode: input.failureCode !== undefined ? input.failureCode : current.failureCode,
+      failureMessage:
+        input.failureMessage !== undefined ? input.failureMessage : current.failureMessage,
       approvalUrl: input.approvalUrl !== undefined ? input.approvalUrl : current.approvalUrl,
       amountMinor: input.amountMinor !== undefined ? input.amountMinor : current.amountMinor,
       currencyCode: input.currencyCode !== undefined ? input.currencyCode : current.currencyCode,
@@ -640,6 +677,10 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
         input.providerSubscriptionStateAt !== undefined
           ? input.providerSubscriptionStateAt
           : current.providerSubscriptionStateAt,
+      subscriptionStateJson:
+        input.subscriptionStateJson !== undefined
+          ? input.subscriptionStateJson
+          : (current.subscriptionStateJson ?? null),
       sellerRef: input.sellerRef !== undefined ? input.sellerRef : current.sellerRef,
       providerReferralId:
         input.providerReferralId !== undefined
@@ -656,6 +697,9 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
       version: current.version + 1,
       updatedAt: nowIso(),
     };
+    this.assertProviderIdsUnbound(updated);
+    assertTransitionAllowed(current.status, input.nextStatus);
+
     this.operations.set(updated.operationId, updated);
     this.operationsByIdempotency.set(
       `${updated.idempotencyScope}::${updated.idempotencyKey}`,
@@ -670,6 +714,7 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
       toStatus: input.nextStatus,
       evidenceId: input.evidenceId ?? null,
       reason: input.reason,
+      transitionKind: input.transitionKind ?? null,
       createdAt: updated.updatedAt,
     });
 
@@ -753,17 +798,17 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
         input.relatedOperationId !== undefined
           ? input.relatedOperationId
           : current.relatedOperationId,
-      eventType: input.eventType ?? current.eventType,
-      resourceId: input.resourceId ?? current.resourceId,
-      errorCode: 'errorCode' in input ? (input.errorCode ?? null) : current.errorCode,
-      errorMessage: 'errorMessage' in input ? (input.errorMessage ?? null) : current.errorMessage,
+      eventType: input.eventType !== undefined ? input.eventType : current.eventType,
+      resourceId: input.resourceId !== undefined ? input.resourceId : current.resourceId,
+      errorCode: input.errorCode !== undefined ? input.errorCode : current.errorCode,
+      errorMessage: input.errorMessage !== undefined ? input.errorMessage : current.errorMessage,
       claimLeaseExpiresAt:
         input.claimLeaseExpiresAt !== undefined
           ? input.claimLeaseExpiresAt
           : current.claimLeaseExpiresAt,
       claimWorkerId:
         input.claimWorkerId !== undefined ? input.claimWorkerId : current.claimWorkerId,
-      processedAt: input.processedAt ?? current.processedAt,
+      processedAt: input.processedAt !== undefined ? input.processedAt : current.processedAt,
       consumerDeliveryStatus:
         input.consumerDeliveryStatus !== undefined
           ? input.consumerDeliveryStatus
@@ -780,6 +825,10 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
         input.consumerDeliveryLastError !== undefined
           ? input.consumerDeliveryLastError
           : current.consumerDeliveryLastError,
+      attempts: input.attempts !== undefined ? input.attempts : current.attempts,
+      nextAttemptAt:
+        input.nextAttemptAt !== undefined ? input.nextAttemptAt : current.nextAttemptAt,
+      retryStatus: input.retryStatus !== undefined ? input.retryStatus : current.retryStatus,
       updatedAt: nowIso(),
     };
     this.evidence.set(updated.evidenceId, updated);
@@ -816,9 +865,24 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
       }
       return true;
     };
+    const deliveryWanted = (row: ProviderEvidenceRecord) =>
+      input.includeConsumerDelivery !== false || !isAwaitingConsumerDeliveryOnly(row);
+    const verificationWanted = (row: ProviderEvidenceRecord) =>
+      input.includePendingVerification !== false || row.verificationStatus !== 'pending';
+    // Rows named explicitly are claimed whatever their backoff; `gave_up` still excludes them.
+    const due = (row: ProviderEvidenceRecord) =>
+      Boolean(input.evidenceIds?.length) || isRetryDue({ nextAttemptAt: row.nextAttemptAt }, now);
     const candidates = [...this.evidence.values()]
-      .filter((row) => leaseAvailable(row) && scopeMatch(row) && isRecoverableEvidenceRow(row))
-      .sort((a, b) => a.receivedAt.localeCompare(b.receivedAt))
+      .filter(
+        (row) =>
+          leaseAvailable(row) &&
+          scopeMatch(row) &&
+          isRecoverableEvidenceRow(row) &&
+          deliveryWanted(row) &&
+          verificationWanted(row) &&
+          due(row),
+      )
+      .sort(byNextAttemptAt)
       .slice(0, input.limit);
     const leaseUntil = new Date(now + input.leaseMs).toISOString();
     return Promise.all(
@@ -830,6 +894,24 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
         }),
       ),
     );
+  }
+
+  async reviveUnmatchedEvidence(input: ReviveUnmatchedEvidenceInput): Promise<number> {
+    const rows = [...this.evidence.values()].filter(
+      (row) =>
+        row.evidenceKind === 'webhook' &&
+        row.verificationStatus === 'verified' &&
+        row.processingStatus === 'unmatched' &&
+        row.providerCode === input.providerCode &&
+        row.accountRef === input.accountRef &&
+        row.environment === input.environment &&
+        row.resourceId === input.resourceId &&
+        hasRetryState(row),
+    );
+    for (const row of rows) {
+      await this.updateEvidence({ evidenceId: row.evidenceId, ...CLEARED_RETRY_STATE });
+    }
+    return rows.length;
   }
 
   async listProviderEvidenceForRecovery(
@@ -854,20 +936,48 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
   }
 
   async listReconciliationCandidates(limit: number): Promise<ProviderEvidenceRecord[]> {
+    const now = Date.now();
     return [...this.evidence.values()]
       .filter(
         (row) =>
+          row.evidenceKind === 'webhook' &&
           row.verificationStatus === 'verified' &&
           (row.processingStatus === 'unmatched' ||
             (row.relatedOperationId &&
-              this.operations.get(row.relatedOperationId)?.status === 'unknown')),
+              this.operations.get(row.relatedOperationId)?.status === 'unknown')) &&
+          isRetryDue(row, now),
       )
+      .sort(byNextAttemptAt)
       .slice(0, limit);
   }
 
-  async listUncertainOperations(limit: number): Promise<PaymentOperation[]> {
+  async listUncertainOperations(
+    limit: number,
+    options: ListUncertainOperationsOptions = {},
+  ): Promise<PaymentOperation[]> {
+    const now = Date.now();
+    const staleBefore = options.submittedStaleBefore
+      ? Date.parse(options.submittedStaleBefore)
+      : Number.NaN;
+    const staleKinds = options.submittedStaleKinds ?? DEFAULT_SUBMITTED_STALE_KINDS;
+    const isStaleSubmitted = (operation: PaymentOperation) =>
+      operation.status === 'submitted' &&
+      Number.isFinite(staleBefore) &&
+      staleKinds.includes(operation.kind) &&
+      !operation.providerReferenceId &&
+      Date.parse(operation.updatedAt) <= staleBefore &&
+      !(
+        operation.executionOwnerToken &&
+        operation.executionLeaseExpiresAt &&
+        Date.parse(operation.executionLeaseExpiresAt) > now
+      );
     return [...this.operations.values()]
-      .filter((operation) => operation.status === 'unknown')
+      .filter(
+        (operation) =>
+          (operation.status === 'unknown' || isStaleSubmitted(operation)) &&
+          isRetryDue(operation, now),
+      )
+      .sort(operationsByNextAttemptAt)
       .slice(0, limit);
   }
 
@@ -934,56 +1044,82 @@ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
     return attempt;
   }
 
-  private indexOperationReferences(operation: PaymentOperation): void {
+  /** Unique provider-id indexes: what a SQL store enforces with partial unique indexes. */
+  private uniqueProviderIdEntries(
+    operation: PaymentOperation,
+  ): Array<[Map<string, PaymentOperation>, string]> {
     const scope = `${operation.providerCode}::${operation.accountRef}::${operation.environment}`;
+    const entries: Array<[Map<string, PaymentOperation>, string]> = [];
     if (operation.providerReferenceId) {
-      this.operationsByProviderRef.set(`${scope}::${operation.providerReferenceId}`, operation);
-    }
-    if (operation.providerOrderId) {
-      this.operationsByProviderOrderId.set(`${scope}::${operation.providerOrderId}`, operation);
-    }
-    if (operation.providerCaptureId) {
-      this.operationsByProviderCaptureId.set(`${scope}::${operation.providerCaptureId}`, operation);
-    }
-    if (operation.providerRefundId) {
-      this.operationsByProviderRefundId.set(`${scope}::${operation.providerRefundId}`, operation);
-    }
-    if (operation.senderBatchId) {
-      this.operationsBySenderBatchId.set(`${scope}::${operation.senderBatchId}`, operation);
-    }
-    if (operation.senderItemId) {
-      this.operationsBySenderItemId.set(`${scope}::${operation.senderItemId}`, operation);
-    }
-    if (operation.providerPayoutBatchId) {
-      this.operationsByProviderPayoutBatchId.set(
-        `${scope}::${operation.providerPayoutBatchId}`,
-        operation,
-      );
-    }
-    if (operation.providerPayoutItemId) {
-      this.operationsByProviderPayoutItemId.set(
-        `${scope}::${operation.providerPayoutItemId}`,
-        operation,
-      );
+      entries.push([this.operationsByProviderRef, `${scope}::${operation.providerReferenceId}`]);
     }
     if (operation.providerProductId && operation.kind === 'catalog_product') {
-      this.operationsByProviderProductId.set(`${scope}::${operation.providerProductId}`, operation);
+      entries.push([
+        this.operationsByProviderProductId,
+        `${scope}::${operation.providerProductId}`,
+      ]);
     }
     if (operation.providerPlanId && operation.kind === 'billing_plan') {
-      this.operationsByProviderPlanId.set(`${scope}::${operation.providerPlanId}`, operation);
+      entries.push([this.operationsByProviderPlanId, `${scope}::${operation.providerPlanId}`]);
     }
     if (operation.providerSubscriptionId && operation.kind === 'subscription') {
-      this.operationsByProviderSubscriptionId.set(
+      entries.push([
+        this.operationsByProviderSubscriptionId,
         `${scope}::${operation.providerSubscriptionId}`,
-        operation,
-      );
+      ]);
     }
     if (operation.providerReferralId && operation.kind === 'seller_referral') {
-      this.operationsByProviderReferralId.set(
+      entries.push([
+        this.operationsByProviderReferralId,
         `${scope}::${operation.providerReferralId}`,
-        operation,
-      );
+      ]);
     }
+    return entries;
+  }
+
+  /** Rejects a write that would bind a unique provider id held by another operation. */
+  private assertProviderIdsUnbound(operation: PaymentOperation): void {
+    for (const [index, key] of this.uniqueProviderIdEntries(operation)) {
+      const bound = index.get(key);
+      if (bound && bound.operationId !== operation.operationId) {
+        throw new PaymentReliabilityError(
+          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
+          PAYMENT_RPC_TRANSITION_DETAIL.PROVIDER_REFERENCE_BOUND,
+          {
+            rejectionReason: PAYMENT_TRANSITION_REJECTION_REASON.PROVIDER_REFERENCE_BOUND,
+          },
+        );
+      }
+    }
+  }
+
+  private indexOperationReferences(operation: PaymentOperation): void {
+    for (const [index, key] of this.operationIndexEntries.get(operation.operationId) ?? []) {
+      if (index.get(key)?.operationId === operation.operationId) {
+        index.delete(key);
+      }
+    }
+    const scope = `${operation.providerCode}::${operation.accountRef}::${operation.environment}`;
+    // Checkout and payout ids are not unique (a capture shares its order id): latest write wins.
+    const entries = this.uniqueProviderIdEntries(operation);
+    const shared: Array<[Map<string, PaymentOperation>, string | null]> = [
+      [this.operationsByProviderOrderId, operation.providerOrderId],
+      [this.operationsByProviderCaptureId, operation.providerCaptureId],
+      [this.operationsByProviderRefundId, operation.providerRefundId],
+      [this.operationsBySenderBatchId, operation.senderBatchId],
+      [this.operationsBySenderItemId, operation.senderItemId],
+      [this.operationsByProviderPayoutBatchId, operation.providerPayoutBatchId],
+      [this.operationsByProviderPayoutItemId, operation.providerPayoutItemId],
+    ];
+    for (const [index, id] of shared) {
+      if (id) {
+        entries.push([index, `${scope}::${id}`]);
+      }
+    }
+    for (const [index, key] of entries) {
+      index.set(key, operation);
+    }
+    this.operationIndexEntries.set(operation.operationId, entries);
   }
 
   async createSellerConnection(
@@ -1338,6 +1474,9 @@ export function toPaymentEvidenceAdminView(row: ProviderEvidenceRecord): Payment
     consumerDeliveredAt: row.consumerDeliveredAt,
     consumerDeliveryAttempts: row.consumerDeliveryAttempts,
     consumerDeliveryLastError: row.consumerDeliveryLastError,
+    attempts: row.attempts ?? null,
+    nextAttemptAt: row.nextAttemptAt ?? null,
+    retryStatus: row.retryStatus ?? null,
     eventType: row.eventType,
     resourceId: row.resourceId,
     errorCode: row.errorCode,
@@ -1347,6 +1486,5 @@ export function toPaymentEvidenceAdminView(row: ProviderEvidenceRecord): Payment
   };
 }
 
-export function sha256Payload(rawPayload: string): string {
-  return createHash('sha256').update(rawPayload, 'utf8').digest('hex');
-}
+/** Kept for compatibility: the helper now lives in `../sha256-payload`. */
+export { sha256Payload };

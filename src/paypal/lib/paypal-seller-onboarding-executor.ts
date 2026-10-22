@@ -11,11 +11,20 @@ import {
 } from '../../contracts/index';
 import {
   assertCapabilityReady,
+  pathSegment,
   type ResolvedPaymentRuntime,
   type SellerOnboardingProviderPort,
 } from '../../core/index';
+import {
+  resendWithFreshPaypalTokenOn401,
+  type PaypalAccessTokenScope,
+} from './paypal-access-token-retry';
 import type { PaypalCheckoutTokenProvider } from './paypal-checkout-executor';
-import type { PaypalSellerOnboardingHttpClient } from './paypal-seller-onboarding-http-client';
+import type {
+  PaypalSellerOnboardingHttpClient,
+  PaypalSellerOnboardingHttpRequest,
+  PaypalSellerOnboardingHttpResponse,
+} from './paypal-seller-onboarding-http-client';
 
 export type PaypalSellerOnboardingPartnerConfig = {
   partnerMerchantId: string;
@@ -101,18 +110,25 @@ export class PaypalSellerOnboardingExecutor implements SellerOnboardingProviderP
     private readonly partnerConfig: PaypalSellerOnboardingPartnerConfig,
   ) {}
 
+  private authorizedRequest(
+    scope: PaypalAccessTokenScope,
+    token: string,
+    request: Omit<PaypalSellerOnboardingHttpRequest, 'accessToken'>,
+  ): Promise<PaypalSellerOnboardingHttpResponse> {
+    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
+      this.httpClient.request({ ...request, accessToken }),
+    );
+  }
+
   async createReferral(
     input: ExecuteCreateSellerReferralRequest,
   ): Promise<ExecuteCreateSellerReferralResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'seller_onboarding');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
       path: `${baseUrl(input.environment)}/v2/customer/partner-referrals`,
-      accessToken: token,
       attributionId: this.partnerConfig.partnerAttributionId,
       requestId: input.providerRequestId,
       body: {
@@ -153,14 +169,11 @@ export class PaypalSellerOnboardingExecutor implements SellerOnboardingProviderP
     input: ExecuteGetSellerReferralRequest,
   ): Promise<ExecuteGetSellerReferralResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'seller_onboarding');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl(input.environment)}/v2/customer/partner-referrals/${input.providerReferralId}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v2/customer/partner-referrals/${pathSegment(input.providerReferralId, 'providerReferralId')}`,
       attributionId: this.partnerConfig.partnerAttributionId,
     });
     if (response.status >= 400) {
@@ -177,14 +190,11 @@ export class PaypalSellerOnboardingExecutor implements SellerOnboardingProviderP
     input: ExecuteFindSellerMerchantRequest,
   ): Promise<ExecuteFindSellerMerchantResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'seller_onboarding');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl(input.environment)}/v1/customer/partners/${this.partnerConfig.partnerMerchantId}/merchant-integrations?tracking_id=${encodeURIComponent(input.trackingId)}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v1/customer/partners/${pathSegment(this.partnerConfig.partnerMerchantId, 'partnerMerchantId')}/merchant-integrations?tracking_id=${encodeURIComponent(input.trackingId)}`,
       attributionId: this.partnerConfig.partnerAttributionId,
     });
     if (response.status === 404) {
@@ -231,14 +241,11 @@ export class PaypalSellerOnboardingExecutor implements SellerOnboardingProviderP
     input: ExecuteGetSellerMerchantStatusRequest,
   ): Promise<ExecuteGetSellerMerchantStatusResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'seller_onboarding');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl(input.environment)}/v1/customer/partners/${this.partnerConfig.partnerMerchantId}/merchant-integrations/${input.providerMerchantId}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v1/customer/partners/${pathSegment(this.partnerConfig.partnerMerchantId, 'partnerMerchantId')}/merchant-integrations/${pathSegment(input.providerMerchantId, 'providerMerchantId')}`,
       attributionId: this.partnerConfig.partnerAttributionId,
     });
     if (response.status >= 400) {

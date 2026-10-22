@@ -1,4 +1,5 @@
 import type { PaymentEnvironment } from './capabilities';
+import type { RetryStatus } from './retry';
 
 export type ClaimPendingEvidenceInput = {
   limit: number;
@@ -8,6 +9,19 @@ export type ClaimPendingEvidenceInput = {
   environment?: PaymentEnvironment;
   providerCode?: string;
   accountRef?: string;
+  /**
+   * When `false`, rows whose only remaining work is consumer delivery (verified, processed,
+   * delivery not confirmed) are not claimed. Default `true`. Recovery passes `false` when no
+   * consumer is configured; a store must honour it, or those rows fill every batch and starve
+   * newer work.
+   */
+  includeConsumerDelivery?: boolean;
+  /**
+   * When `false`, rows whose verification is still `pending` are not claimed. Default `true`.
+   * Recovery passes `false`: it cannot verify a row without the transmission headers (only a
+   * provider redelivery can), so those rows would only be skipped and fill every batch (issue #20).
+   */
+  includePendingVerification?: boolean;
 };
 
 export type RecoverPaymentReliabilityInput = {
@@ -64,6 +78,9 @@ export type PaymentEvidenceAdminView = {
   consumerDeliveredAt?: string | null;
   consumerDeliveryAttempts?: number;
   consumerDeliveryLastError?: string | null;
+  attempts?: number | null;
+  nextAttemptAt?: string | null;
+  retryStatus?: RetryStatus | null;
   eventType: string | null;
   resourceId: string | null;
   errorCode: string | null;

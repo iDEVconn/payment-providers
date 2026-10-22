@@ -3,22 +3,24 @@ import {
   PaymentReliabilityError,
   type CanonicalMoney,
 } from '../../contracts/index';
-
-const CURRENCY_FRACTION_DIGITS: Record<string, number> = {
-  USD: 2,
-  EUR: 2,
-  GBP: 2,
-  JPY: 0,
-};
+import { currencyMinorUnitExponent } from '../../subscription-core/lib/subscription-money';
 
 const UNSAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 
+/** ISO 4217 minor-unit digits; one table, shared with the pure subscription core. */
 export function currencyFractionDigits(currency: string): number {
-  const normalized = currency.trim().toUpperCase();
-  return CURRENCY_FRACTION_DIGITS[normalized] ?? 2;
+  return currencyMinorUnitExponent(currency.trim());
 }
 
-export function validateCanonicalMoney(input: CanonicalMoney): CanonicalMoney {
+export type ValidateCanonicalMoneyOptions = {
+  /** Accept a zero amount (free trial cycles); negative amounts are still rejected. */
+  allowZero?: boolean;
+};
+
+export function validateCanonicalMoney(
+  input: CanonicalMoney,
+  options: ValidateCanonicalMoneyOptions = {},
+): CanonicalMoney {
   const currency = input.currency?.trim().toUpperCase();
   if (!currency || !/^[A-Z]{3}$/.test(currency)) {
     throw new PaymentReliabilityError(
@@ -54,7 +56,7 @@ export function validateCanonicalMoney(input: CanonicalMoney): CanonicalMoney {
       'amountMinor exceeds safe integer range',
     );
   }
-  if (value === 0n) {
+  if (value === 0n && !options.allowZero) {
     throw new PaymentReliabilityError(
       PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
       'amountMinor must be greater than zero',
@@ -87,7 +89,16 @@ export function minorUnitsToMajorString(amountMinor: string, currency: string): 
 }
 
 /** Map canonical money to legacy CreateOrderInput.amount without changing legacy DTO shape. */
-export function canonicalMoneyToLegacyMajorAmount(money: CanonicalMoney): string {
+export function canonicalMoneyToLegacyMajorAmount(
+  money: CanonicalMoney,
+  options: ValidateCanonicalMoneyOptions = {},
+): string {
+  if (options.allowZero) {
+    const validated = validateCanonicalMoney(money, options);
+    if (BigInt(validated.amountMinor) === 0n) {
+      return '0';
+    }
+  }
   return minorUnitsToMajorString(money.amountMinor, money.currency);
 }
 

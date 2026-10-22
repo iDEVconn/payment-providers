@@ -137,13 +137,39 @@ export type SubscriptionProviderPlanReference = {
   planOperationId?: never;
 };
 
-export type CreateSubscriptionRequest = SubscriptionProviderContext & {
-  idempotencyKey: string;
-  correlationId?: string | null;
-  subscriber: SubscriberInput;
-  returnUrl?: string | null;
-  cancelUrl?: string | null;
-} & (SubscriptionPlanOperationReference | SubscriptionProviderPlanReference);
+/** PayPal `application_context.shipping_preference`. */
+export type SubscriptionShippingPreference =
+  | 'GET_FROM_FILE'
+  | 'NO_SHIPPING'
+  | 'SET_PROVIDED_ADDRESS';
+
+/** PayPal `application_context.user_action`. */
+export type SubscriptionUserAction = 'CONTINUE' | 'SUBSCRIBE_NOW';
+
+/** Optional correlation and checkout-experience fields for subscription creation. */
+export type SubscriptionCreateOptions = {
+  /** Host correlation id echoed by PayPal as `custom_id` (at most 127 characters). */
+  customId?: string | null;
+  /**
+   * Defaults to `NO_SHIPPING` unless `productType` is `PHYSICAL`, so digital buyers
+   * are not asked for a shipping address.
+   */
+  shippingPreference?: SubscriptionShippingPreference | null;
+  /** Merchant name shown on the PayPal approval page (at most 127 characters). */
+  brandName?: string | null;
+  userAction?: SubscriptionUserAction | null;
+  /** Type of the product behind the plan; drives the shipping preference default. */
+  productType?: ProductType | null;
+};
+
+export type CreateSubscriptionRequest = SubscriptionProviderContext &
+  SubscriptionCreateOptions & {
+    idempotencyKey: string;
+    correlationId?: string | null;
+    subscriber: SubscriberInput;
+    returnUrl?: string | null;
+    cancelUrl?: string | null;
+  } & (SubscriptionPlanOperationReference | SubscriptionProviderPlanReference);
 
 export type SubscriptionResult = {
   subscriptionOperationId: string;
@@ -169,12 +195,13 @@ export type GetSubscriptionRequest = SubscriptionProviderContext & {
 export type GetSubscriptionResult = SubscriptionResult;
 
 /** Explicit recovery for subscription create stuck without a provider subscription id. */
-export type RetrySubscriptionCreateRequest = SubscriptionProviderContext & {
-  subscriptionOperationId: string;
-  subscriber: SubscriberInput;
-  returnUrl?: string | null;
-  cancelUrl?: string | null;
-} & (SubscriptionPlanOperationReference | SubscriptionProviderPlanReference);
+export type RetrySubscriptionCreateRequest = SubscriptionProviderContext &
+  SubscriptionCreateOptions & {
+    subscriptionOperationId: string;
+    subscriber: SubscriberInput;
+    returnUrl?: string | null;
+    cancelUrl?: string | null;
+  } & (SubscriptionPlanOperationReference | SubscriptionProviderPlanReference);
 
 export type SubscriptionProviderCreateRetryEligibility = 'allowed' | 'expired' | 'unavailable';
 
@@ -253,13 +280,14 @@ export type ExecutePlanLifecycleRequest = SubscriptionProviderContext & {
 
 export type ExecutePlanLifecycleResult = ExecuteGetBillingPlanResult;
 
-export type ExecuteCreateSubscriptionRequest = SubscriptionProviderContext & {
-  providerRequestId: string;
-  providerPlanId: string;
-  subscriberEmail?: string | null;
-  returnUrl?: string | null;
-  cancelUrl?: string | null;
-};
+export type ExecuteCreateSubscriptionRequest = SubscriptionProviderContext &
+  SubscriptionCreateOptions & {
+    providerRequestId: string;
+    providerPlanId: string;
+    subscriberEmail?: string | null;
+    returnUrl?: string | null;
+    cancelUrl?: string | null;
+  };
 
 export type ExecuteCreateSubscriptionResult = {
   providerSubscriptionId: string;
@@ -285,6 +313,12 @@ export type ExecuteGetSubscriptionResult = {
   lifecycleReason: string | null;
   providerDebugId?: string | null;
   providerSubscriptionStateAt?: string | null;
+  /** `billing_info.last_payment`; `time` is null when PayPal sent none. */
+  lastPayment?: (CanonicalMoney & { time: string | null }) | null;
+  /** `billing_info.failed_payments_count`. */
+  failedPaymentsCount?: number | null;
+  /** `billing_info.outstanding_balance`. */
+  outstandingBalance?: CanonicalMoney | null;
 };
 
 export type ExecuteSubscriptionLifecycleRequest = SubscriptionProviderContext & {

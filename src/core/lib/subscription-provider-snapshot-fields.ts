@@ -1,3 +1,7 @@
+/**
+ * @deprecated The engine maps provider snapshots with `subscriptionEventFromProviderSnapshot` and
+ * the pure reducer. Kept for existing callers.
+ */
 export function subscriptionBillingFieldsFromProviderSnapshot(snapshot: {
   startTime?: string | null;
   nextBillingTime?: string | null;

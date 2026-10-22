@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  PAYMENT_RELIABILITY_ERROR,
+  PAYMENT_TRANSITION_REJECTION_REASON,
+  PaymentReliabilityError,
+} from '../../../contracts/index';
+import {
   assertSubscriptionTransitionAllowed,
   mapPlanWebhookEventToStatus,
   mapSubscriptionWebhookEventToStatus,
@@ -28,8 +33,33 @@ describe('subscription-transition-policy', () => {
     expect(() => assertSubscriptionTransitionAllowed('active', 'approval_pending')).toThrow();
   });
 
+  it('blocks approved and suspended subscriptions from regressing to approval_pending', () => {
+    expect(() => assertSubscriptionTransitionAllowed('approved', 'approval_pending')).toThrow();
+    expect(() => assertSubscriptionTransitionAllowed('suspended', 'approval_pending')).toThrow();
+    expect(() => assertSubscriptionTransitionAllowed('unknown', 'approval_pending')).not.toThrow();
+  });
+
   it('allows active and suspended to toggle', () => {
     expect(() => assertSubscriptionTransitionAllowed('active', 'suspended')).not.toThrow();
     expect(() => assertSubscriptionTransitionAllowed('suspended', 'active')).not.toThrow();
+  });
+});
+
+describe('subscription-transition-policy errors', () => {
+  it.each([
+    ['cancelled', 'active'],
+    ['active', 'approval_pending'],
+  ] as const)('throws a typed PaymentReliabilityError for %s -> %s', (current, next) => {
+    let thrown: unknown;
+    try {
+      assertSubscriptionTransitionAllowed(current, next);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(PaymentReliabilityError);
+    expect(thrown).toMatchObject({
+      code: PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
+      rejectionReason: PAYMENT_TRANSITION_REJECTION_REASON.INVALID_TRANSITION,
+    });
   });
 });

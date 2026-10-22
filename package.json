@@ -38,6 +38,52 @@
         "types": "./dist/paypal.d.cts",
         "default": "./dist/paypal.cjs"
       }
+    },
+    "./subscription": {
+      "import": {
+        "types": "./dist/subscription.d.ts",
+        "default": "./dist/subscription.js"
+      },
+      "require": {
+        "types": "./dist/subscription.d.cts",
+        "default": "./dist/subscription.cjs"
+      }
+    },
+    "./legacy": {
+      "import": {
+        "types": "./dist/legacy.d.ts",
+        "default": "./dist/legacy.js"
+      },
+      "require": {
+        "types": "./dist/legacy.d.cts",
+        "default": "./dist/legacy.cjs"
+      }
+    },
+    "./testing": {
+      "import": {
+        "types": "./dist/testing.d.ts",
+        "default": "./dist/testing.js"
+      },
+      "require": {
+        "types": "./dist/testing.d.cts",
+        "default": "./dist/testing.cjs"
+      }
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "paypal": [
+        "./dist/paypal.d.ts"
+      ],
+      "subscription": [
+        "./dist/subscription.d.ts"
+      ],
+      "legacy": [
+        "./dist/legacy.d.ts"
+      ],
+      "testing": [
+        "./dist/testing.d.ts"
+      ]
     }
   },
   "files": [
@@ -53,18 +99,24 @@
     "lint": "eslint src",
     "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build"
   },
-  "dependencies": {
+  "peerDependencies": {
     "@idevconn/payment": "^1.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@idevconn/payment": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.3",
+    "@idevconn/payment": "^1.2.0",
     "@types/node": "^22.10.0",
     "@typescript-eslint/eslint-plugin": "^8.70.0",
     "@typescript-eslint/parser": "^8.70.0",
     "eslint": "^9.17.0",
     "tsup": "^8.3.0",
     "typescript": "^5.7.2",
-    "vitest": "^3.0.0"
+    "vitest": "^4.1.12"
   },
   "publishConfig": {
     "access": "public"

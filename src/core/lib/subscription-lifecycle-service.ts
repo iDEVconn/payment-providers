@@ -3,7 +3,9 @@ import {
   PAYMENT_TRANSITION_REJECTION_REASON,
   PaymentReliabilityError,
   type PaymentReliabilityErrorCode,
+  type BillingCycleInput,
   type BillingPlanResult,
+  type CanonicalMoney,
   type CatalogProductResult,
   type CreateBillingPlanRequest,
   type CreateCatalogProductRequest,
@@ -15,41 +17,94 @@ import {
   type GetSubscriptionRequest,
   type GetSubscriptionResult,
   type PaymentOperation,
+  type PaymentPreferencesInput,
   type PlanLifecycleRequest,
   type PlanLifecycleResult,
+  type ExecuteCreateSubscriptionResult,
   type ExecuteSubscriptionLifecycleResult,
   type SubscriptionLifecycleCommandRequest,
   type SubscriptionLifecycleCommandResult,
   type SubscriptionResult,
   type RetrySubscriptionCreateRequest,
+  type SubscriptionCreateOptions,
   type SubscriptionProviderContext,
   type SubscriptionProviderCreateRetryEligibility,
   isExecuteSubscriptionLifecycleRefreshPending,
 } from '../../contracts/index';
 import { buildCommandFingerprint } from './command-fingerprint';
 import {
+  formatProviderFailureMessage,
   isTerminalPreProviderFailureCode,
   resolveProviderFailure,
 } from './resolve-provider-failure';
 import { maskSubscriberEmail, maskSubscriberRef } from './mask-subscriber';
 import { buildOperationIdempotencyScope } from './operation-idempotency';
 import { validateBillingCycles } from './subscription-billing-cycles';
+import {
+  compareMinorUnits,
+  isMinorUnitString,
+} from '../../subscription-core/lib/subscription-money';
+import {
+  resolveSubscriptionCreateOptions,
+  subscriptionCreateFingerprintFields,
+} from './subscription-create-options';
 import type { SubscriptionProviderPort } from './subscription-provider-port';
 import {
   planStatusToOperationStatus,
   subscriptionStatusToOperationStatus,
 } from './subscription-transition-policy';
-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
+import type {
+  CreateExecutionLeaseStore,
+  EvidenceStore,
+  OperationStore,
+} from './persistence/payment-reliability-store';
+import { clearResolvedOperationRetryState } from './retry-backoff';
+import { resolveFirstProviderExecutionAt } from './provider-execution-transition';
 import {
+  HELD_EFFECTS_OVERFLOW,
   applyPlanDomainUpdate,
-  applySubscriptionDomainUpdate,
+  applySubscriptionEvents,
+  deliverSubscriptionEffects,
+  readHeldSubscriptionEffects,
+  subscriptionEventFromProviderSnapshot,
+  type ApplySubscriptionEventsResult,
+  type SubscriptionEffectsHooks,
 } from './subscription-evidence-application';
-import {
-  assertSubscriptionProviderPlanSnapshotConsistent,
-  isSubscriptionProviderPlanMismatchError,
-} from './subscription-provider-plan-consistency';
 
-const SUBSCRIPTION_CLAIMED_FOR_EXECUTION_REASON = 'Claimed for provider execution';
+/**
+ * Lowest price PayPal can charge in one payment of this plan: the smallest positive cycle price or
+ * setup fee. Stored on the plan operation (`amountMinor`/`currencyCode`) so a `PAYMENT.SALE.COMPLETED`
+ * below it is reported as `amount_mismatch` (#4). Null when the plan has no paid amount or mixes
+ * currencies. Limits: a priced trial or a setup fee below the regular price lowers this amount (a
+ * regular renewal at that amount passes); after the price goes down at PayPal, renewals are
+ * `amount_mismatch` until the host stores the new amount (`adoptSubscriptionPlan`, or the
+ * subscription's own `amountMinor`/`currencyCode`).
+ */
+function expectedPlanPayment(
+  cycles: BillingCycleInput[],
+  paymentPreferences: PaymentPreferencesInput,
+): CanonicalMoney | null {
+  const prices = [...cycles.map((cycle) => cycle.price), paymentPreferences.setupFee].filter(
+    (price): price is CanonicalMoney =>
+      price != null && isMinorUnitString(price.amountMinor) && BigInt(price.amountMinor) > 0n,
+  );
+  const currencies = new Set(prices.map((price) => price.currency.trim().toUpperCase()));
+  if (prices.length === 0 || currencies.size !== 1) {
+    return null;
+  }
+  const lowest = prices.reduce((min, price) =>
+    compareMinorUnits(price.amountMinor, min.amountMinor) < 0 ? price : min,
+  );
+  return { amountMinor: lowest.amountMinor, currency: [...currencies][0] as string };
+}
+
+/** Key the effects of a lifecycle command are held under until the host hook accepted them. */
+function commandEffectsKey(commandOp: PaymentOperation): string {
+  return `command:${commandOp.operationId}`;
+}
+
+/** Version conflicts an overlapping create can cause before its result is stored. */
+const CREATE_RESULT_PERSIST_ATTEMPTS = 3;
 
 function isTerminal(status: PaymentOperation['status']): boolean {
   return status === 'succeeded' || status === 'failed';
@@ -61,28 +116,68 @@ export type SubscriptionCreateRetryOptions = {
   ) => SubscriptionProviderCreateRetryEligibility;
 };
 
+type SubscriptionCreateFingerprintInput = Pick<
+  CreateSubscriptionRequest,
+  | 'subscriber'
+  | 'returnUrl'
+  | 'cancelUrl'
+  | 'planOperationId'
+  | 'providerPlanId'
+  | 'offeringRef'
+  | keyof SubscriptionCreateOptions
+>;
+
+/**
+ * Every field that shapes the PayPal create request (issue #25): plan reference, subscriber ref and
+ * email, return/cancel URLs and the optional create fields. Fields a request does not use are left
+ * out, so a request without email or optional fields keeps the fingerprint it had in 0.2.
+ */
 function buildSubscriptionCreateCommandFingerprint(
-  input: Pick<
-    CreateSubscriptionRequest,
-    'subscriber' | 'returnUrl' | 'cancelUrl' | 'planOperationId' | 'providerPlanId' | 'offeringRef'
-  >,
+  input: SubscriptionCreateFingerprintInput,
+  { withEmail = true }: { withEmail?: boolean } = {},
 ): string {
   const reference = resolveSubscriptionPlanReference(input);
+  const email = withEmail ? (input.subscriber.email ?? null) : null;
+  const common = {
+    subscriberRef: input.subscriber.subscriberRef,
+    returnUrl: input.returnUrl ?? null,
+    cancelUrl: input.cancelUrl ?? null,
+    ...subscriptionCreateFingerprintFields(input),
+    ...(email !== null ? { subscriberEmail: email } : {}),
+  };
   if (reference.form === 'plan_operation') {
-    return buildCommandFingerprint({
-      planOperationId: reference.planOperationId,
-      subscriberRef: input.subscriber.subscriberRef,
-      returnUrl: input.returnUrl ?? null,
-      cancelUrl: input.cancelUrl ?? null,
-    });
+    return buildCommandFingerprint({ planOperationId: reference.planOperationId, ...common });
   }
   return buildCommandFingerprint({
     providerPlanId: reference.providerPlanId,
     offeringRef: reference.offeringRef,
-    subscriberRef: input.subscriber.subscriberRef,
-    returnUrl: input.returnUrl ?? null,
-    cancelUrl: input.cancelUrl ?? null,
+    ...common,
   });
+}
+
+/**
+ * Operations created before 0.3 have a fingerprint without the subscriber email. Such a row matches
+ * a request whose email-less fingerprint equals it and whose email equals the stored
+ * `subscriberEmail` (which 0.2 stored), so upgraded hosts can still replay and retry it.
+ */
+function matchesSubscriptionCreateFingerprint(
+  operation: PaymentOperation,
+  input: SubscriptionCreateFingerprintInput,
+): boolean {
+  if (operation.commandFingerprint === buildSubscriptionCreateCommandFingerprint(input)) {
+    return true;
+  }
+  const email = input.subscriber.email ?? null;
+  return (
+    email !== null &&
+    operation.subscriberEmail === email &&
+    operation.commandFingerprint ===
+      buildSubscriptionCreateCommandFingerprint(input, { withEmail: false })
+  );
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return error instanceof PaymentReliabilityError && error.code === code;
 }
 
 function assertSubscriptionOperationScope(
@@ -152,7 +247,7 @@ function toSubscriptionResult(
 }
 
 async function markSubscriptionLifecycleCommandSucceeded(
-  store: PaymentReliabilityStore,
+  store: OperationStore,
   commandOp: PaymentOperation,
   kind: string,
 ): Promise<PaymentOperation> {
@@ -164,12 +259,16 @@ async function markSubscriptionLifecycleCommandSucceeded(
   });
 }
 
-function throwNormalizedCommandFailure(commandOp: PaymentOperation): never {
+function throwNormalizedCommandFailure(
+  commandOp: PaymentOperation,
+  providerDebugId: string | null,
+): never {
   const code = (commandOp.failureCode ??
     PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN) as PaymentReliabilityErrorCode;
   throw new PaymentReliabilityError(
     code,
     commandOp.failureMessage ?? 'Subscription lifecycle command failed',
+    { providerDebugId },
   );
 }
 
@@ -208,10 +307,18 @@ function resolveSubscriptionPlanReference(
   return { form: 'provider_plan', providerPlanId, offeringRef };
 }
 
+/** The store capabilities `SubscriptionLifecycleService` uses (a `SubscriptionStore` has them). */
+export type SubscriptionLifecycleStore = OperationStore & CreateExecutionLeaseStore;
+
 export class SubscriptionLifecycleService {
   constructor(
-    private readonly store: PaymentReliabilityStore,
+    private readonly store: SubscriptionLifecycleStore,
     private readonly provider: SubscriptionProviderPort,
+    /**
+     * Optional host hooks; `onSubscriptionEffects` gets the reducer's effects after a cancel,
+     * suspend or activate command saved the provider's state (context `source: 'lifecycle'`).
+     */
+    private readonly hooks: SubscriptionEffectsHooks = {},
   ) {}
 
   async createCatalogProduct(input: CreateCatalogProductRequest): Promise<CatalogProductResult> {
@@ -306,6 +413,7 @@ export class SubscriptionLifecycleService {
     }
 
     const cycles = validateBillingCycles(input.billingCycles);
+    const expectedPayment = expectedPlanPayment(cycles, input.paymentPreferences);
     const fingerprint = buildCommandFingerprint({
       productOperationId: input.productOperationId,
       offeringRef: input.offeringRef ?? null,
@@ -335,6 +443,8 @@ export class SubscriptionLifecycleService {
       offeringRef: input.offeringRef ?? null,
       itemRef: input.name,
       planStatus: input.status === 'ACTIVE' ? 'active' : 'created',
+      amountMinor: expectedPayment?.amountMinor ?? null,
+      currencyCode: expectedPayment?.currency ?? null,
     });
 
     if (
@@ -415,15 +525,14 @@ export class SubscriptionLifecycleService {
       );
     }
 
-    const fingerprint = buildCommandFingerprint({
-      planOperationId: reference.planOperationId,
-      subscriberRef: input.subscriber.subscriberRef,
-      returnUrl: input.returnUrl ?? null,
-      cancelUrl: input.cancelUrl ?? null,
-    });
+    const base = this.subscriptionOperationBase(
+      input,
+      await this.subscriptionCreateFingerprint(input),
+    );
+    await this.assertProviderPlanActiveBeforeCreate(input, base, plan.providerPlanId);
 
     const operation = await this.store.createOperation({
-      ...this.subscriptionOperationBase(input, fingerprint),
+      ...base,
       parentOperationId: plan.operationId,
       providerPlanId: plan.providerPlanId,
       offeringRef: plan.offeringRef ?? null,
@@ -436,30 +545,11 @@ export class SubscriptionLifecycleService {
     input: CreateSubscriptionRequest,
     reference: { providerPlanId: string; offeringRef: string },
   ): Promise<SubscriptionResult> {
-    const fingerprint = buildCommandFingerprint({
-      providerPlanId: reference.providerPlanId,
-      offeringRef: reference.offeringRef,
-      subscriberRef: input.subscriber.subscriberRef,
-      returnUrl: input.returnUrl ?? null,
-      cancelUrl: input.cancelUrl ?? null,
-    });
-    const base = this.subscriptionOperationBase(input, fingerprint);
-
-    const existing = await this.store.findOperationByIdempotency(
-      base.idempotencyScope,
-      base.idempotencyKey,
+    const base = this.subscriptionOperationBase(
+      input,
+      await this.subscriptionCreateFingerprint(input),
     );
-    if (existing && existing.commandFingerprint !== fingerprint) {
-      throw new PaymentReliabilityError(
-        PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT,
-        'Idempotency key is already bound to a different command fingerprint',
-      );
-    }
-    // Only a new or still-prepared operation is about to reach the provider;
-    // replays of submitted/unknown/terminal operations return stored state.
-    if (!existing || existing.status === 'prepared') {
-      await this.assertProviderPlanActive(input, reference.providerPlanId);
-    }
+    await this.assertProviderPlanActiveBeforeCreate(input, base, reference.providerPlanId);
 
     const operation = await this.store.createOperation({
       ...base,
@@ -469,6 +559,47 @@ export class SubscriptionLifecycleService {
     });
 
     return this.executeSubscriptionOperation(input, operation, reference.providerPlanId);
+  }
+
+  /** The request's fingerprint, or the stored pre-0.3 one when the stored row matches it. */
+  private async subscriptionCreateFingerprint(input: CreateSubscriptionRequest): Promise<string> {
+    const existing = await this.store.findOperationByIdempotency(
+      buildOperationIdempotencyScope({
+        applicationRef: input.applicationRef,
+        accountRef: input.accountRef,
+        environment: input.environment,
+        kind: 'subscription',
+      }),
+      input.idempotencyKey,
+    );
+    return existing && matchesSubscriptionCreateFingerprint(existing, input)
+      ? existing.commandFingerprint
+      : buildSubscriptionCreateCommandFingerprint(input);
+  }
+
+  /**
+   * Both plan reference forms check the provider plan before a new (or still prepared)
+   * operation reaches the provider; replays of submitted/unknown/terminal operations return
+   * stored state without a provider call.
+   */
+  private async assertProviderPlanActiveBeforeCreate(
+    input: CreateSubscriptionRequest,
+    base: ReturnType<SubscriptionLifecycleService['subscriptionOperationBase']>,
+    providerPlanId: string,
+  ): Promise<void> {
+    const existing = await this.store.findOperationByIdempotency(
+      base.idempotencyScope,
+      base.idempotencyKey,
+    );
+    if (existing && existing.commandFingerprint !== base.commandFingerprint) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT,
+        'Idempotency key is already bound to a different command fingerprint',
+      );
+    }
+    if (!existing || existing.status === 'prepared') {
+      await this.assertProviderPlanActive(input, providerPlanId);
+    }
   }
 
   private async assertProviderPlanActive(
@@ -530,10 +661,21 @@ export class SubscriptionLifecycleService {
       return toSubscriptionResult(operation);
     }
 
-    operation = await this.store.claimOperationForExecution({
-      operationId: operation.operationId,
-      expectedVersion: operation.version,
-    });
+    try {
+      operation = await this.store.claimOperationForExecution({
+        operationId: operation.operationId,
+        expectedVersion: operation.version,
+      });
+    } catch (error) {
+      // A concurrent create with the same key won the claim: return its state (issue #22).
+      const current = hasErrorCode(error, PAYMENT_RELIABILITY_ERROR.OPERATION_CONFLICT)
+        ? await this.store.findOperationById(operation.operationId)
+        : null;
+      if (current && current.status !== 'prepared') {
+        return toSubscriptionResult(current);
+      }
+      throw error;
+    }
 
     try {
       const result = await this.provider.createSubscription({
@@ -546,21 +688,11 @@ export class SubscriptionLifecycleService {
         subscriberEmail: input.subscriber.email ?? null,
         returnUrl: input.returnUrl ?? null,
         cancelUrl: input.cancelUrl ?? null,
+        ...resolveSubscriptionCreateOptions(input),
       });
-      operation = await this.store.transitionOperation({
-        operationId: operation.operationId,
-        expectedVersion: operation.version,
-        nextStatus: subscriptionStatusToOperationStatus(result.subscriptionStatus),
-        subscriptionStatus: result.subscriptionStatus,
-        providerSubscriptionId: result.providerSubscriptionId,
-        providerReferenceId: result.providerSubscriptionId,
-        approvalUrl: result.approvalUrl,
-        startTime: result.startTime,
-        nextBillingTime: result.nextBillingTime,
-        reason: 'PayPal subscription created awaiting approval if required',
-      });
+      operation = await this.persistSubscriptionCreateResult(operation, result, null);
     } catch (error) {
-      operation = await this.handleFailure(operation, error);
+      operation = await this.handleSubscriptionCreateFailure(operation, error);
     }
 
     return toSubscriptionResult(operation);
@@ -590,8 +722,7 @@ export class SubscriptionLifecycleService {
     }
     assertSubscriptionOperationScope(operation, input);
 
-    const fingerprint = buildSubscriptionCreateCommandFingerprint(input);
-    if (fingerprint !== operation.commandFingerprint) {
+    if (!matchesSubscriptionCreateFingerprint(operation, input)) {
       throw new PaymentReliabilityError(
         PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT,
         'Retry parameters do not match the original subscription command',
@@ -655,6 +786,9 @@ export class SubscriptionLifecycleService {
       return toSubscriptionResult(latest ?? operation);
     }
     operation = latest;
+    // The first create call claims without a lease: a `submitted` row without one may still have
+    // that call in flight, and its PayPal answer must not be thrown away by ours (issue #22).
+    const mayOverlapFirstCall = operation.status === 'submitted' && !operation.executionOwnerToken;
 
     const lease = await this.store.acquireCheckoutCreateExecutionLease({
       operationId: operation.operationId,
@@ -672,6 +806,7 @@ export class SubscriptionLifecycleService {
       lease.operation,
       lease.executionOwnerToken,
       providerPlanId,
+      mayOverlapFirstCall,
     );
   }
 
@@ -861,6 +996,9 @@ export class SubscriptionLifecycleService {
       commandOp.status === 'submitted' ||
       commandOp.status === 'unknown'
     ) {
+      if (commandOp.status === 'succeeded') {
+        await this.redeliverHeldCommandEffects(subscription, commandOp, kind);
+      }
       return toSubscriptionResult(subscription);
     }
 
@@ -874,7 +1012,7 @@ export class SubscriptionLifecycleService {
       providerResult = await execute(subscription.providerSubscriptionId);
     } catch (error) {
       commandOp = await this.handleFailure(commandOp, error);
-      throwNormalizedCommandFailure(commandOp);
+      throwNormalizedCommandFailure(commandOp, resolveProviderFailure(error).providerDebugId);
     }
 
     commandOp = await markSubscriptionLifecycleCommandSucceeded(this.store, commandOp, kind);
@@ -894,26 +1032,94 @@ export class SubscriptionLifecycleService {
       );
     }
 
-    try {
-      assertSubscriptionProviderPlanSnapshotConsistent(currentSubscription, providerResult);
-    } catch (error) {
-      if (isSubscriptionProviderPlanMismatchError(error)) {
-        return toSubscriptionResult(currentSubscription, {
-          subscriptionStateRefreshErrorCode: PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
-        });
-      }
-      throw error;
-    }
-
-    const updated = await applySubscriptionDomainUpdate(this.store, currentSubscription, {
-      subscriptionStatus: providerResult.subscriptionStatus,
-      lifecycleReason: providerResult.lifecycleReason ?? input.reason,
-      startTime: providerResult.startTime,
-      nextBillingTime: providerResult.nextBillingTime,
-      providerSubscriptionStateAt: providerResult.providerSubscriptionStateAt ?? null,
+    // The provider's state after the command goes through the same reducer as webhooks: plan
+    // check, never-move-back watermark, billing fields and effects for the host hook.
+    const effectsKey = commandEffectsKey(commandOp);
+    const applied = await applySubscriptionEvents(this.store, {
+      operation: currentSubscription,
+      steps: [
+        {
+          event: subscriptionEventFromProviderSnapshot(
+            currentSubscription.providerSubscriptionId ?? providerResult.providerSubscriptionId,
+            providerResult,
+            { eventType: `PROVIDER.${kind.toUpperCase()}` },
+          ),
+          options: { source: 'lookup' },
+        },
+      ],
+      evidenceId: null,
+      effectsKey,
       reason: `PayPal subscription ${kind}`,
+      holdEffects: Boolean(this.hooks.onSubscriptionEffects),
+      lifecycleReason: providerResult.lifecycleReason ?? input.reason,
     });
-    return toSubscriptionResult(updated);
+    await this.deliverCommandEffects(applied, kind);
+
+    if (applied.heldOverflow) {
+      // Not applied yet; the provider's webhook for this change applies it later.
+      return toSubscriptionResult(applied.operation, {
+        subscriptionStateRefreshPending: true,
+        subscriptionStateRefreshErrorCode: HELD_EFFECTS_OVERFLOW,
+      });
+    }
+    if (applied.planMismatch) {
+      return toSubscriptionResult(applied.operation, {
+        subscriptionStateRefreshErrorCode: PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
+      });
+    }
+    return toSubscriptionResult(applied.operation);
+  }
+
+  /** Throws `SUBSCRIPTION_EFFECTS_HOOK_FAILED` when the hook throws; a replay delivers again. */
+  private async deliverCommandEffects(
+    applied: ApplySubscriptionEventsResult,
+    kind: string,
+  ): Promise<void> {
+    const delivery = await deliverSubscriptionEffects(this.store, this.hooks, applied, {
+      evidenceId: null,
+      eventType: `PROVIDER.${kind.toUpperCase()}`,
+      source: 'lifecycle',
+    });
+    if (
+      !delivery.delivered &&
+      delivery.code === PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_EFFECTS_HOOK_FAILED
+    ) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_EFFECTS_HOOK_FAILED,
+        'Subscription effects hook failed; replay the command with the same idempotency key to deliver again',
+        { operationId: applied.operation.operationId },
+      );
+    }
+  }
+
+  /** A replayed succeeded command delivers the effects a failed hook left held. */
+  private async redeliverHeldCommandEffects(
+    subscription: PaymentOperation,
+    commandOp: PaymentOperation,
+    kind: string,
+  ): Promise<void> {
+    if (!this.hooks.onSubscriptionEffects) {
+      return;
+    }
+    const current = (await this.store.findOperationById(subscription.operationId)) ?? subscription;
+    const effectsKey = commandEffectsKey(commandOp);
+    const effects = readHeldSubscriptionEffects(current, effectsKey);
+    if (effects.length === 0) {
+      return;
+    }
+    await this.deliverCommandEffects(
+      {
+        operation: current,
+        decision: 'applied',
+        reason: null,
+        planMismatch: false,
+        effects,
+        heldKey: effectsKey,
+        planMismatchToNotify: null,
+        heldOverflow: false,
+      },
+      kind,
+    );
   }
 
   private isSubscriptionExecutionLeaseInFlight(operation: PaymentOperation): boolean {
@@ -927,14 +1133,7 @@ export class SubscriptionLifecycleService {
   private async resolveFirstSubscriptionProviderExecutionAt(
     operationId: string,
   ): Promise<string | null> {
-    const transitions = await this.store.listOperationTransitions(operationId);
-    const executionTransitions = transitions
-      .filter(
-        (row) =>
-          row.toStatus === 'submitted' && row.reason === SUBSCRIPTION_CLAIMED_FOR_EXECUTION_REASON,
-      )
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-    return executionTransitions[0]?.createdAt ?? null;
+    return resolveFirstProviderExecutionAt(await this.store.listOperationTransitions(operationId));
   }
 
   private async executeSubscriptionCreateProviderRetry(
@@ -942,6 +1141,7 @@ export class SubscriptionLifecycleService {
     operation: PaymentOperation,
     executionOwnerToken: string,
     providerPlanId: string,
+    mayOverlapFirstCall: boolean,
   ): Promise<SubscriptionResult> {
     let executingOperation = operation;
     try {
@@ -955,26 +1155,19 @@ export class SubscriptionLifecycleService {
         subscriberEmail: input.subscriber.email ?? null,
         returnUrl: input.returnUrl ?? null,
         cancelUrl: input.cancelUrl ?? null,
+        ...resolveSubscriptionCreateOptions(input),
       });
-      executingOperation = await this.persistSubscriptionCreateExecutionTransition(
+      executingOperation = await this.persistSubscriptionCreateResult(
         executingOperation,
+        result,
         executionOwnerToken,
-        {
-          nextStatus: subscriptionStatusToOperationStatus(result.subscriptionStatus),
-          subscriptionStatus: result.subscriptionStatus,
-          providerSubscriptionId: result.providerSubscriptionId,
-          providerReferenceId: result.providerSubscriptionId,
-          approvalUrl: result.approvalUrl,
-          startTime: result.startTime,
-          nextBillingTime: result.nextBillingTime,
-          reason: 'PayPal subscription created awaiting approval if required',
-        },
       );
     } catch (error) {
       executingOperation = await this.handleSubscriptionCreateProviderFailure(
         executingOperation,
         error,
         executionOwnerToken,
+        { terminalAsUnknown: mayOverlapFirstCall },
       );
     }
     return toSubscriptionResult(executingOperation);
@@ -1006,30 +1199,91 @@ export class SubscriptionLifecycleService {
     return reloaded;
   }
 
-  private async persistSubscriptionCreateExecutionTransition(
+  /**
+   * PayPal created the subscription: store it even when an overlapping create call (the original
+   * and a retry, issue #22) moved the row on. Both calls send the operation id as PayPal-Request-Id,
+   * so they receive the same subscription. A row that already holds a provider subscription id, or
+   * is terminal, is returned as stored. Other errors are rethrown for the caller's failure path.
+   */
+  private async persistSubscriptionCreateResult(
     operation: PaymentOperation,
-    executionOwnerToken: string,
-    input: Omit<
-      Parameters<PaymentReliabilityStore['transitionOperation']>[0],
-      | 'operationId'
-      | 'expectedVersion'
-      | 'expectedExecutionOwnerToken'
-      | 'executionOwnerToken'
-      | 'executionLeaseExpiresAt'
-    >,
+    result: ExecuteCreateSubscriptionResult,
+    executionOwnerToken: string | null,
+  ): Promise<PaymentOperation> {
+    let current = operation;
+    let ownerToken = executionOwnerToken;
+    for (let attempt = 0; attempt < CREATE_RESULT_PERSIST_ATTEMPTS; attempt += 1) {
+      try {
+        const stored = await this.store.transitionOperation({
+          operationId: current.operationId,
+          expectedVersion: current.version,
+          ...(ownerToken ? { expectedExecutionOwnerToken: ownerToken } : {}),
+          executionOwnerToken: null,
+          executionLeaseExpiresAt: null,
+          nextStatus: subscriptionStatusToOperationStatus(result.subscriptionStatus),
+          subscriptionStatus: result.subscriptionStatus,
+          providerSubscriptionId: result.providerSubscriptionId,
+          providerReferenceId: result.providerSubscriptionId,
+          approvalUrl: result.approvalUrl,
+          startTime: result.startTime,
+          nextBillingTime: result.nextBillingTime,
+          reason: 'PayPal subscription created awaiting approval if required',
+        });
+        return await this.afterSubscriptionCreateStored(stored);
+      } catch (error) {
+        if (!this.isSubscriptionExecutorPersistenceConflict(error)) {
+          throw error;
+        }
+        const fresh = await this.reloadSubscriptionOperationAfterPersistenceConflict(
+          current.operationId,
+        );
+        if (fresh.providerSubscriptionId?.trim() || isTerminal(fresh.status)) {
+          return fresh;
+        }
+        // The other call holds the lease or wrote a failure: this call has the result, so it wins.
+        current = fresh;
+        ownerToken = null;
+      }
+    }
+    return this.reloadSubscriptionOperationAfterPersistenceConflict(operation.operationId);
+  }
+
+  /**
+   * The subscription id is bound now: the operation leaves its retry schedule, and webhook events
+   * for that id that arrived before it (`unmatched`, maybe given up) become candidates again when
+   * the store supports `reviveUnmatchedEvidence`. Best effort: the create result is already stored.
+   */
+  private async afterSubscriptionCreateStored(stored: PaymentOperation): Promise<PaymentOperation> {
+    const operation = await clearResolvedOperationRetryState(this.store, stored);
+    const evidenceStore = this.store as Partial<Pick<EvidenceStore, 'reviveUnmatchedEvidence'>>;
+    if (operation.providerSubscriptionId && evidenceStore.reviveUnmatchedEvidence) {
+      try {
+        await evidenceStore.reviveUnmatchedEvidence({
+          providerCode: operation.providerCode,
+          accountRef: operation.accountRef,
+          environment: operation.environment,
+          resourceId: operation.providerSubscriptionId,
+        });
+      } catch {
+        // Not fatal: the rows still wait for their own backoff.
+      }
+    }
+    return operation;
+  }
+
+  /**
+   * Failure of the first create call. When a create retry moved the row on in the meantime, the
+   * stored state is returned and nothing is overwritten (issue #22).
+   */
+  private async handleSubscriptionCreateFailure(
+    operation: PaymentOperation,
+    error: unknown,
   ): Promise<PaymentOperation> {
     try {
-      return await this.store.transitionOperation({
-        operationId: operation.operationId,
-        expectedVersion: operation.version,
-        expectedExecutionOwnerToken: executionOwnerToken,
-        executionOwnerToken: null,
-        executionLeaseExpiresAt: null,
-        ...input,
-      });
-    } catch (error) {
-      if (!this.isSubscriptionExecutorPersistenceConflict(error)) {
-        throw error;
+      return await this.handleFailure(operation, error, { pinVersion: true });
+    } catch (transitionError) {
+      if (!this.isSubscriptionExecutorPersistenceConflict(transitionError)) {
+        throw transitionError;
       }
       return this.reloadSubscriptionOperationAfterPersistenceConflict(operation.operationId);
     }
@@ -1039,9 +1293,15 @@ export class SubscriptionLifecycleService {
     operation: PaymentOperation,
     error: unknown,
     executionOwnerToken?: string | null,
+    /**
+     * The first create call may still be in flight: a 4xx (request in progress, duplicate) is not
+     * proof that nothing was created, so the row stays `unknown` and the first call's answer, or
+     * the next retry, settles it (issue #22). A retry from `unknown` fails as usual.
+     */
+    { terminalAsUnknown = false }: { terminalAsUnknown?: boolean } = {},
   ): Promise<PaymentOperation> {
     const resolved = resolveProviderFailure(error);
-    const nextStatus =
+    const mappedStatus =
       resolved.code === PAYMENT_RELIABILITY_ERROR.PROVIDER_ACTION_REQUIRED
         ? 'failed'
         : resolved.uncertain || resolved.retryable
@@ -1050,6 +1310,7 @@ export class SubscriptionLifecycleService {
               resolved.code === PAYMENT_RELIABILITY_ERROR.PROVIDER_TERMINAL_REJECTION
             ? 'failed'
             : 'unknown';
+    const nextStatus = terminalAsUnknown ? 'unknown' : mappedStatus;
 
     const ownerToken = executionOwnerToken ?? operation.executionOwnerToken;
     const transitionInput = {
@@ -1065,9 +1326,9 @@ export class SubscriptionLifecycleService {
       nextStatus,
       subscriptionStatus: nextStatus === 'unknown' ? 'unknown' : operation.subscriptionStatus,
       failureCode: resolved.code,
-      failureMessage: resolved.message,
+      failureMessage: formatProviderFailureMessage(resolved),
       reason: 'Subscription provider mutation returned uncertain or terminal outcome',
-    } as Parameters<PaymentReliabilityStore['transitionOperation']>[0];
+    } as Parameters<OperationStore['transitionOperation']>[0];
 
     try {
       return await this.store.transitionOperation(transitionInput);
@@ -1082,6 +1343,8 @@ export class SubscriptionLifecycleService {
   private async handleFailure(
     operation: PaymentOperation,
     error: unknown,
+    /** Only write when the row is still at `operation.version`; else return it as stored. */
+    { pinVersion = false }: { pinVersion?: boolean } = {},
   ): Promise<PaymentOperation> {
     const err = error as {
       code?: string;
@@ -1103,6 +1366,9 @@ export class SubscriptionLifecycleService {
         'Operation was not found',
       );
     }
+    if (pinVersion && current.version !== operation.version) {
+      return current;
+    }
 
     return this.store.transitionOperation({
       operationId: current.operationId,
@@ -1112,12 +1378,7 @@ export class SubscriptionLifecycleService {
       planStatus: nextStatus === 'unknown' ? 'unknown' : current.planStatus,
       productStatus: nextStatus === 'unknown' ? 'unknown' : current.productStatus,
       failureCode: err?.code ?? PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
-      failureMessage:
-        typeof err?.message === 'string'
-          ? err.message
-          : err instanceof Error
-            ? err.message
-            : String(error),
+      failureMessage: formatProviderFailureMessage(resolveProviderFailure(error)),
       reason: 'Subscription provider mutation returned uncertain or terminal outcome',
     });
   }

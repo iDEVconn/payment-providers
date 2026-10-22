@@ -14,6 +14,7 @@ describe('environment independence', () => {
     });
     await expect(import('../src/index')).resolves.toBeDefined();
     await expect(import('../src/paypal/index')).resolves.toBeDefined();
+    await expect(import('../src/legacy/index')).resolves.toBeDefined();
     envSpy.mockRestore();
   });
 

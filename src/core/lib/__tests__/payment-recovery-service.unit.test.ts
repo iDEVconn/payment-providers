@@ -218,7 +218,9 @@ describe('PaymentRecoveryService', () => {
     expect(updated?.consumerDeliveryLastError).toBe('Consumer event delivery failed');
   });
 
-  it('skips evidence still awaiting provider verification when claimed', async () => {
+  // Recovery cannot verify without the transmission headers: it no longer claims such rows only to
+  // skip them (issue #20; was claimed 1 / skipped 1).
+  it('does not claim evidence still awaiting provider verification', async () => {
     const store = new MemoryPaymentReliabilityStore();
     const recovery = new PaymentRecoveryService({
       store,
@@ -243,16 +245,17 @@ describe('PaymentRecoveryService', () => {
       limit: 5,
       evidenceIds: [inserted.evidenceId],
     });
-    expect(summary.claimed).toBe(1);
-    expect(summary.skipped).toBe(1);
+    expect(summary.claimed).toBe(0);
+    expect(summary.skipped).toBe(0);
   });
 
   it('respects recovery batch limit', async () => {
     const store = new MemoryPaymentReliabilityStore();
+    // Rows awaiting delivery are claimed only when a consumer is configured (issue #21).
     const recovery = new PaymentRecoveryService({
       store,
       webhookProcessing: new WebhookProcessingService(store),
-      consumer: null,
+      consumer: { deliver: vi.fn(async () => undefined) },
     });
     for (let i = 0; i < 3; i += 1) {
       const row = await store.insertEvidence({

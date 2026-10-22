@@ -25,18 +25,33 @@ export type PaypalWebhookVerificationClient = {
     authAlgo: string;
     transmissionSig: string;
     webhookEvent: unknown;
+    /** Original webhook body text; live clients send it to PayPal unmodified (#15). */
+    rawWebhookEvent?: string;
   }): Promise<{ verification_status: string }>;
 };
+
+export type PaypalWebhookVerifierOptions = {
+  /** Webhook id used when a request carries none (checked when the verifier is built). */
+  webhookId?: string;
+};
+
+type ParsedWebhookEvent = { event_type?: string; resource?: { id?: string } };
+
+function isJsonObject(value: unknown): value is ParsedWebhookEvent {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 export class PaypalWebhookVerifier {
   constructor(
     private readonly runtime: ResolvedPaymentRuntime,
     private readonly client: PaypalWebhookVerificationClient,
     private readonly nodeEnv: string | undefined,
+    private readonly options: PaypalWebhookVerifierOptions = {},
   ) {}
 
   async verify(request: VerifyWebhookRequest): Promise<VerifyWebhookResult> {
-    if (!request.webhookId?.trim()) {
+    const webhookId = request.webhookId?.trim() || this.options.webhookId?.trim();
+    if (!webhookId) {
       return {
         verified: false,
         transmissionId: request.headers.transmissionId,
@@ -47,32 +62,49 @@ export class PaypalWebhookVerifier {
       };
     }
 
-    let parsed: { event_type?: string; resource?: { id?: string } };
+    let parsed: ParsedWebhookEvent;
     try {
-      parsed = JSON.parse(request.rawBody) as { event_type?: string; resource?: { id?: string } };
+      const value: unknown = JSON.parse(request.rawBody);
+      if (!isJsonObject(value)) {
+        throw new Error('not an object');
+      }
+      parsed = value;
     } catch {
       return {
         verified: false,
         transmissionId: request.headers.transmissionId,
         eventType: null,
         resourceId: null,
-        unavailableReason: 'Webhook body is not valid JSON',
+        unavailableReason: 'Webhook body is not a valid JSON object',
         failureKind: 'invalid_payload',
       };
     }
 
     try {
       const response = await this.client.verifyWebhookSignature({
-        webhookId: request.webhookId,
+        webhookId,
         transmissionId: request.headers.transmissionId,
         transmissionTime: request.headers.transmissionTime,
         certUrl: request.headers.certUrl,
         authAlgo: request.headers.authAlgo,
         transmissionSig: request.headers.transmissionSig,
         webhookEvent: parsed,
+        rawWebhookEvent: request.rawBody,
       });
 
-      const verified = response.verification_status === 'SUCCESS';
+      // Only an explicit FAILURE is a rejected signature; anything else we cannot read stays retryable.
+      const status = response.verification_status;
+      if (status !== 'SUCCESS' && status !== 'FAILURE') {
+        return {
+          verified: false,
+          transmissionId: request.headers.transmissionId,
+          eventType: parsed.event_type ?? null,
+          resourceId: parsed.resource?.id ?? null,
+          unavailableReason: 'PayPal webhook verification is temporarily unavailable',
+          failureKind: 'verification_unavailable',
+        };
+      }
+      const verified = status === 'SUCCESS';
       return {
         verified,
         transmissionId: request.headers.transmissionId,

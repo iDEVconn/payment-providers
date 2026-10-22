@@ -1,0 +1,13 @@
+{
+  "runtime": [
+    "DEFAULT_CONFORMANCE_LEASE_MARGIN_MS",
+    "DEFAULT_CONFORMANCE_LEASE_MS",
+    "runStoreConformance"
+  ],
+  "typeOnly": [
+    "ConformanceAssertion",
+    "ConformanceExpect",
+    "StoreConformanceCapabilities",
+    "StoreConformanceOptions"
+  ]
+}

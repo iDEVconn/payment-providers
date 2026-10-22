@@ -42,11 +42,27 @@ export function classifyWebhookEvidenceResume(
   return 'ack_duplicate';
 }
 
+/**
+ * No consumer delivery is left to do: confirmed, given up (`failed_terminal`), or a legacy row
+ * without delivery fields.
+ */
 export function isConsumerDeliveryComplete(evidence: ProviderEvidenceRecord): boolean {
   if (evidence.consumerDeliveryStatus === undefined) {
     return true;
   }
-  return evidence.consumerDeliveryStatus === 'confirmed';
+  return (
+    evidence.consumerDeliveryStatus === 'confirmed' ||
+    evidence.consumerDeliveryStatus === 'failed_terminal'
+  );
+}
+
+/** Verified and processed; only the consumer delivery is outstanding. */
+export function isAwaitingConsumerDeliveryOnly(evidence: ProviderEvidenceRecord): boolean {
+  return (
+    evidence.verificationStatus === 'verified' &&
+    evidence.processingStatus === 'processed' &&
+    !isConsumerDeliveryComplete(evidence)
+  );
 }
 
 export function verificationFailureKind(
@@ -64,7 +80,14 @@ export function isVerificationUnavailable(verification: VerifyWebhookResult): bo
   );
 }
 
+/**
+ * Rows recovery may claim. A row that gave up (`retryStatus: 'gave_up'`) is not claimed for
+ * processing again; only its consumer delivery, which has its own cap, is still recoverable.
+ */
 export function isRecoverableEvidenceRow(evidence: ProviderEvidenceRecord): boolean {
+  if (evidence.retryStatus != null && !isAwaitingConsumerDeliveryOnly(evidence)) {
+    return false;
+  }
   if (evidence.verificationStatus === 'pending') {
     return true;
   }
@@ -72,7 +95,7 @@ export function isRecoverableEvidenceRow(evidence: ProviderEvidenceRecord): bool
     return true;
   }
   if (evidence.verificationStatus === 'verified' && evidence.processingStatus === 'processed') {
-    return evidence.consumerDeliveryStatus !== 'confirmed';
+    return !isConsumerDeliveryComplete(evidence);
   }
   if (evidence.verificationStatus === 'verified' && evidence.processingStatus === 'unmatched') {
     return true;

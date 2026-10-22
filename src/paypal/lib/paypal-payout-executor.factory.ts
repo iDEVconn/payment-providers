@@ -2,6 +2,7 @@ import { PaymentConfigurationError } from '../../core/lib/payment-configuration-
 import type { PaymentExecutionStatus } from '../../contracts/index';
 import type { ResolvedPaymentRuntime } from '../../core/index';
 import {
+  assertProviderNetworkAllowedInProduction,
   blockedHttpClient,
   blockedOAuthGetter,
   shouldRejectProviderNetworkCalls,
@@ -19,6 +20,8 @@ export type BuildPaypalPayoutExecutorInput = {
   runtime: ResolvedPaymentRuntime;
   nodeEnv?: string;
   executionStatus?: PaymentExecutionStatus;
+  /** See `resolvePaymentRuntime`: build a reject-only composition in production on purpose. */
+  allowRejectOnlyInProduction?: boolean;
   forceFakeHttp?: boolean;
   httpClient?: PaypalPayoutHttpClient;
 };
@@ -28,6 +31,14 @@ export function buildPaypalPayoutExecutor(
 ): PaypalPayoutExecutor {
   const { runtime, nodeEnv, forceFakeHttp, httpClient, executionStatus } = input;
   const isProduction = nodeEnv === 'production';
+
+  assertProviderNetworkAllowedInProduction({
+    runtime,
+    executionStatus,
+    nodeEnv,
+    component: 'PayPal payout executor',
+    allowRejectOnlyInProduction: input.allowRejectOnlyInProduction,
+  });
 
   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
     return new PaypalPayoutExecutor(runtime, blockedHttpClient(), blockedOAuthGetter());
@@ -71,10 +82,13 @@ export function buildPaypalPayoutExecutor(
   const payoutHttp =
     httpClient ?? new FetchPaypalPayoutHttpClient(credentials.requestTimeoutMs ?? 10_000);
 
-  return new PaypalPayoutExecutor(runtime, payoutHttp, (scope) =>
-    oauthClient.getAccessToken({
-      accountRef: scope.accountRef,
-      environment: scope.environment,
-    }),
+  return new PaypalPayoutExecutor(runtime, payoutHttp, (scope, options) =>
+    oauthClient.getAccessToken(
+      {
+        accountRef: scope.accountRef,
+        environment: scope.environment,
+      },
+      options,
+    ),
   );
 }

@@ -273,7 +273,11 @@ describe('legacy planOperationId compatibility', () => {
         cancelUrl: null,
       }),
     });
-    expect(provider.getPlan).not.toHaveBeenCalled();
+    // The plan status is now checked on this path as on the providerPlanId path.
+    expect(provider.getPlan).toHaveBeenCalledWith({
+      ...context,
+      providerPlanId: 'P-LEGACYPLAN',
+    });
   });
 });
 

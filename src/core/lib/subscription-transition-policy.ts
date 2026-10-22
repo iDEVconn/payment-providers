@@ -1,11 +1,29 @@
+import {
+  PAYMENT_RELIABILITY_ERROR,
+  PAYMENT_TRANSITION_REJECTION_REASON,
+  PaymentReliabilityError,
+} from '../../contracts/index';
 import type {
   PaymentOperationStatus,
   PlanStatus,
   ProductStatus,
   SubscriptionStatus,
 } from '../../contracts/index';
+import {
+  evaluateSubscriptionStateOrdering,
+  isSubscriptionStatusTransitionAllowed,
+  isTerminalSubscriptionStatus,
+  parseProviderTimestamp,
+} from '../../subscription-core/lib/subscription-status-rules';
 
-const SUBSCRIPTION_TERMINAL: ReadonlySet<SubscriptionStatus> = new Set(['cancelled', 'expired']);
+// Status mapping and transition rules live in the pure subscription core; re-exported unchanged.
+export {
+  isSubscriptionPaymentEvidenceEvent,
+  isSubscriptionWebhookProviderRefreshEvent,
+  mapPaypalSubscriptionStatus,
+  mapSubscriptionWebhookEventToStatus,
+  resolveSubscriptionStatusTransition,
+} from '../../subscription-core/lib/subscription-status-rules';
 
 export const SUBSCRIPTION_PROVIDER_STATE_WATERMARK_PREFIX = 'subscription-provider-state-at:';
 
@@ -15,6 +33,10 @@ export type SubscriptionStateApplySource =
   | 'reconcile_event'
   | 'provider_mutation';
 
+/**
+ * @deprecated The engine reads webhook bodies with `normalizePaypalSubscriptionEvent` (`stateAt`)
+ * from `@idevconn/payment-providers/subscription`. Kept for existing callers.
+ */
 export function parseSubscriptionResourceStateTimestamp(
   rawPayload: string | null | undefined,
 ): string | null {
@@ -25,15 +47,7 @@ export function parseSubscriptionResourceStateTimestamp(
     const parsed = JSON.parse(rawPayload) as {
       resource?: { update_time?: unknown; create_time?: unknown };
     };
-    const candidate = parsed.resource?.update_time ?? parsed.resource?.create_time;
-    if (typeof candidate !== 'string' || candidate.trim().length === 0) {
-      return null;
-    }
-    const epochMs = Date.parse(candidate);
-    if (Number.isNaN(epochMs)) {
-      return null;
-    }
-    return new Date(epochMs).toISOString();
+    return parseProviderTimestamp(parsed.resource?.update_time ?? parsed.resource?.create_time);
   } catch {
     return null;
   }
@@ -72,28 +86,15 @@ export function resolveProviderTransactionIdAfterSubscriptionStateWatermarkPersi
   return undefined;
 }
 
-function compareProviderStateTimestamps(
-  stored: string | null,
-  incoming: string,
-): 'older' | 'newer' | 'equal' {
-  if (!stored) {
-    return 'newer';
-  }
-  const storedMs = Date.parse(stored);
-  const incomingMs = Date.parse(incoming);
-  if (incomingMs > storedMs) {
-    return 'newer';
-  }
-  if (incomingMs < storedMs) {
-    return 'older';
-  }
-  return 'equal';
-}
-
 export type SubscriptionProviderStateOrderingDecision =
   | { action: 'apply'; providerStateWatermark: string | null }
   | { action: 'noop'; reason: 'stale' | 'equal_conflict' | 'missing_timestamp' };
 
+/**
+ * @deprecated The engine orders subscription state with `reduceSubscription` (via
+ * `applySubscriptionEvents`); use `evaluateSubscriptionStateOrdering` from
+ * `@idevconn/payment-providers/subscription`. Kept for existing callers.
+ */
 export function evaluateSubscriptionProviderStateOrdering(input: {
   operation: {
     subscriptionStatus: SubscriptionStatus | null;
@@ -108,28 +109,17 @@ export function evaluateSubscriptionProviderStateOrdering(input: {
     return { action: 'apply', providerStateWatermark: null };
   }
 
-  const storedWatermark = readSubscriptionProviderStateWatermark(input.operation);
-  const incomingTimestamp = input.providerStateTimestamp;
-  if (!incomingTimestamp) {
-    if (storedWatermark) {
-      return { action: 'noop', reason: 'missing_timestamp' };
-    }
-    return { action: 'apply', providerStateWatermark: null };
+  const ordering = evaluateSubscriptionStateOrdering({
+    currentStatus: input.operation.subscriptionStatus,
+    storedStateAt: readSubscriptionProviderStateWatermark(input.operation),
+    desiredStatus: input.desiredStatus,
+    incomingStateAt: input.providerStateTimestamp,
+    authoritative: false,
+  });
+  if (ordering.action === 'noop') {
+    return ordering;
   }
-
-  const ordering = compareProviderStateTimestamps(storedWatermark, incomingTimestamp);
-  if (ordering === 'older') {
-    return { action: 'noop', reason: 'stale' };
-  }
-  if (ordering === 'equal') {
-    const current = input.operation.subscriptionStatus ?? 'approval_pending';
-    if (current !== input.desiredStatus) {
-      return { action: 'noop', reason: 'equal_conflict' };
-    }
-    return { action: 'apply', providerStateWatermark: incomingTimestamp };
-  }
-
-  return { action: 'apply', providerStateWatermark: incomingTimestamp };
+  return { action: 'apply', providerStateWatermark: ordering.stateAt };
 }
 
 export function mapPaypalProductStatus(): ProductStatus {
@@ -146,49 +136,6 @@ export function mapPaypalPlanStatus(status: string): PlanStatus {
       return 'inactive';
     default:
       return 'unknown';
-  }
-}
-
-export function mapPaypalSubscriptionStatus(status: string): SubscriptionStatus {
-  switch (status.toUpperCase()) {
-    case 'APPROVAL_PENDING':
-      return 'approval_pending';
-    case 'APPROVED':
-      return 'approved';
-    case 'ACTIVE':
-      return 'active';
-    case 'SUSPENDED':
-      return 'suspended';
-    case 'CANCELLED':
-      return 'cancelled';
-    case 'EXPIRED':
-      return 'expired';
-    default:
-      return 'unknown';
-  }
-}
-
-export function isSubscriptionWebhookProviderRefreshEvent(eventType: string): boolean {
-  return eventType === 'BILLING.SUBSCRIPTION.UPDATED';
-}
-
-export function mapSubscriptionWebhookEventToStatus(eventType: string): SubscriptionStatus | null {
-  switch (eventType) {
-    case 'BILLING.SUBSCRIPTION.CREATED':
-      return 'approval_pending';
-    case 'BILLING.SUBSCRIPTION.ACTIVATED':
-    case 'BILLING.SUBSCRIPTION.RE-ACTIVATED':
-      return 'active';
-    case 'BILLING.SUBSCRIPTION.APPROVED':
-      return 'approved';
-    case 'BILLING.SUBSCRIPTION.SUSPENDED':
-      return 'suspended';
-    case 'BILLING.SUBSCRIPTION.CANCELLED':
-      return 'cancelled';
-    case 'BILLING.SUBSCRIPTION.EXPIRED':
-      return 'expired';
-    default:
-      return null;
   }
 }
 
@@ -213,15 +160,6 @@ export function mapSubscriptionWebhookEventToOperationKind(
     return 'billing_plan';
   }
   return null;
-}
-
-export function isSubscriptionPaymentEvidenceEvent(eventType: string): boolean {
-  return (
-    eventType === 'PAYMENT.SALE.COMPLETED' ||
-    eventType === 'BILLING.SUBSCRIPTION.PAYMENT.FAILED' ||
-    eventType === 'PAYMENT.SALE.REFUNDED' ||
-    eventType === 'PAYMENT.SALE.REVERSED'
-  );
 }
 
 export function subscriptionStatusToOperationStatus(
@@ -256,29 +194,19 @@ export function assertSubscriptionTransitionAllowed(
   current: SubscriptionStatus,
   next: SubscriptionStatus,
 ): void {
-  if (current === next) {
+  if (isSubscriptionStatusTransitionAllowed(current, next)) {
     return;
   }
-  if (SUBSCRIPTION_TERMINAL.has(current)) {
-    throw new Error(`Terminal subscription status "${current}" cannot transition to "${next}"`);
+  if (isTerminalSubscriptionStatus(current)) {
+    throw new PaymentReliabilityError(
+      PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
+      `Terminal subscription status "${current}" cannot transition to "${next}"`,
+      { rejectionReason: PAYMENT_TRANSITION_REJECTION_REASON.INVALID_TRANSITION },
+    );
   }
-  if (current === 'active' && next === 'approval_pending') {
-    throw new Error(`Subscription status "${current}" cannot regress to "${next}"`);
-  }
-}
-
-/** Rejected stale transitions keep the current subscription status. */
-export function resolveSubscriptionStatusTransition(
-  current: SubscriptionStatus,
-  next: SubscriptionStatus,
-): SubscriptionStatus {
-  if (current === next) {
-    return current;
-  }
-  try {
-    assertSubscriptionTransitionAllowed(current, next);
-    return next;
-  } catch {
-    return current;
-  }
+  throw new PaymentReliabilityError(
+    PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
+    `Subscription status "${current}" cannot regress to "${next}"`,
+    { rejectionReason: PAYMENT_TRANSITION_REJECTION_REASON.INVALID_TRANSITION },
+  );
 }

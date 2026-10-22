@@ -2,6 +2,7 @@ import { PaymentConfigurationError } from '../../core/lib/payment-configuration-
 import type { PaymentExecutionStatus } from '../../contracts/index';
 import type { ResolvedPaymentRuntime } from '../../core/index';
 import {
+  assertProviderNetworkAllowedInProduction,
   blockedHttpClient,
   blockedOAuthGetter,
   shouldRejectProviderNetworkCalls,
@@ -23,6 +24,8 @@ export type BuildPaypalSellerOnboardingExecutorInput = {
   partnerConfig: PaypalSellerOnboardingPartnerConfig;
   nodeEnv?: string;
   executionStatus?: PaymentExecutionStatus;
+  /** See `resolvePaymentRuntime`: build a reject-only composition in production on purpose. */
+  allowRejectOnlyInProduction?: boolean;
   forceFakeHttp?: boolean;
   httpClient?: PaypalSellerOnboardingHttpClient;
 };
@@ -32,6 +35,14 @@ export function buildPaypalSellerOnboardingExecutor(
 ): PaypalSellerOnboardingExecutor {
   const { runtime, nodeEnv, forceFakeHttp, httpClient, executionStatus, partnerConfig } = input;
   const isProduction = nodeEnv === 'production';
+
+  assertProviderNetworkAllowedInProduction({
+    runtime,
+    executionStatus,
+    nodeEnv,
+    component: 'PayPal seller onboarding executor',
+    allowRejectOnlyInProduction: input.allowRejectOnlyInProduction,
+  });
 
   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
     return new PaypalSellerOnboardingExecutor(
@@ -89,11 +100,14 @@ export function buildPaypalSellerOnboardingExecutor(
   return new PaypalSellerOnboardingExecutor(
     runtime,
     sellerHttp,
-    (scope) =>
-      oauthClient.getAccessToken({
-        accountRef: scope.accountRef,
-        environment: scope.environment,
-      }),
+    (scope, options) =>
+      oauthClient.getAccessToken(
+        {
+          accountRef: scope.accountRef,
+          environment: scope.environment,
+        },
+        options,
+      ),
     partnerConfig,
   );
 }

@@ -1,0 +1,17 @@
+{
+  "runtime": [
+    "LegacyPaymentError",
+    "PaypalPaymentProvider",
+    "createPaypalPaymentProvider",
+    "invokeCheckoutWhenReady"
+  ],
+  "typeOnly": [
+    "CaptureResult",
+    "CheckoutOperation",
+    "CreateOrderInput",
+    "OrderResult",
+    "PaymentError",
+    "PaymentErrorCode",
+    "RequestOptions"
+  ]
+}

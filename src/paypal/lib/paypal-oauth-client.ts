@@ -29,6 +29,14 @@ type ScopeState = {
   inflight: Promise<string> | null;
 };
 
+export type PaypalAccessTokenRequestOptions = {
+  /**
+   * Token that PayPal just answered with HTTP 401. It is evicted from the cache (only if it is still
+   * the cached one) so the next call fetches a fresh token; concurrent callers share one refresh.
+   */
+  rejectedToken?: string;
+};
+
 export class PaypalOAuthClient {
   private readonly registry = new ScopedTokenCacheRegistry<ScopeState>();
 
@@ -40,24 +48,10 @@ export class PaypalOAuthClient {
     private readonly safetyMarginMs = DEFAULT_SAFETY_MARGIN_MS,
   ) {}
 
-  async getAccessToken(scope: TokenCacheScopeInput): Promise<string> {
-    const state = this.registry.get(scope, () => ({ cached: null, inflight: null }));
-    if (state.cached && state.cached.expiresAt > Date.now()) {
-      return state.cached.token;
-    }
-    if (state.inflight) {
-      return state.inflight;
-    }
-
-    state.inflight = this.refresh(scope, state);
-    try {
-      return await state.inflight;
-    } finally {
-      state.inflight = null;
-    }
-  }
-
-  private async refresh(scope: TokenCacheScopeInput, state: ScopeState): Promise<string> {
+  async getAccessToken(
+    scope: TokenCacheScopeInput,
+    options?: PaypalAccessTokenRequestOptions,
+  ): Promise<string> {
     const credentials = this.credentialsByScope(scope);
     if (!credentials) {
       throw {
@@ -68,6 +62,29 @@ export class PaypalOAuthClient {
       };
     }
 
+    const state = this.registry.get({ ...scope, clientId: credentials.clientId }, () => ({
+      cached: null,
+      inflight: null,
+    }));
+    if (options?.rejectedToken !== undefined && state.cached?.token === options.rejectedToken) {
+      state.cached = null;
+    }
+    if (state.cached && state.cached.expiresAt > Date.now()) {
+      return state.cached.token;
+    }
+    if (state.inflight) {
+      return state.inflight;
+    }
+
+    state.inflight = this.refresh(credentials, state);
+    try {
+      return await state.inflight;
+    } finally {
+      state.inflight = null;
+    }
+  }
+
+  private async refresh(credentials: PaypalOAuthCredentials, state: ScopeState): Promise<string> {
     const baseUrl =
       credentials.environment === 'live'
         ? 'https://api-m.paypal.com'
