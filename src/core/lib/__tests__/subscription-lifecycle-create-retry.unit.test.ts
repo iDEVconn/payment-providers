@@ -152,6 +152,8 @@ describe('retrySubscriptionCreate', () => {
       parentOperationId: plan.operationId,
       providerPlanId: 'PLAN-1',
       subscriberRef: subscriber.subscriberRef,
+      // A 0.2 row: fingerprint without the email, email stored in its column (issue #25).
+      subscriberEmail: subscriber.email,
       maskedSubscriber: '***',
       subscriptionStatus: 'approval_pending',
     });

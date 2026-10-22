@@ -52,12 +52,6 @@ export function validateBillingCycles(cycles: BillingCycleInput[]): BillingCycle
         'Trial billing cycles must repeat at least once',
       );
     }
-    if (cycle.tenureType === 'REGULAR' && cycle.totalCycles !== 0 && cycle.totalCycles < 1) {
-      throw new PaymentReliabilityError(
-        PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
-        'Regular billing cycle total cycles must be zero or positive',
-      );
-    }
     if (sequences.has(cycle.sequence)) {
       throw new PaymentReliabilityError(
         PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
@@ -65,8 +59,15 @@ export function validateBillingCycles(cycles: BillingCycleInput[]): BillingCycle
       );
     }
     sequences.add(cycle.sequence);
+    if (cycle.tenureType === 'REGULAR' && !cycle.price) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+        'Regular billing cycle must have a price',
+      );
+    }
     if (cycle.price) {
-      validateCanonicalMoney(cycle.price);
+      // A free trial may carry a zero price; the regular cycle must always charge.
+      validateCanonicalMoney(cycle.price, { allowZero: cycle.tenureType === 'TRIAL' });
     }
   }
 
@@ -78,6 +79,21 @@ export function validateBillingCycles(cycles: BillingCycleInput[]): BillingCycle
         'Billing cycle sequences must be strictly increasing',
       );
     }
+  }
+
+  sorted.forEach((cycle, index) => {
+    if (cycle.sequence !== index + 1) {
+      throw new PaymentReliabilityError(
+        PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+        'Billing cycle sequences must be contiguous and start at 1',
+      );
+    }
+  });
+  if (sorted.findIndex((cycle) => cycle.tenureType === 'REGULAR') !== sorted.length - 1) {
+    throw new PaymentReliabilityError(
+      PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
+      'Trial billing cycles must come before the regular billing cycle',
+    );
   }
 
   return sorted;

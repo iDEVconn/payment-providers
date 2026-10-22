@@ -1,8 +1,9 @@
 import { PaymentConfigurationError } from '../../core/lib/payment-configuration-error';
-import type { PaymentStrategy } from '@idevconn/payment';
+import type { PaymentStrategy } from '../../contracts/lib/legacy-checkout';
 import type { PaymentExecutionStatus } from '../../contracts/index';
 import type { ResolvedPaymentRuntime } from '../../core/index';
 import {
+  assertProviderNetworkAllowedInProduction,
   blockedHttpClient,
   blockedOAuthGetter,
   shouldRejectProviderNetworkCalls,
@@ -20,6 +21,8 @@ export type BuildPaypalCheckoutExecutorInput = {
   strategyFactory: () => PaymentStrategy;
   nodeEnv?: string;
   executionStatus?: PaymentExecutionStatus;
+  /** See `resolvePaymentRuntime`: build a reject-only composition in production on purpose. */
+  allowRejectOnlyInProduction?: boolean;
   /** Explicit test/dev simulation only. Never set in production composition. */
   forceFakeHttp?: boolean;
 };
@@ -29,6 +32,14 @@ export function buildPaypalCheckoutExecutor(
 ): PaypalCheckoutExecutor {
   const { runtime, strategyFactory, nodeEnv, forceFakeHttp, executionStatus } = input;
   const isProduction = nodeEnv === 'production';
+
+  assertProviderNetworkAllowedInProduction({
+    runtime,
+    executionStatus,
+    nodeEnv,
+    component: 'PayPal checkout executor',
+    allowRejectOnlyInProduction: input.allowRejectOnlyInProduction,
+  });
 
   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
     return new PaypalCheckoutExecutor(
@@ -83,10 +94,13 @@ export function buildPaypalCheckoutExecutor(
   );
   const ordersHttp = new FetchPaypalOrdersHttpClient(credentials.requestTimeoutMs ?? 10_000);
 
-  return new PaypalCheckoutExecutor(runtime, strategyFactory, ordersHttp, (scope) =>
-    oauthClient.getAccessToken({
-      accountRef: scope.accountRef,
-      environment: scope.environment,
-    }),
+  return new PaypalCheckoutExecutor(runtime, strategyFactory, ordersHttp, (scope, options) =>
+    oauthClient.getAccessToken(
+      {
+        accountRef: scope.accountRef,
+        environment: scope.environment,
+      },
+      options,
+    ),
   );
 }

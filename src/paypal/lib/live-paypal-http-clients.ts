@@ -29,6 +29,9 @@ import type {
   PaypalSellerOnboardingHttpResponse,
 } from './paypal-seller-onboarding-http-client';
 
+// Every client passes `redirect: 'error'`: PayPal APIs never redirect, and a followed redirect could
+// replay the bearer token or Basic credentials to another URL. A refusal is a sanitized transport failure.
+
 function extractDebugId(headers: Headers): string | null {
   return headers.get('paypal-debug-id') ?? headers.get('Paypal-Debug-Id');
 }
@@ -59,6 +62,7 @@ export class FetchPaypalOAuthHttpClient implements PaypalOAuthHttpClient {
         method: 'POST',
         headers,
         body,
+        redirect: 'error',
         signal: controller.signal,
       });
       return {
@@ -92,6 +96,7 @@ export class FetchPaypalPayoutHttpClient implements PaypalPayoutHttpClient {
         method: input.method,
         headers,
         body: input.body != null ? JSON.stringify(input.body) : undefined,
+        redirect: 'error',
         signal: controller.signal,
       });
       return {
@@ -125,6 +130,7 @@ export class FetchPaypalSubscriptionHttpClient implements PaypalSubscriptionHttp
         method: input.method,
         headers,
         body: input.body != null ? JSON.stringify(input.body) : undefined,
+        redirect: 'error',
         signal: controller.signal,
       });
       return {
@@ -164,6 +170,7 @@ export class FetchPaypalOrdersHttpClient implements PaypalOrdersHttpClient {
         method: input.method,
         headers,
         body: input.body != null ? JSON.stringify(input.body) : undefined,
+        redirect: 'error',
         signal: controller.signal,
       });
       return {
@@ -200,6 +207,7 @@ export class FetchPaypalSellerOnboardingHttpClient implements PaypalSellerOnboar
         method: input.method,
         headers,
         body: input.body != null ? JSON.stringify(input.body) : undefined,
+        redirect: 'error',
         signal: controller.signal,
       });
       return {

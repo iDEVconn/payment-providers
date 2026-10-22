@@ -12,6 +12,7 @@ import {
 } from '../../contracts/index';
 import {
   assertCapabilityReady,
+  pathSegment,
   canonicalMoneyToLegacyMajorAmount,
   PAYPAL_SENDER_BATCH_ID_MAX,
   PAYPAL_SENDER_ITEM_ID_MAX,
@@ -19,9 +20,17 @@ import {
   type ResolvedPaymentRuntime,
 } from '../../core/index';
 import { mapPaypalBatchStatus, mapPaypalItemTransactionStatus } from '../../core/index';
+import {
+  resendWithFreshPaypalTokenOn401,
+  type PaypalAccessTokenScope,
+} from './paypal-access-token-retry';
 import { extractPaypalIssueCodes } from './paypal-checkout-order-parsing';
 import type { PaypalCheckoutTokenProvider } from './paypal-checkout-executor';
-import type { PaypalPayoutHttpClient } from './paypal-payout-http-client';
+import type {
+  PaypalPayoutHttpClient,
+  PaypalPayoutHttpRequest,
+  PaypalPayoutHttpResponse,
+} from './paypal-payout-http-client';
 
 function majorToMinor(value: string, currency: string): string {
   const [whole = '0', fraction = ''] = value.split('.');
@@ -157,24 +166,31 @@ export class PaypalPayoutExecutor implements PayoutProviderPort {
     private readonly tokenProvider: PaypalCheckoutTokenProvider,
   ) {}
 
+  private authorizedRequest(
+    scope: PaypalAccessTokenScope,
+    token: string,
+    request: Omit<PaypalPayoutHttpRequest, 'accessToken'>,
+  ): Promise<PaypalPayoutHttpResponse> {
+    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
+      this.httpClient.request({ ...request, accessToken }),
+    );
+  }
+
   async submitBatch(
     input: ExecuteSubmitPayoutBatchRequest,
   ): Promise<ExecuteSubmitPayoutBatchResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'payout');
     assertPayoutSenderIdLengths(input);
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
 
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
       path: `${baseUrl}/v1/payments/payouts`,
-      accessToken: token,
       requestId: input.providerRequestId,
       body: {
         sender_batch_header: {
@@ -208,10 +224,9 @@ export class PaypalPayoutExecutor implements PayoutProviderPort {
           providerDebugId: response.debugId ?? null,
         };
       }
-      const existing = await this.httpClient.request({
+      const existing = await this.authorizedRequest(tokenScope, token, {
         method: 'GET',
-        path: `${baseUrl}/v1/payments/payouts/${providerPayoutBatchId}`,
-        accessToken: token,
+        path: `${baseUrl}/v1/payments/payouts/${pathSegment(providerPayoutBatchId, 'providerPayoutBatchId')}`,
       });
       if (existing.status >= 400) {
         throw {
@@ -299,36 +314,30 @@ export class PaypalPayoutExecutor implements PayoutProviderPort {
 
   async getBatch(input: ExecuteGetPayoutBatchRequest): Promise<ExecuteGetPayoutBatchResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'payout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl}/v1/payments/payouts/${input.providerPayoutBatchId}`,
-      accessToken: token,
+      path: `${baseUrl}/v1/payments/payouts/${pathSegment(input.providerPayoutBatchId, 'providerPayoutBatchId')}`,
     });
     return this.mapBatchLookup(response, input.providerPayoutBatchId);
   }
 
   async getItem(input: ExecuteGetPayoutItemRequest): Promise<ExecuteGetPayoutItemResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'payout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl}/v1/payments/payouts-item/${input.providerPayoutItemId}`,
-      accessToken: token,
+      path: `${baseUrl}/v1/payments/payouts-item/${pathSegment(input.providerPayoutItemId, 'providerPayoutItemId')}`,
     });
     return this.mapItemLookup(response, input.providerPayoutItemId);
   }
@@ -337,18 +346,15 @@ export class PaypalPayoutExecutor implements PayoutProviderPort {
     input: ExecuteCancelUnclaimedPayoutItemRequest,
   ): Promise<ExecuteCancelUnclaimedPayoutItemResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'payout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const baseUrl =
       input.environment === 'live'
         ? 'https://api-m.paypal.com'
         : 'https://api-m.sandbox.paypal.com';
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
-      path: `${baseUrl}/v1/payments/payouts-item/${input.providerPayoutItemId}/cancel`,
-      accessToken: token,
+      path: `${baseUrl}/v1/payments/payouts-item/${pathSegment(input.providerPayoutItemId, 'providerPayoutItemId')}/cancel`,
       body: {},
     });
     if (response.status >= 400) {

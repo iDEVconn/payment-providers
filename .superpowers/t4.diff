@@ -1,0 +1,720 @@
+diff --color -ruN .superpowers/snap-after-t3/src/contracts/lib/legacy-checkout.ts .superpowers/snap-after-t4/src/contracts/lib/legacy-checkout.ts
+--- .superpowers/snap-after-t3/src/contracts/lib/legacy-checkout.ts	2026-10-22 12:44:55.574959224 +0300
++++ .superpowers/snap-after-t4/src/contracts/lib/legacy-checkout.ts	2026-10-22 12:57:32.043240040 +0300
+@@ -1,10 +1,57 @@
+-export type {
+-  CaptureResult,
+-  CreateOrderInput,
+-  OrderResult,
+-  PaymentError,
+-  PaymentErrorCode,
+-  RequestOptions,
+-} from '@idevconn/payment';
++/*
++ * Structural copies of the legacy `@idevconn/payment` checkout types. `@idevconn/payment`
++ * is an optional peer, so root, `/paypal` and `/subscription` declarations must not import
++ * it. Same shapes as `@idevconn/payment@1.2`; the real types stay on `/legacy`.
++ */
+ 
+-export { PaymentError as LegacyPaymentError } from '@idevconn/payment';
++/** @deprecated Import the real type from `@idevconn/payment-providers/legacy`. */
++export type CreateOrderInput = {
++  amount: string;
++  currency: string;
++  referenceId?: string;
++  returnUrl?: string;
++  cancelUrl?: string;
++};
++
++/** @deprecated Import the real type from `@idevconn/payment-providers/legacy`. */
++export type OrderResult = {
++  orderId: string;
++  status: string;
++  approveUrl?: string;
++};
++
++/** @deprecated Import the real type from `@idevconn/payment-providers/legacy`. */
++export type CaptureResult = {
++  orderId: string;
++  status: string;
++  payer?: Record<string, unknown>;
++  purchaseUnits?: Record<string, unknown>[];
++};
++
++/** @deprecated Import the real type from `@idevconn/payment-providers/legacy`. */
++export type RequestOptions = {
++  idempotencyKey?: string;
++};
++
++/** @deprecated Import the real type from `@idevconn/payment-providers/legacy`. */
++export type PaymentStrategy = {
++  readonly name: string;
++  createOrder(input: CreateOrderInput, options?: RequestOptions): Promise<OrderResult>;
++  captureOrder(orderId: string, options?: RequestOptions): Promise<CaptureResult>;
++};
++
++/** @deprecated Import the real type from `@idevconn/payment-providers/legacy`. */
++export type PaymentErrorCode =
++  | 'VALIDATION_FAILED'
++  | 'PROVIDER_NOT_REGISTERED'
++  | 'NOT_SUPPORTED'
++  | 'PROVIDER_ERROR'
++  | 'INTERNAL_ERROR';
++
++/** @deprecated Import the real type from `@idevconn/payment-providers/legacy`. */
++export interface PaymentError extends Error {
++  readonly code: PaymentErrorCode;
++  readonly statusCode: number;
++  readonly details?: Record<string, unknown> | undefined;
++  toResponseBody(): Record<string, unknown>;
++}
+diff --color -ruN .superpowers/snap-after-t3/src/legacy/index.ts .superpowers/snap-after-t4/src/legacy/index.ts
+--- .superpowers/snap-after-t3/src/legacy/index.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t4/src/legacy/index.ts	2026-10-22 12:57:32.056653932 +0300
+@@ -0,0 +1,14 @@
++/**
++ * Legacy `@idevconn/payment` checkout surface. This is the only entry that loads
++ * `@idevconn/payment` at runtime; install it (optional peer) before importing here.
++ */
++export { PaymentError as LegacyPaymentError } from '@idevconn/payment';
++export type {
++  CaptureResult,
++  CreateOrderInput,
++  OrderResult,
++  PaymentError,
++  PaymentErrorCode,
++  RequestOptions,
++} from '@idevconn/payment';
++export * from '../paypal/lib/paypal-payment-provider';
+diff --color -ruN .superpowers/snap-after-t3/src/paypal/index.ts .superpowers/snap-after-t4/src/paypal/index.ts
+--- .superpowers/snap-after-t3/src/paypal/index.ts	2026-10-22 12:44:55.581569158 +0300
++++ .superpowers/snap-after-t4/src/paypal/index.ts	2026-10-22 12:57:32.056030009 +0300
+@@ -2,7 +2,6 @@
+ export * from './lib/blocked-provider-network';
+ export * from './lib/provider-network-policy';
+ export * from './lib/unconfigured-fake-checkout.strategy';
+-export * from './lib/paypal-payment-provider';
+ export * from './lib/paypal-webhook-verifier';
+ export * from './lib/paypal-webhook-verifier.factory';
+ export * from './lib/fake-paypal-webhook-verification-client';
+diff --color -ruN .superpowers/snap-after-t3/src/paypal/lib/paypal-checkout-executor.factory.ts .superpowers/snap-after-t4/src/paypal/lib/paypal-checkout-executor.factory.ts
+--- .superpowers/snap-after-t3/src/paypal/lib/paypal-checkout-executor.factory.ts	2026-10-22 12:44:55.580769696 +0300
++++ .superpowers/snap-after-t4/src/paypal/lib/paypal-checkout-executor.factory.ts	2026-10-22 12:57:32.050285705 +0300
+@@ -1,5 +1,5 @@
+ import { PaymentConfigurationError } from '../../core/lib/payment-configuration-error';
+-import type { PaymentStrategy } from '@idevconn/payment';
++import type { PaymentStrategy } from '../../contracts/lib/legacy-checkout';
+ import type { PaymentExecutionStatus } from '../../contracts/index';
+ import type { ResolvedPaymentRuntime } from '../../core/index';
+ import {
+diff --color -ruN .superpowers/snap-after-t3/src/paypal/lib/paypal-checkout-executor.ts .superpowers/snap-after-t4/src/paypal/lib/paypal-checkout-executor.ts
+--- .superpowers/snap-after-t3/src/paypal/lib/paypal-checkout-executor.ts	2026-10-22 12:44:55.581471699 +0300
++++ .superpowers/snap-after-t4/src/paypal/lib/paypal-checkout-executor.ts	2026-10-22 12:57:32.055912137 +0300
+@@ -1,4 +1,4 @@
+-import { PaymentError, type OrderResult, type PaymentStrategy } from '@idevconn/payment';
++import type { OrderResult, PaymentStrategy } from '../../contracts/lib/legacy-checkout';
+ import {
+   PAYMENT_CAPABILITY_UNAVAILABLE,
+   PAYMENT_RELIABILITY_ERROR,
+@@ -477,7 +477,7 @@
+       if (isRecord(error) && error['code'] === PAYMENT_CAPABILITY_UNAVAILABLE) {
+         throw error;
+       }
+-      if (error instanceof PaymentError) {
++      if (isLegacyPaymentError(error)) {
+         throw {
+           code: PAYMENT_RELIABILITY_ERROR.PROVIDER_AUTH_FAILURE,
+           message: 'Payment provider rejected authentication',
+@@ -490,3 +490,8 @@
+     }
+   }
+ }
++
++/** Structural check: `@idevconn/payment` is an optional peer and is not loaded at runtime here. */
++function isLegacyPaymentError(error: unknown): boolean {
++  return error instanceof Error && error.name === 'PaymentError';
++}
+diff --color -ruN .superpowers/snap-after-t3/src/paypal/lib/unconfigured-fake-checkout.strategy.ts .superpowers/snap-after-t4/src/paypal/lib/unconfigured-fake-checkout.strategy.ts
+--- .superpowers/snap-after-t3/src/paypal/lib/unconfigured-fake-checkout.strategy.ts	2026-10-22 12:44:55.581444074 +0300
++++ .superpowers/snap-after-t4/src/paypal/lib/unconfigured-fake-checkout.strategy.ts	2026-10-22 12:57:32.055883371 +0300
+@@ -4,7 +4,7 @@
+   OrderResult,
+   PaymentStrategy,
+   RequestOptions,
+-} from '@idevconn/payment';
++} from '../../contracts/lib/legacy-checkout';
+ import { PAYMENT_CAPABILITY_UNAVAILABLE, PAYMENT_CAUSE_CODE } from '../../contracts/index';
+ 
+ export class UnconfiguredFakeCheckoutStrategy implements PaymentStrategy {
+diff --color -ruN .superpowers/snap-after-t3/test/dist-declarations.test.ts .superpowers/snap-after-t4/test/dist-declarations.test.ts
+--- .superpowers/snap-after-t3/test/dist-declarations.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t4/test/dist-declarations.test.ts	2026-10-22 12:57:32.057031630 +0300
+@@ -0,0 +1,107 @@
++import { execFileSync } from 'node:child_process';
++import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { afterAll, beforeAll, describe, expect, it } from 'vitest';
++
++/*
++ * `@idevconn/payment` is an optional peer, so the declarations of root, /paypal and
++ * /subscription must not mention it (issue #10). The package is copied (not linked)
++ * into a temp consumer outside this repo, so `@idevconn/payment` cannot resolve there,
++ * and checked with `skipLibCheck: false`.
++ */
++
++const root = join(import.meta.dirname, '..');
++const distReady = existsSync(join(root, 'dist/legacy.d.ts'));
++const consumerDir = mkdtempSync(join(tmpdir(), 'pp-declarations-'));
++const pkgDir = join(consumerDir, 'node_modules/@idevconn/payment-providers');
++const tscBin = join(root, 'node_modules/typescript/bin/tsc');
++
++/** Declaration files reachable from an entry's `.d.ts`/`.d.cts` through relative imports. */
++function reachableDeclarations(entry: string): string[] {
++  const seen = new Set<string>();
++  const queue = [entry];
++  while (queue.length > 0) {
++    const file = queue.pop() as string;
++    if (seen.has(file)) continue;
++    seen.add(file);
++    const text = readFileSync(join(root, 'dist', file), 'utf8');
++    for (const match of text.matchAll(/from ['"]\.\/([^'"]+)['"]/g)) {
++      const base = match[1] as string;
++      const ext = file.endsWith('.d.cts') ? '.d.cts' : '.d.ts';
++      queue.push(base.endsWith('.js') || base.endsWith('.cjs') ? base.replace(/\.c?js$/, ext) : `${base}${ext}`);
++    }
++  }
++  return [...seen];
++}
++
++describe.skipIf(!distReady)('declarations of root, /paypal and /subscription are free of @idevconn/payment', () => {
++  beforeAll(() => {
++    mkdirSync(pkgDir, { recursive: true });
++    cpSync(join(root, 'dist'), join(pkgDir, 'dist'), { recursive: true });
++    cpSync(join(root, 'package.json'), join(pkgDir, 'package.json'));
++    writeFileSync(join(consumerDir, 'package.json'), JSON.stringify({ name: 'consumer', private: true }));
++  });
++
++  afterAll(() => {
++    rmSync(consumerDir, { recursive: true, force: true });
++  });
++
++  it.each(['index', 'paypal', 'subscription'])('dist/%s declarations and their shared chunks do not mention it', (entry) => {
++    for (const ext of ['.d.ts', '.d.cts']) {
++      for (const file of reachableDeclarations(`${entry}${ext}`)) {
++        expect(readFileSync(join(root, 'dist', file), 'utf8'), file).not.toContain('@idevconn/payment"');
++        expect(readFileSync(join(root, 'dist', file), 'utf8'), file).not.toContain("@idevconn/payment'");
++      }
++    }
++  });
++
++  it('keeps the legacy entry on the real @idevconn/payment types', () => {
++    expect(readFileSync(join(root, 'dist/legacy.d.ts'), 'utf8')).toContain('@idevconn/payment');
++    expect(readdirSync(join(root, 'dist')).length).toBeGreaterThan(0);
++  });
++
++  it.each(['node10', 'node16'])(
++    'type-checks root, /paypal and /subscription with skipLibCheck false under %s without @idevconn/payment installed',
++    (moduleResolution) => {
++      const dir = join(consumerDir, moduleResolution);
++      mkdirSync(dir, { recursive: true });
++      writeFileSync(
++        join(dir, 'index.ts'),
++        `import { WebhookProcessingService, PaymentCapabilityError } from '@idevconn/payment-providers';
++         import type { OrderResult, PaymentStrategy } from '@idevconn/payment-providers';
++         import { PaypalWebhookVerifier, PaypalCheckoutExecutor, buildPaypalCheckoutExecutor } from '@idevconn/payment-providers/paypal';
++         import { reduceSubscription } from '@idevconn/payment-providers/subscription';
++         declare const order: OrderResult;
++         declare const strategy: PaymentStrategy;
++         export { order, strategy, WebhookProcessingService, PaymentCapabilityError, PaypalWebhookVerifier, PaypalCheckoutExecutor, buildPaypalCheckoutExecutor, reduceSubscription };
++        `,
++      );
++      writeFileSync(
++        join(dir, 'tsconfig.json'),
++        JSON.stringify({
++          compilerOptions: {
++            target: 'ES2022',
++            module: moduleResolution === 'node10' ? 'commonjs' : 'node16',
++            moduleResolution,
++            strict: true,
++            noEmit: true,
++            skipLibCheck: false,
++            types: [],
++          },
++          files: ['index.ts'],
++        }),
++      );
++      const result = (() => {
++        try {
++          return execFileSync(process.execPath, [tscBin, '-p', join(dir, 'tsconfig.json')], { cwd: dir, encoding: 'utf8' });
++        } catch (error) {
++          const failure = error as { stdout?: string; stderr?: string };
++          return `FAILED\n${failure.stdout ?? ''}${failure.stderr ?? ''}`;
++        }
++      })();
++      expect(result).toBe('');
++    },
++    60_000,
++  );
++});
+diff --color -ruN .superpowers/snap-after-t3/test/dist-entry-identity.test.ts .superpowers/snap-after-t4/test/dist-entry-identity.test.ts
+--- .superpowers/snap-after-t3/test/dist-entry-identity.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t4/test/dist-entry-identity.test.ts	2026-10-22 12:57:32.057089105 +0300
+@@ -0,0 +1,111 @@
++import { execFileSync } from 'node:child_process';
++import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { pathToFileURL } from 'node:url';
++import { afterAll, describe, expect, it } from 'vitest';
++
++/*
++ * Built-package checks run in a fresh `node` process against dist/, so the module
++ * graph is the one a consumer gets: core classes must be one copy across entries
++ * (issue #9), and the entries must not load the legacy checkout runtime (issue #10).
++ */
++
++const root = join(import.meta.dirname, '..');
++const distReady = existsSync(join(root, 'dist/index.js'));
++const scratch = mkdtempSync(join(tmpdir(), 'pp-entry-identity-'));
++
++const identityBody = (load: (name: string) => string) => `
++  const core = ${load('index')};
++  const pp = ${load('paypal')};
++  const sub = ${load('subscription')};
++  const ctx = { providerCode: 'paypal', accountRef: 'a', applicationRef: 'x', environment: 'sandbox' };
++  const runtime = { mode: 'live-provider', context: ctx, descriptor: { ...ctx, capabilities: core.evaluateCapabilities({ applicationRef: 'x', environment: 'sandbox' }, ctx) } };
++  const executor = new pp.PaypalSubscriptionExecutor(runtime, { request: async () => ({}) }, async () => 't');
++  const thrown = await executor.getPlan({ ...ctx, providerPlanId: 'P' }).then(() => null, (e) => e);
++  console.log(JSON.stringify({
++    capability: thrown instanceof core.PaymentCapabilityError,
++    configuration: new pp.PaypalWebhookVerifier !== undefined,
++    subscriptionEntry: typeof sub.reduceSubscription,
++  }));
++`;
++
++function runNode(args: string[]): string {
++  return execFileSync(process.execPath, args, { cwd: scratch, encoding: 'utf8' });
++}
++
++const blockedSpecifier = /^(axios|zod|express|@idevconn\/payment)(\/|$)/;
++
++describe.skipIf(!distReady)('built entries share one core and stay free of the legacy runtime', () => {
++  afterAll(() => {
++    rmSync(scratch, { recursive: true, force: true });
++  });
++
++  it('shares PaymentCapabilityError between root and paypal under CJS require', () => {
++    const script = join(scratch, 'identity.cjs');
++    const load = (name: string) => `require(${JSON.stringify(join(root, `dist/${name}.cjs`))})`;
++    writeFileSync(script, `(async () => {${identityBody(load).replace('new pp.PaypalWebhookVerifier !== undefined', 'typeof pp.PaypalWebhookVerifier')}})();`);
++    const out = JSON.parse(runNode([script]));
++    expect(out.capability).toBe(true);
++    expect(out.subscriptionEntry).toBe('function');
++  });
++
++  it('shares PaymentCapabilityError between root and paypal under ESM import', () => {
++    const script = join(scratch, 'identity.mjs');
++    const load = (name: string) => `await import(${JSON.stringify(pathToFileURL(join(root, `dist/${name}.js`)).href)})`;
++    writeFileSync(script, identityBody(load).replace('new pp.PaypalWebhookVerifier !== undefined', 'typeof pp.PaypalWebhookVerifier'));
++    const out = JSON.parse(runNode([script]));
++    expect(out.capability).toBe(true);
++  });
++
++  const cjsGuard = (entry: string) => `
++    const Module = require('node:module');
++    const blocked = ${blockedSpecifier.toString()};
++    const original = Module._resolveFilename;
++    const seen = [];
++    Module._resolveFilename = function (request, ...rest) {
++      if (blocked.test(request)) seen.push(request);
++      return original.call(this, request, ...rest);
++    };
++    require(${JSON.stringify(join(root, `dist/${entry}.cjs`))});
++    const cached = Object.keys(require.cache).filter((k) => /node_modules[\\\\/](axios|zod|express|@idevconn[\\\\/]payment[\\\\/])/.test(k));
++    console.log(JSON.stringify({ seen, cached }));
++  `;
++
++  it.each(['index', 'paypal', 'subscription'])('loads dist/%s.cjs without axios, zod, express or @idevconn/payment', (entry) => {
++    const out = JSON.parse(runNode(['-e', cjsGuard(entry)]));
++    expect(out).toEqual({ seen: [], cached: [] });
++  });
++
++  it('loads dist/legacy.cjs with @idevconn/payment', () => {
++    const out = JSON.parse(runNode(['-e', cjsGuard('legacy')]));
++    expect(out.seen).toContain('@idevconn/payment');
++  });
++
++  const hooks = join(scratch, 'hooks.mjs');
++  const register = join(scratch, 'register.mjs');
++  const esmGuard = (entry: string) => {
++    writeFileSync(
++      hooks,
++      `const blocked = ${blockedSpecifier.toString()};
++       export async function resolve(specifier, context, next) {
++         if (blocked.test(specifier)) console.log('BLOCKED:' + specifier);
++         return next(specifier, context);
++       }`,
++    );
++    writeFileSync(register, `import { register } from 'node:module';\nregister(${JSON.stringify(pathToFileURL(hooks).href)});`);
++    const script = join(scratch, `guard-${entry}.mjs`);
++    writeFileSync(script, `await import(${JSON.stringify(pathToFileURL(join(root, `dist/${entry}.js`)).href)});`);
++    return runNode(['--import', register, script])
++      .split('\n')
++      .filter((line) => line.startsWith('BLOCKED:'));
++  };
++
++  it.each(['index', 'paypal', 'subscription'])('loads dist/%s.js without axios, zod, express or @idevconn/payment', (entry) => {
++    expect(esmGuard(entry)).toEqual([]);
++  });
++
++  it('loads dist/legacy.js with @idevconn/payment', () => {
++    expect(esmGuard('legacy')).toContain('BLOCKED:@idevconn/payment');
++  });
++});
+diff --color -ruN .superpowers/snap-after-t3/test/entries-consumer.test.ts .superpowers/snap-after-t4/test/entries-consumer.test.ts
+--- .superpowers/snap-after-t3/test/entries-consumer.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ .superpowers/snap-after-t4/test/entries-consumer.test.ts	2026-10-22 12:57:32.056741931 +0300
+@@ -0,0 +1,79 @@
++import { execFileSync } from 'node:child_process';
++import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
++import { join } from 'node:path';
++import { afterAll, beforeAll, describe, expect, it } from 'vitest';
++
++/*
++ * Consumer type-check of every public entry under `moduleResolution` node10
++ * (resolved only through `typesVersions`) and node16 (through `exports`), run
++ * with a real `tsc` against the built package linked by name (issues #9, #10).
++ */
++
++const root = join(import.meta.dirname, '..');
++const distReady = existsSync(join(root, 'dist/legacy.d.ts'));
++const consumerDir = join(root, 'node_modules/.cache/entries-consumer-smoke');
++const tscBin = join(root, 'node_modules/typescript/bin/tsc');
++
++const source = `import { WebhookProcessingService, PaymentCapabilityError } from '@idevconn/payment-providers';
++import type { OrderResult } from '@idevconn/payment-providers';
++import { PaypalWebhookVerifier, PaypalSubscriptionExecutor } from '@idevconn/payment-providers/paypal';
++import { reduceSubscription, initialSubscriptionState } from '@idevconn/payment-providers/subscription';
++import { createPaypalPaymentProvider, LegacyPaymentError } from '@idevconn/payment-providers/legacy';
++declare const order: OrderResult;
++export { order, WebhookProcessingService, PaymentCapabilityError, PaypalWebhookVerifier, PaypalSubscriptionExecutor, reduceSubscription, initialSubscriptionState, createPaypalPaymentProvider, LegacyPaymentError };
++`;
++
++describe.skipIf(!distReady)('every entry resolves for a consumer', () => {
++  beforeAll(() => {
++    rmSync(consumerDir, { recursive: true, force: true });
++    mkdirSync(join(consumerDir, 'node_modules/@idevconn'), { recursive: true });
++    symlinkSync(root, join(consumerDir, 'node_modules/@idevconn/payment-providers'), 'dir');
++    symlinkSync(
++      join(root, 'node_modules/@idevconn/payment'),
++      join(consumerDir, 'node_modules/@idevconn/payment'),
++      'dir',
++    );
++    writeFileSync(join(consumerDir, 'package.json'), JSON.stringify({ name: 'consumer', private: true }));
++  });
++
++  afterAll(() => {
++    rmSync(consumerDir, { recursive: true, force: true });
++  });
++
++  it.each(['node10', 'node16'])(
++    'type-checks root, /paypal, /subscription and /legacy under moduleResolution %s',
++    (moduleResolution) => {
++      const dir = join(consumerDir, moduleResolution);
++      mkdirSync(dir, { recursive: true });
++      writeFileSync(join(dir, 'index.ts'), source);
++      writeFileSync(
++        join(dir, 'tsconfig.json'),
++        JSON.stringify({
++          compilerOptions: {
++            target: 'ES2022',
++            module: moduleResolution === 'node10' ? 'commonjs' : 'node16',
++            moduleResolution,
++            strict: true,
++            noEmit: true,
++            skipLibCheck: true,
++            types: [],
++          },
++          files: ['index.ts'],
++        }),
++      );
++      const result = (() => {
++        try {
++          return execFileSync(process.execPath, [tscBin, '-p', join(dir, 'tsconfig.json')], {
++            cwd: dir,
++            encoding: 'utf8',
++          });
++        } catch (error) {
++          const failure = error as { stdout?: string; stderr?: string };
++          return `FAILED\n${failure.stdout ?? ''}${failure.stderr ?? ''}`;
++        }
++      })();
++      expect(result).toBe('');
++    },
++    60_000,
++  );
++});
+diff --color -ruN .superpowers/snap-after-t3/test/environment-independence.test.ts .superpowers/snap-after-t4/test/environment-independence.test.ts
+--- .superpowers/snap-after-t3/test/environment-independence.test.ts	2026-10-22 12:44:55.582201642 +0300
++++ .superpowers/snap-after-t4/test/environment-independence.test.ts	2026-10-22 12:57:32.056845944 +0300
+@@ -14,6 +14,7 @@
+     });
+     await expect(import('../src/index')).resolves.toBeDefined();
+     await expect(import('../src/paypal/index')).resolves.toBeDefined();
++    await expect(import('../src/legacy/index')).resolves.toBeDefined();
+     envSpy.mockRestore();
+   });
+ 
+diff --color -ruN .superpowers/snap-after-t3/test/package-consumer.test.ts .superpowers/snap-after-t4/test/package-consumer.test.ts
+--- .superpowers/snap-after-t3/test/package-consumer.test.ts	2026-10-22 12:44:55.582322900 +0300
++++ .superpowers/snap-after-t4/test/package-consumer.test.ts	2026-10-22 12:57:32.056954195 +0300
+@@ -9,6 +9,19 @@
+ 
+   it('loads the PayPal subpath', async () => {
+     const paypal = await import('../src/paypal/index');
+-    expect(paypal.PaypalPaymentProvider).toBeDefined();
++    expect(paypal.PaypalWebhookVerifier).toBeDefined();
++    expect(paypal.PaypalPaymentProvider).toBeUndefined();
++  });
++
++  it('loads the legacy subpath with the checkout provider and LegacyPaymentError', async () => {
++    const legacy = await import('../src/legacy/index');
++    expect(legacy.PaypalPaymentProvider).toBeDefined();
++    expect(legacy.createPaypalPaymentProvider).toBeDefined();
++    expect(legacy.LegacyPaymentError).toBeDefined();
++  });
++
++  it('keeps the root free of the legacy runtime value', async () => {
++    const root = await import('../src/index');
++    expect((root as Record<string, unknown>)['LegacyPaymentError']).toBeUndefined();
+   });
+ });
+diff --color -ruN .superpowers/snap-after-t3/test/public-exports.unit.test.ts .superpowers/snap-after-t4/test/public-exports.unit.test.ts
+--- .superpowers/snap-after-t3/test/public-exports.unit.test.ts	2026-10-22 12:44:55.582347005 +0300
++++ .superpowers/snap-after-t4/test/public-exports.unit.test.ts	2026-10-22 12:57:32.056978206 +0300
+@@ -26,11 +26,11 @@
+     expect(root.resolvePaymentRuntime({ config }).context.environment).toBe('sandbox');
+   });
+ 
+-  it('resolves the PayPal subpath entrypoint', async () => {
++  it('resolves the PayPal subpath entrypoint (checkout provider lives in ./legacy)', async () => {
+     const paypal = await import('../src/paypal/index');
+     expect(paypal.PaypalWebhookVerifier).toBeDefined();
+     expect(paypal.LivePaypalWebhookVerificationClient).toBeDefined();
+-    expect(paypal.createPaypalPaymentProvider).toBeDefined();
++    expect(paypal.createPaypalPaymentProvider).toBeUndefined();
+     expect(paypal.parsePaypalEnvironmentFromEnv).toBeUndefined();
+   });
+ });
+diff --color -ruN .superpowers/snap-after-t3/.github/workflows/ci.yml .superpowers/snap-after-t4/.github/workflows/ci.yml
+--- .superpowers/snap-after-t3/.github/workflows/ci.yml	2026-10-22 12:44:55.582665116 +0300
++++ .superpowers/snap-after-t4/.github/workflows/ci.yml	2026-10-22 12:57:32.057501200 +0300
+@@ -10,22 +10,26 @@
+   group: ci-${{ github.ref }}
+   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+ 
+-permissions:
+-  contents: read
++permissions: {}
+ 
+ jobs:
+   ci:
+     runs-on: ubuntu-latest
++    permissions:
++      contents: read
+     steps:
+-      - uses: actions/checkout@v4
++      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
++        with:
++          persist-credentials: false
+ 
+-      - uses: actions/setup-node@v4
++      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: 22.12
+           cache: npm
+ 
++      # No install scripts: build and tests do not need them (esbuild's postinstall is optional).
+       - name: Install dependencies
+-        run: npm ci
++        run: npm ci --ignore-scripts
+ 
+       - name: Typecheck
+         run: npm run typecheck
+@@ -36,6 +40,11 @@
+       - name: Test
+         run: npm run test
+ 
++      # Built-package checks: CJS/ESM core identity, no legacy runtime in root, /paypal and
++      # /subscription, node10 + node16 consumer type-check (real tsc), pure-core entry.
++      - name: Package smoke tests
++        run: npx vitest run test/dist-package-surface.test.ts test/dist-entry-identity.test.ts test/entries-consumer.test.ts test/subscription-entry-consumer.test.ts
++
+       - name: Lint
+         run: npm run lint
+ 
+diff --color -ruN .superpowers/snap-after-t3/.github/workflows/release.yml .superpowers/snap-after-t4/.github/workflows/release.yml
+--- .superpowers/snap-after-t3/.github/workflows/release.yml	2026-10-22 12:44:55.582691560 +0300
++++ .superpowers/snap-after-t4/.github/workflows/release.yml	2026-10-22 12:57:32.057525493 +0300
+@@ -8,31 +8,29 @@
+   push:
+     branches: [main]
+ 
+-permissions:
+-  contents: write
+-  pull-requests: write
+-  id-token: write
++permissions: {}
+ 
+ concurrency:
+   group: release-${{ github.ref }}
+   cancel-in-progress: false
+ 
+ jobs:
+-  release:
++  verify:
+     runs-on: ubuntu-latest
++    permissions:
++      contents: read
+     steps:
+-      - uses: actions/checkout@v4
++      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+         with:
+-          fetch-depth: 0
++          persist-credentials: false
+ 
+-      - uses: actions/setup-node@v4
++      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+         with:
+           node-version: 22.14
+           cache: npm
+-          registry-url: https://registry.npmjs.org
+ 
+       - name: Install dependencies
+-        run: npm ci
++        run: npm ci --ignore-scripts
+ 
+       - name: Typecheck
+         run: npm run typecheck
+@@ -43,12 +41,40 @@
+       - name: Test
+         run: npm run test
+ 
++      - name: Package smoke tests
++        run: npx vitest run test/dist-package-surface.test.ts test/dist-entry-identity.test.ts test/entries-consumer.test.ts test/subscription-entry-consumer.test.ts
++
+       - name: Lint
+         run: npm run lint
+ 
+       - name: Pack dry-run
+         run: npm pack --dry-run
+ 
++  # Only this job can write to the repo and mint the OIDC token for npm trusted publishing.
++  release:
++    needs: verify
++    runs-on: ubuntu-latest
++    permissions:
++      contents: write
++      pull-requests: write
++      id-token: write
++    steps:
++      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
++        with:
++          fetch-depth: 0
++
++      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
++        with:
++          node-version: 22.14
++          cache: npm
++          registry-url: https://registry.npmjs.org
++
++      - name: Install dependencies
++        run: npm ci --ignore-scripts
++
++      - name: Build
++        run: npm run build
++
+       # setup-node writes a project .npmrc expecting NODE_AUTH_TOKEN; remove it so
+       # changeset publish can use npm OIDC trusted publishing instead.
+       - name: Clean npm auth config for OIDC publish
+@@ -61,7 +87,7 @@
+         run: npm install -g npm@11.21.1
+ 
+       - name: Create Release PR or publish
+-        uses: changesets/action@v1
++        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+         with:
+           publish: npx changeset publish
+           version: npx changeset version
+--- .superpowers/snap-after-t3/package.json	2026-10-22 12:44:55.582504059 +0300
++++ .superpowers/snap-after-t4/package.json	2026-10-22 12:57:32.057176877 +0300
+@@ -48,6 +48,16 @@
+         "types": "./dist/subscription.d.cts",
+         "default": "./dist/subscription.cjs"
+       }
++    },
++    "./legacy": {
++      "import": {
++        "types": "./dist/legacy.d.ts",
++        "default": "./dist/legacy.js"
++      },
++      "require": {
++        "types": "./dist/legacy.d.cts",
++        "default": "./dist/legacy.cjs"
++      }
+     }
+   },
+   "typesVersions": {
+@@ -57,6 +67,9 @@
+       ],
+       "subscription": [
+         "./dist/subscription.d.ts"
++      ],
++      "legacy": [
++        "./dist/legacy.d.ts"
+       ]
+     }
+   },
+@@ -73,18 +86,24 @@
+     "lint": "eslint src",
+     "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build"
+   },
+-  "dependencies": {
++  "peerDependencies": {
+     "@idevconn/payment": "^1.2.0"
+   },
++  "peerDependenciesMeta": {
++    "@idevconn/payment": {
++      "optional": true
++    }
++  },
+   "devDependencies": {
+     "@changesets/cli": "^3.0.3",
++    "@idevconn/payment": "^1.2.0",
+     "@types/node": "^22.10.0",
+     "@typescript-eslint/eslint-plugin": "^8.70.0",
+     "@typescript-eslint/parser": "^8.70.0",
+     "eslint": "^9.17.0",
+     "tsup": "^8.3.0",
+     "typescript": "^5.7.2",
+-    "vitest": "^3.0.0"
++    "vitest": "^4.1.12"
+   },
+   "publishConfig": {
+     "access": "public"
+--- .superpowers/snap-after-t3/tsup.config.ts	2026-10-22 12:44:55.582533331 +0300
++++ .superpowers/snap-after-t4/tsup.config.ts	2026-10-22 12:57:32.057357364 +0300
+@@ -4,9 +4,12 @@
+   entry: {
+     index: 'src/index.ts',
+     paypal: 'src/paypal/index.ts',
++    legacy: 'src/legacy/index.ts',
+     subscription: 'src/subscription-core/index.ts',
+   },
+   format: ['esm', 'cjs'],
++  // One shared chunk for core classes across entries (CJS `instanceof` identity).
++  splitting: true,
+   dts: true,
+   sourcemap: true,
+   clean: true,

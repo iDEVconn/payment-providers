@@ -1,0 +1,2688 @@
+diff --git a/README.md b/README.md
+index 0c9f63d..eb3797a 100644
+--- a/README.md
++++ b/README.md
+@@ -29,6 +29,7 @@ npm install @idevconn/payment-providers
+ |--------|---------|
+ | `@idevconn/payment-providers` | Contracts, lifecycle services, ports, webhook/recovery/reconciliation, runtime resolution, configuration types |
+ | `@idevconn/payment-providers/paypal` | PayPal provider composition, executors, OAuth, webhook verification, retry policies |
++| `@idevconn/payment-providers/subscription` | Pure subscription core: PayPal event normalisation and the subscription state reducer (no IO; see [Pure core](#pure-core)) |
+ 
+ ```ts
+ import {
+@@ -52,6 +53,69 @@ Types such as `PaymentProviderConfig` are exported for TypeScript; use `import t
+ 
+ ---
+ 
++## Pure core
++
++`@idevconn/payment-providers/subscription` holds the provider knowledge for subscriptions as pure functions:
++no IO, no clock, no randomness, no persistence. Time and ids come in as arguments. It works under ESM, CJS
++and TypeScript `moduleResolution: node10`, and it does not load the engine or the legacy checkout runtime.
++
++The contract:
++
++1. The host persists a `SubscriptionState` per subscription (`status`, `providerSubscriptionId`,
++   `providerPlanId`, `stateAt` watermark, `nextBillingTime`, `startTime`, `lastPayment`,
++   `failedPaymentsCount`, `lastEventId`). Start from `initialSubscriptionState()`.
++2. For each verified webhook it calls `normalizePaypalSubscriptionEvent(rawBody)`. This never throws: invalid
++   JSON, a wrong shape, an unsupported event type or a sale that is not tied to a subscription gives
++   `{ ok: false, reason }`. Amounts become integer minor units (decimal strings) with string arithmetic and
++   ISO 4217 exponents (JPY/KRW 0, BHD/KWD/JOD/OMR/TND 3, default 2).
++3. It calls `reduceSubscription(state, event, { source, expectedPlanId?, expectedPayment? })` and gets
++   `{ state, decision: 'applied' | 'noop', reason?, effects }`. It stores `state` (a noop returns the same
++   object) and treats `effects` as its own business hooks: `status_changed`, `payment_completed`,
++   `payment_failed`, `plan_mismatch`, `amount_mismatch`, `currency_mismatch`, `refund_or_reversal`,
++   `period_updated`. A provider `GET` subscription body goes through `normalizePaypalSubscriptionResource`
++   and `source: 'lookup'`.
++
++Rules (the engine uses the same functions):
++
++- `cancelled` and `expired` are terminal; `approved`, `active` and `suspended` never move back to
++  `approval_pending` (a late `CREATED`).
++- Webhooks: an older `stateAt` is a noop (`stale`), an equal `stateAt` with another status is a noop
++  (`equal_conflict`), and a missing `stateAt` after a watermark is a noop (`missing_timestamp`). A lookup
++  is authoritative over ordering but still bound by the terminal and regression rules.
++- An event `plan_id` that differs from `expectedPlanId` (default: the stored `providerPlanId`) is not applied
++  and reports `plan_mismatch`.
++- `PAYMENT.SALE.COMPLETED` in another currency than `expectedPayment`, below it, or with an amount that
++  cannot be read is not applied and reports `currency_mismatch` / `amount_mismatch`. A higher amount is
++  accepted. Payment events never change the status or the watermark.
++- `BILLING.SUBSCRIPTION.PAYMENT.FAILED` reports `payment_failed` and takes `failed_payments_count` from the
++  resource, or increments the stored counter.
++- The same `providerEventId` as `lastEventId` is a noop (`duplicate_event`); hosts should still dedupe on a
++  unique `(provider, account, environment, event id)` key.
++
++```ts
++import {
++  initialSubscriptionState,
++  normalizePaypalSubscriptionEvent,
++  reduceSubscription,
++} from '@idevconn/payment-providers/subscription';
++
++const normalized = normalizePaypalSubscriptionEvent(rawBody); // after signature verification
++if (normalized.ok) {
++  const stored = (await db.loadSubscription(normalized.event.providerSubscriptionId)) ?? initialSubscriptionState();
++  const result = reduceSubscription(stored, normalized.event, {
++    source: 'webhook',
++    expectedPayment: { amountMinor: '999', currency: 'USD' }, // from your plan catalogue
++  });
++  await db.saveSubscription(result.state); // compare-and-set on your row version
++  for (const effect of result.effects) await onSubscriptionEffect(effect); // your product rules
++}
++```
++
++Also exported: `deriveProviderEventId(rawBody)`, `isFreshTransmission(transmissionTime, now, maxSkewMs)`,
++`parseDecimalToMinorUnits`, `currencyMinorUnitExponent`, and the status mapping and ordering helpers.
++
++---
++
+ ## Architecture overview
+ 
+ ```text
+diff --git a/package.json b/package.json
+index dc89129..d8d00b4 100644
+--- a/package.json
++++ b/package.json
+@@ -38,6 +38,26 @@
+         "types": "./dist/paypal.d.cts",
+         "default": "./dist/paypal.cjs"
+       }
++    },
++    "./subscription": {
++      "import": {
++        "types": "./dist/subscription.d.ts",
++        "default": "./dist/subscription.js"
++      },
++      "require": {
++        "types": "./dist/subscription.d.cts",
++        "default": "./dist/subscription.cjs"
++      }
++    }
++  },
++  "typesVersions": {
++    "*": {
++      "paypal": [
++        "./dist/paypal.d.ts"
++      ],
++      "subscription": [
++        "./dist/subscription.d.ts"
++      ]
+     }
+   },
+   "files": [
+diff --git a/src/core/lib/__tests__/subscription-transition-policy.unit.test.ts b/src/core/lib/__tests__/subscription-transition-policy.unit.test.ts
+index 841990d..2477c17 100644
+--- a/src/core/lib/__tests__/subscription-transition-policy.unit.test.ts
++++ b/src/core/lib/__tests__/subscription-transition-policy.unit.test.ts
+@@ -28,6 +28,12 @@ describe('subscription-transition-policy', () => {
+     expect(() => assertSubscriptionTransitionAllowed('active', 'approval_pending')).toThrow();
+   });
+ 
++  it('blocks approved and suspended subscriptions from regressing to approval_pending', () => {
++    expect(() => assertSubscriptionTransitionAllowed('approved', 'approval_pending')).toThrow();
++    expect(() => assertSubscriptionTransitionAllowed('suspended', 'approval_pending')).toThrow();
++    expect(() => assertSubscriptionTransitionAllowed('unknown', 'approval_pending')).not.toThrow();
++  });
++
+   it('allows active and suspended to toggle', () => {
+     expect(() => assertSubscriptionTransitionAllowed('active', 'suspended')).not.toThrow();
+     expect(() => assertSubscriptionTransitionAllowed('suspended', 'active')).not.toThrow();
+diff --git a/src/core/lib/subscription-transition-policy.ts b/src/core/lib/subscription-transition-policy.ts
+index 269ca9c..347331d 100644
+--- a/src/core/lib/subscription-transition-policy.ts
++++ b/src/core/lib/subscription-transition-policy.ts
+@@ -4,8 +4,21 @@ import type {
+   ProductStatus,
+   SubscriptionStatus,
+ } from '../../contracts/index';
+-
+-const SUBSCRIPTION_TERMINAL: ReadonlySet<SubscriptionStatus> = new Set(['cancelled', 'expired']);
++import {
++  evaluateSubscriptionStateOrdering,
++  isSubscriptionStatusTransitionAllowed,
++  isTerminalSubscriptionStatus,
++  parseProviderTimestamp,
++} from '../../subscription-core/lib/subscription-status-rules';
++
++// Status mapping and transition rules live in the pure subscription core; re-exported unchanged.
++export {
++  isSubscriptionPaymentEvidenceEvent,
++  isSubscriptionWebhookProviderRefreshEvent,
++  mapPaypalSubscriptionStatus,
++  mapSubscriptionWebhookEventToStatus,
++  resolveSubscriptionStatusTransition,
++} from '../../subscription-core/lib/subscription-status-rules';
+ 
+ export const SUBSCRIPTION_PROVIDER_STATE_WATERMARK_PREFIX = 'subscription-provider-state-at:';
+ 
+@@ -25,15 +38,7 @@ export function parseSubscriptionResourceStateTimestamp(
+     const parsed = JSON.parse(rawPayload) as {
+       resource?: { update_time?: unknown; create_time?: unknown };
+     };
+-    const candidate = parsed.resource?.update_time ?? parsed.resource?.create_time;
+-    if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+-      return null;
+-    }
+-    const epochMs = Date.parse(candidate);
+-    if (Number.isNaN(epochMs)) {
+-      return null;
+-    }
+-    return new Date(epochMs).toISOString();
++    return parseProviderTimestamp(parsed.resource?.update_time ?? parsed.resource?.create_time);
+   } catch {
+     return null;
+   }
+@@ -72,24 +77,6 @@ export function resolveProviderTransactionIdAfterSubscriptionStateWatermarkPersi
+   return undefined;
+ }
+ 
+-function compareProviderStateTimestamps(
+-  stored: string | null,
+-  incoming: string,
+-): 'older' | 'newer' | 'equal' {
+-  if (!stored) {
+-    return 'newer';
+-  }
+-  const storedMs = Date.parse(stored);
+-  const incomingMs = Date.parse(incoming);
+-  if (incomingMs > storedMs) {
+-    return 'newer';
+-  }
+-  if (incomingMs < storedMs) {
+-    return 'older';
+-  }
+-  return 'equal';
+-}
+-
+ export type SubscriptionProviderStateOrderingDecision =
+   | { action: 'apply'; providerStateWatermark: string | null }
+   | { action: 'noop'; reason: 'stale' | 'equal_conflict' | 'missing_timestamp' };
+@@ -108,28 +95,17 @@ export function evaluateSubscriptionProviderStateOrdering(input: {
+     return { action: 'apply', providerStateWatermark: null };
+   }
+ 
+-  const storedWatermark = readSubscriptionProviderStateWatermark(input.operation);
+-  const incomingTimestamp = input.providerStateTimestamp;
+-  if (!incomingTimestamp) {
+-    if (storedWatermark) {
+-      return { action: 'noop', reason: 'missing_timestamp' };
+-    }
+-    return { action: 'apply', providerStateWatermark: null };
+-  }
+-
+-  const ordering = compareProviderStateTimestamps(storedWatermark, incomingTimestamp);
+-  if (ordering === 'older') {
+-    return { action: 'noop', reason: 'stale' };
++  const ordering = evaluateSubscriptionStateOrdering({
++    currentStatus: input.operation.subscriptionStatus,
++    storedStateAt: readSubscriptionProviderStateWatermark(input.operation),
++    desiredStatus: input.desiredStatus,
++    incomingStateAt: input.providerStateTimestamp,
++    authoritative: false,
++  });
++  if (ordering.action === 'noop') {
++    return ordering;
+   }
+-  if (ordering === 'equal') {
+-    const current = input.operation.subscriptionStatus ?? 'approval_pending';
+-    if (current !== input.desiredStatus) {
+-      return { action: 'noop', reason: 'equal_conflict' };
+-    }
+-    return { action: 'apply', providerStateWatermark: incomingTimestamp };
+-  }
+-
+-  return { action: 'apply', providerStateWatermark: incomingTimestamp };
++  return { action: 'apply', providerStateWatermark: ordering.stateAt };
+ }
+ 
+ export function mapPaypalProductStatus(): ProductStatus {
+@@ -149,49 +125,6 @@ export function mapPaypalPlanStatus(status: string): PlanStatus {
+   }
+ }
+ 
+-export function mapPaypalSubscriptionStatus(status: string): SubscriptionStatus {
+-  switch (status.toUpperCase()) {
+-    case 'APPROVAL_PENDING':
+-      return 'approval_pending';
+-    case 'APPROVED':
+-      return 'approved';
+-    case 'ACTIVE':
+-      return 'active';
+-    case 'SUSPENDED':
+-      return 'suspended';
+-    case 'CANCELLED':
+-      return 'cancelled';
+-    case 'EXPIRED':
+-      return 'expired';
+-    default:
+-      return 'unknown';
+-  }
+-}
+-
+-export function isSubscriptionWebhookProviderRefreshEvent(eventType: string): boolean {
+-  return eventType === 'BILLING.SUBSCRIPTION.UPDATED';
+-}
+-
+-export function mapSubscriptionWebhookEventToStatus(eventType: string): SubscriptionStatus | null {
+-  switch (eventType) {
+-    case 'BILLING.SUBSCRIPTION.CREATED':
+-      return 'approval_pending';
+-    case 'BILLING.SUBSCRIPTION.ACTIVATED':
+-    case 'BILLING.SUBSCRIPTION.RE-ACTIVATED':
+-      return 'active';
+-    case 'BILLING.SUBSCRIPTION.APPROVED':
+-      return 'approved';
+-    case 'BILLING.SUBSCRIPTION.SUSPENDED':
+-      return 'suspended';
+-    case 'BILLING.SUBSCRIPTION.CANCELLED':
+-      return 'cancelled';
+-    case 'BILLING.SUBSCRIPTION.EXPIRED':
+-      return 'expired';
+-    default:
+-      return null;
+-  }
+-}
+-
+ export function mapPlanWebhookEventToStatus(eventType: string): PlanStatus | null {
+   switch (eventType) {
+     case 'BILLING.PLAN.ACTIVATED':
+@@ -215,15 +148,6 @@ export function mapSubscriptionWebhookEventToOperationKind(
+   return null;
+ }
+ 
+-export function isSubscriptionPaymentEvidenceEvent(eventType: string): boolean {
+-  return (
+-    eventType === 'PAYMENT.SALE.COMPLETED' ||
+-    eventType === 'BILLING.SUBSCRIPTION.PAYMENT.FAILED' ||
+-    eventType === 'PAYMENT.SALE.REFUNDED' ||
+-    eventType === 'PAYMENT.SALE.REVERSED'
+-  );
+-}
+-
+ export function subscriptionStatusToOperationStatus(
+   status: SubscriptionStatus,
+ ): PaymentOperationStatus {
+@@ -256,29 +180,11 @@ export function assertSubscriptionTransitionAllowed(
+   current: SubscriptionStatus,
+   next: SubscriptionStatus,
+ ): void {
+-  if (current === next) {
++  if (isSubscriptionStatusTransitionAllowed(current, next)) {
+     return;
+   }
+-  if (SUBSCRIPTION_TERMINAL.has(current)) {
++  if (isTerminalSubscriptionStatus(current)) {
+     throw new Error(`Terminal subscription status "${current}" cannot transition to "${next}"`);
+   }
+-  if (current === 'active' && next === 'approval_pending') {
+-    throw new Error(`Subscription status "${current}" cannot regress to "${next}"`);
+-  }
+-}
+-
+-/** Rejected stale transitions keep the current subscription status. */
+-export function resolveSubscriptionStatusTransition(
+-  current: SubscriptionStatus,
+-  next: SubscriptionStatus,
+-): SubscriptionStatus {
+-  if (current === next) {
+-    return current;
+-  }
+-  try {
+-    assertSubscriptionTransitionAllowed(current, next);
+-    return next;
+-  } catch {
+-    return current;
+-  }
++  throw new Error(`Subscription status "${current}" cannot regress to "${next}"`);
+ }
+diff --git a/test/dist-package-surface.test.ts b/test/dist-package-surface.test.ts
+index a5d10ed..916d1dc 100644
+--- a/test/dist-package-surface.test.ts
++++ b/test/dist-package-surface.test.ts
+@@ -35,6 +35,18 @@ describe.skipIf(!distReady)('built package surface', () => {
+     expect(existsSync(join(root, 'dist/index.cjs'))).toBe(true);
+     expect(existsSync(join(root, 'dist/paypal.js'))).toBe(true);
+     expect(existsSync(join(root, 'dist/paypal.cjs'))).toBe(true);
++    expect(existsSync(join(root, 'dist/subscription.js'))).toBe(true);
++    expect(existsSync(join(root, 'dist/subscription.cjs'))).toBe(true);
++    expect(existsSync(join(root, 'dist/subscription.d.ts'))).toBe(true);
++    expect(existsSync(join(root, 'dist/subscription.d.cts'))).toBe(true);
++  });
++
++  it('loads the subscription subpath from dist (ESM and CJS)', async () => {
++    const esm = await import(pathToFileURL(join(root, 'dist/subscription.js')).href);
++    const require = createRequire(import.meta.url);
++    const cjs = require(join(root, 'dist/subscription.cjs'));
++    expect(esm.reduceSubscription).toBeDefined();
++    expect(cjs.reduceSubscription).toBeDefined();
+   });
+ });
+ 
+diff --git a/tsup.config.ts b/tsup.config.ts
+index 82bb44f..b2ac287 100644
+--- a/tsup.config.ts
++++ b/tsup.config.ts
+@@ -4,6 +4,7 @@ export default defineConfig({
+   entry: {
+     index: 'src/index.ts',
+     paypal: 'src/paypal/index.ts',
++    subscription: 'src/subscription-core/index.ts',
+   },
+   format: ['esm', 'cjs'],
+   dts: true,
+diff --git a/src/subscription-core/index.ts b/src/subscription-core/index.ts
+new file mode 100644
+index 0000000..4b517fa
+--- /dev/null
++++ b/src/subscription-core/index.ts
+@@ -0,0 +1,28 @@
++export * from './lib/subscription-core-types';
++export {
++  currencyMinorUnitExponent,
++  parseDecimalToMinorUnits,
++} from './lib/subscription-money';
++export {
++  compareProviderStateTimestamps,
++  evaluateSubscriptionStateOrdering,
++  isFreshTransmission,
++  isSubscriptionPaymentEvidenceEvent,
++  isSubscriptionStatusTransitionAllowed,
++  isSubscriptionWebhookProviderRefreshEvent,
++  isTerminalSubscriptionStatus,
++  mapPaypalSubscriptionStatus,
++  mapSubscriptionWebhookEventToStatus,
++  parseProviderTimestamp,
++  resolveSubscriptionStatusTransition,
++  SUBSCRIPTION_PAYMENT_FAILED_EVENT_TYPE,
++  SUBSCRIPTION_SALE_EVENT_TYPES,
++  type SubscriptionStateOrderingDecision,
++} from './lib/subscription-status-rules';
++export {
++  deriveProviderEventId,
++  normalizePaypalSubscriptionEvent,
++  normalizePaypalSubscriptionResource,
++} from './lib/normalize-paypal-subscription-event';
++export { initialSubscriptionState, reduceSubscription } from './lib/reduce-subscription';
++export type { SubscriptionStatus } from '../contracts/lib/subscription';
+diff --git a/src/subscription-core/lib/__tests__/normalize-paypal-subscription-event.unit.test.ts b/src/subscription-core/lib/__tests__/normalize-paypal-subscription-event.unit.test.ts
+new file mode 100644
+index 0000000..08d1cb1
+--- /dev/null
++++ b/src/subscription-core/lib/__tests__/normalize-paypal-subscription-event.unit.test.ts
+@@ -0,0 +1,296 @@
++import { describe, expect, it } from 'vitest';
++import {
++  deriveProviderEventId,
++  isFreshTransmission,
++  normalizePaypalSubscriptionEvent,
++} from '../normalize-paypal-subscription-event';
++
++const subscriptionBody = (overrides: Record<string, unknown> = {}, resource: Record<string, unknown> = {}) =>
++  JSON.stringify({
++    id: 'WH-1',
++    event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++    resource_type: 'subscription',
++    create_time: '2026-10-22T10:00:01Z',
++    ...overrides,
++    resource: {
++      id: 'I-SUB',
++      plan_id: 'P-1',
++      status: 'ACTIVE',
++      start_time: '2026-10-22T00:00:00Z',
++      create_time: '2026-10-22T09:00:00Z',
++      update_time: '2026-10-22T10:00:00Z',
++      billing_info: {
++        next_billing_time: '2026-11-22T10:00:00Z',
++        last_payment: { amount: { currency_code: 'USD', value: '9.99' }, time: '2026-10-22T10:00:00Z' },
++        failed_payments_count: 0,
++        outstanding_balance: { currency_code: 'USD', value: '0.00' },
++      },
++      ...resource,
++    },
++  });
++
++describe('normalizePaypalSubscriptionEvent', () => {
++  it('normalises a subscription event', () => {
++    const result = normalizePaypalSubscriptionEvent(subscriptionBody());
++    expect(result).toEqual({
++      ok: true,
++      event: {
++        providerEventId: 'WH-1',
++        eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
++        resourceType: 'subscription',
++        providerSubscriptionId: 'I-SUB',
++        providerPlanId: 'P-1',
++        providerStatus: 'ACTIVE',
++        subscriptionStatus: 'active',
++        stateAt: '2026-10-22T10:00:00.000Z',
++        nextBillingTime: '2026-11-22T10:00:00.000Z',
++        startTime: '2026-10-22T00:00:00.000Z',
++        lastPayment: { amountMinor: '999', currency: 'USD', time: '2026-10-22T10:00:00.000Z' },
++        failedPaymentsCount: 0,
++        outstandingBalance: { amountMinor: '0', currency: 'USD' },
++        payment: null,
++        eventTime: '2026-10-22T10:00:01.000Z',
++      },
++    });
++  });
++
++  it('falls back to resource create_time for stateAt and leaves absent fields null', () => {
++    const result = normalizePaypalSubscriptionEvent(
++      JSON.stringify({
++        id: 'WH-2',
++        event_type: 'BILLING.SUBSCRIPTION.CREATED',
++        resource: { id: 'I-SUB', create_time: '2026-10-22T09:00:00Z' },
++      }),
++    );
++    expect(result.ok).toBe(true);
++    if (!result.ok) return;
++    expect(result.event).toMatchObject({
++      resourceType: 'subscription',
++      stateAt: '2026-10-22T09:00:00.000Z',
++      subscriptionStatus: 'approval_pending',
++      providerPlanId: null,
++      providerStatus: null,
++      nextBillingTime: null,
++      startTime: null,
++      lastPayment: null,
++      failedPaymentsCount: null,
++      outstandingBalance: null,
++      eventTime: null,
++    });
++  });
++
++  it('uses the resource status for UPDATED events', () => {
++    const result = normalizePaypalSubscriptionEvent(
++      subscriptionBody({ event_type: 'BILLING.SUBSCRIPTION.UPDATED' }, { status: 'SUSPENDED' }),
++    );
++    expect(result.ok && result.event.subscriptionStatus).toBe('suspended');
++  });
++
++  it('never derives a subscription status from PAYMENT.FAILED', () => {
++    const result = normalizePaypalSubscriptionEvent(
++      subscriptionBody(
++        { event_type: 'BILLING.SUBSCRIPTION.PAYMENT.FAILED' },
++        { billing_info: { failed_payments_count: 2, outstanding_balance: { currency_code: 'USD', value: '9.99' } } },
++      ),
++    );
++    expect(result.ok).toBe(true);
++    if (!result.ok) return;
++    expect(result.event.subscriptionStatus).toBeNull();
++    expect(result.event.failedPaymentsCount).toBe(2);
++    expect(result.event.outstandingBalance).toEqual({ amountMinor: '999', currency: 'USD' });
++  });
++
++  it('normalises a PAYMENT.SALE.COMPLETED to the billing agreement', () => {
++    const result = normalizePaypalSubscriptionEvent(
++      JSON.stringify({
++        id: 'WH-S',
++        event_type: 'PAYMENT.SALE.COMPLETED',
++        resource_type: 'sale',
++        create_time: '2026-10-22T10:00:05Z',
++        resource: {
++          id: 'SALE-1',
++          billing_agreement_id: 'I-SUB',
++          state: 'completed',
++          amount: { total: '10.00', currency: 'USD' },
++          create_time: '2026-10-22T10:00:00Z',
++        },
++      }),
++    );
++    expect(result.ok).toBe(true);
++    if (!result.ok) return;
++    expect(result.event).toMatchObject({
++      providerEventId: 'WH-S',
++      resourceType: 'sale',
++      providerSubscriptionId: 'I-SUB',
++      subscriptionStatus: null,
++      providerPlanId: null,
++      payment: { amountMinor: '1000', currency: 'USD', saleId: 'SALE-1' },
++      stateAt: '2026-10-22T10:00:00.000Z',
++    });
++  });
++
++  it('keeps the currency but nulls a sale amount that cannot be represented (0.01 JPY)', () => {
++    const result = normalizePaypalSubscriptionEvent(
++      JSON.stringify({
++        id: 'WH-S',
++        event_type: 'PAYMENT.SALE.COMPLETED',
++        resource: { id: 'SALE-1', billing_agreement_id: 'I-SUB', amount: { total: '0.01', currency: 'JPY' } },
++      }),
++    );
++    expect(result.ok && result.event.payment).toEqual({
++      amountMinor: null,
++      currency: 'JPY',
++      saleId: 'SALE-1',
++    });
++  });
++
++  it('uses sale_id for refunds', () => {
++    const result = normalizePaypalSubscriptionEvent(
++      JSON.stringify({
++        id: 'WH-R',
++        event_type: 'PAYMENT.SALE.REFUNDED',
++        resource: {
++          id: 'REF-1',
++          sale_id: 'SALE-1',
++          billing_agreement_id: 'I-SUB',
++          amount: { total: '10.00', currency: 'USD' },
++        },
++      }),
++    );
++    expect(result.ok && result.event.payment).toEqual({
++      amountMinor: '1000',
++      currency: 'USD',
++      saleId: 'SALE-1',
++    });
++  });
++
++  it.each<[string, string, string]>([
++    ['invalid JSON', '{not json', 'invalid_json'],
++    ['empty body', '', 'invalid_json'],
++    ['JSON array', '[]', 'not_an_object'],
++    ['JSON null', 'null', 'not_an_object'],
++    ['JSON string', '"x"', 'not_an_object'],
++    ['missing id', JSON.stringify({ event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', resource: { id: 'I' } }), 'missing_event_id'],
++    ['numeric id', JSON.stringify({ id: 123, event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', resource: { id: 'I' } }), 'missing_event_id'],
++    ['id with spaces', JSON.stringify({ id: 'WH 1', event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', resource: { id: 'I' } }), 'missing_event_id'],
++    ['missing event_type', JSON.stringify({ id: 'WH-1', resource: { id: 'I' } }), 'missing_event_type'],
++    ['plan event', JSON.stringify({ id: 'WH-1', event_type: 'BILLING.PLAN.ACTIVATED', resource: { id: 'P' } }), 'unsupported_event_type'],
++    ['checkout event', JSON.stringify({ id: 'WH-1', event_type: 'CHECKOUT.ORDER.APPROVED', resource: { id: 'O' } }), 'unsupported_event_type'],
++    ['unknown subscription event', JSON.stringify({ id: 'WH-1', event_type: 'BILLING.SUBSCRIPTION.SOMETHING', resource: { id: 'I' } }), 'unsupported_event_type'],
++    ['missing resource', JSON.stringify({ id: 'WH-1', event_type: 'BILLING.SUBSCRIPTION.ACTIVATED' }), 'missing_resource'],
++    ['resource is an array', JSON.stringify({ id: 'WH-1', event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', resource: [] }), 'missing_resource'],
++    ['numeric subscription id', JSON.stringify({ id: 'WH-1', event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', resource: { id: 42 } }), 'missing_subscription_id'],
++    ['sale without billing agreement', JSON.stringify({ id: 'WH-1', event_type: 'PAYMENT.SALE.COMPLETED', resource: { id: 'SALE-1', amount: { total: '1.00', currency: 'USD' } } }), 'missing_subscription_id'],
++    ['oversized id', JSON.stringify({ id: 'W'.repeat(300), event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', resource: { id: 'I' } }), 'missing_event_id'],
++  ])('rejects %s', (_name, raw, reason) => {
++    expect(normalizePaypalSubscriptionEvent(raw)).toEqual({ ok: false, reason });
++  });
++
++  it('never throws on hostile input', () => {
++    const deep = '['.repeat(200_000) + ']'.repeat(200_000);
++    const huge = subscriptionBody({ padding: 'x'.repeat(5_000_000) });
++    const inputs: unknown[] = [
++      undefined,
++      null,
++      42,
++      {},
++      deep,
++      huge,
++      '{"__proto__":{"id":"WH-1"},"event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"I"}}',
++      '{"id":"WH-1","event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"I","billing_info":"x"}}',
++      '{"id":"WH-1","event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"I","update_time":12}}',
++    ];
++    for (const input of inputs) {
++      expect(() => normalizePaypalSubscriptionEvent(input as string)).not.toThrow();
++    }
++    expect(normalizePaypalSubscriptionEvent(undefined as unknown as string)).toEqual({
++      ok: false,
++      reason: 'invalid_json',
++    });
++    expect(normalizePaypalSubscriptionEvent(huge).ok).toBe(true);
++    expect(
++      normalizePaypalSubscriptionEvent(
++        '{"__proto__":{"id":"WH-1"},"event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"I"}}',
++      ),
++    ).toEqual({ ok: false, reason: 'missing_event_id' });
++  });
++
++  it('decodes unicode escapes before validating ids', () => {
++    const escaped = '{"id":"WH\\u002d1","event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"I\\u002dSUB"}}';
++    const result = normalizePaypalSubscriptionEvent(escaped);
++    expect(result.ok && result.event.providerEventId).toBe('WH-1');
++    expect(result.ok && result.event.providerSubscriptionId).toBe('I-SUB');
++    const control = '{"id":"WH\\u0000","event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"I"}}';
++    expect(normalizePaypalSubscriptionEvent(control)).toEqual({ ok: false, reason: 'missing_event_id' });
++    const rtl = '{"id":"WH-1","event_type":"BILLING.SUBSCRIPTION.ACTIVATED","resource":{"id":"I\\u202eX"}}';
++    expect(normalizePaypalSubscriptionEvent(rtl)).toEqual({ ok: false, reason: 'missing_subscription_id' });
++  });
++
++  it('ignores invalid optional fields instead of failing the event', () => {
++    const result = normalizePaypalSubscriptionEvent(
++      subscriptionBody(
++        { create_time: 'yesterday' },
++        {
++          update_time: 'not-a-date',
++          create_time: '1',
++          plan_id: 7,
++          status: 'WEIRD',
++          billing_info: {
++            next_billing_time: 5,
++            last_payment: { amount: { currency_code: 'USD', value: 9.99 } },
++            failed_payments_count: -1,
++          },
++        },
++      ),
++    );
++    expect(result.ok).toBe(true);
++    if (!result.ok) return;
++    expect(result.event).toMatchObject({
++      stateAt: null,
++      eventTime: null,
++      providerPlanId: null,
++      providerStatus: 'WEIRD',
++      subscriptionStatus: 'active',
++      nextBillingTime: null,
++      lastPayment: null,
++      failedPaymentsCount: null,
++    });
++  });
++});
++
++describe('deriveProviderEventId', () => {
++  it('returns the body id or null', () => {
++    expect(deriveProviderEventId(subscriptionBody())).toBe('WH-1');
++    expect(deriveProviderEventId('{"id":5}')).toBeNull();
++    expect(deriveProviderEventId('nope')).toBeNull();
++    expect(deriveProviderEventId(undefined as unknown as string)).toBeNull();
++  });
++});
++
++describe('isFreshTransmission', () => {
++  const now = Date.parse('2026-10-22T10:00:00Z');
++  const fifteenMinutes = 15 * 60 * 1000;
++
++  it.each<[string | null | undefined, boolean]>([
++    ['2026-10-22T10:00:00Z', true],
++    ['2026-10-22T09:45:00Z', true],
++    ['2026-10-22T09:44:59Z', false],
++    ['2026-10-22T10:15:00Z', true],
++    ['2026-10-22T10:15:01Z', false],
++    ['2026-10-22T09:50:00.123+00:00', true],
++    ['garbage', false],
++    ['1', false],
++    ['', false],
++    [null, false],
++    [undefined, false],
++  ])('%j -> %s', (transmissionTime, expected) => {
++    expect(isFreshTransmission(transmissionTime, now, fifteenMinutes)).toBe(expected);
++  });
++
++  it('accepts a Date for now and rejects an invalid skew', () => {
++    expect(isFreshTransmission('2026-10-22T10:00:00Z', new Date(now), fifteenMinutes)).toBe(true);
++    expect(isFreshTransmission('2026-10-22T10:00:00Z', now, -1)).toBe(false);
++    expect(isFreshTransmission('2026-10-22T10:00:00Z', now, Number.NaN)).toBe(false);
++    expect(isFreshTransmission('2026-10-22T10:00:00Z', Number.NaN, fifteenMinutes)).toBe(false);
++  });
++});
+diff --git a/src/subscription-core/lib/__tests__/reduce-subscription.vectors.unit.test.ts b/src/subscription-core/lib/__tests__/reduce-subscription.vectors.unit.test.ts
+new file mode 100644
+index 0000000..1a9e7f1
+--- /dev/null
++++ b/src/subscription-core/lib/__tests__/reduce-subscription.vectors.unit.test.ts
+@@ -0,0 +1,629 @@
++import { describe, expect, it } from 'vitest';
++import {
++  initialSubscriptionState,
++  reduceSubscription,
++  type ReduceSubscriptionOptions,
++  type ReduceSubscriptionResult,
++  type SubscriptionState,
++} from '../reduce-subscription';
++import {
++  normalizePaypalSubscriptionEvent,
++  normalizePaypalSubscriptionResource,
++} from '../normalize-paypal-subscription-event';
++import type { NormalizedSubscriptionEvent } from '../subscription-core-types';
++
++/*
++ * Table-driven vectors. Each vector starts from a stored state, feeds a
++ * sequence of raw PayPal bodies through normalise -> reduce exactly as a host
++ * would, and checks the final state and every step's decision. Scenarios come
++ * from issue #2 (event ordering), issue #4 (billing data, money and plan
++ * checks) and the plan's review focus (missing and equal timestamps, money
++ * shapes, hostile bodies).
++ */
++
++let seq = 0;
++type RawResource = Record<string, unknown>;
++
++function webhook(eventType: string, resource: RawResource, extra: Record<string, unknown> = {}): string {
++  seq += 1;
++  return JSON.stringify({ id: `WH-${seq}`, event_type: eventType, ...extra, resource });
++}
++
++function sub(eventSuffix: string, ts?: string, resource: RawResource = {}): string {
++  return webhook(`BILLING.SUBSCRIPTION.${eventSuffix}`, {
++    id: 'I-SUB',
++    ...(ts ? { update_time: ts, create_time: ts } : {}),
++    ...resource,
++  });
++}
++
++function sale(
++  eventSuffix: 'COMPLETED' | 'REFUNDED' | 'REVERSED',
++  total: unknown,
++  currency: unknown,
++  extra: RawResource = {},
++): string {
++  return webhook(`PAYMENT.SALE.${eventSuffix}`, {
++    id: `SALE-${seq + 1}`,
++    billing_agreement_id: 'I-SUB',
++    amount: { total, currency },
++    create_time: '2026-10-22T10:00:00Z',
++    ...extra,
++  });
++}
++
++function lookup(status: string, ts?: string, resource: RawResource = {}): string {
++  return JSON.stringify({
++    id: 'I-SUB',
++    status,
++    plan_id: 'P-1',
++    ...(ts ? { update_time: ts } : {}),
++    ...resource,
++  });
++}
++
++type Step = {
++  raw: string;
++  source?: 'webhook' | 'lookup';
++  options?: Omit<ReduceSubscriptionOptions, 'source'>;
++  decision: 'applied' | 'noop';
++  reason?: string;
++  effects?: string[];
++};
++
++type Vector = {
++  name: string;
++  start?: Partial<SubscriptionState>;
++  steps: Step[];
++  expectState: Partial<SubscriptionState>;
++};
++
++const T0 = '2026-10-22T10:00:00Z';
++const T1 = '2026-10-22T11:00:00Z';
++const T2 = '2026-10-22T12:00:00Z';
++const T3 = '2026-10-22T13:00:00Z';
++const iso = (t: string) => new Date(Date.parse(t)).toISOString();
++const PRICE = { amountMinor: '999', currency: 'USD' };
++
++function normalize(step: Step): NormalizedSubscriptionEvent {
++  const result =
++    step.source === 'lookup'
++      ? normalizePaypalSubscriptionResource(step.raw)
++      : normalizePaypalSubscriptionEvent(step.raw);
++  if (!result.ok) {
++    throw new Error(`vector body did not normalise: ${result.reason}`);
++  }
++  return result.event;
++}
++
++const vectors: Vector[] = [
++  // ---- Issue #2: ordering --------------------------------------------------
++  {
++    name: '#2a no timestamps: late CREATED after ACTIVATED stays active',
++    steps: [
++      { raw: sub('ACTIVATED'), decision: 'applied', effects: ['status_changed'] },
++      { raw: sub('CREATED'), decision: 'noop', reason: 'transition_rejected' },
++    ],
++    expectState: { status: 'active', stateAt: null },
++  },
++  {
++    name: '#2a with update_time: late CREATED (older) after ACTIVATED stays active',
++    steps: [
++      { raw: sub('ACTIVATED', T1), decision: 'applied', effects: ['status_changed'] },
++      { raw: sub('CREATED', T0), decision: 'noop', reason: 'stale' },
++    ],
++    expectState: { status: 'active', stateAt: iso(T1) },
++  },
++  {
++    name: '#2a late CREATED with a NEWER timestamp still never regresses to approval_pending',
++    steps: [
++      { raw: sub('ACTIVATED', T0), decision: 'applied' },
++      { raw: sub('CREATED', T1), decision: 'noop', reason: 'transition_rejected' },
++    ],
++    expectState: { status: 'active', stateAt: iso(T0) },
++  },
++  {
++    name: '#2b no timestamps: CANCELLED, late SUSPENDED, then ACTIVATED stays cancelled',
++    steps: [
++      { raw: sub('ACTIVATED'), decision: 'applied' },
++      { raw: sub('CANCELLED'), decision: 'applied', effects: ['status_changed'] },
++      { raw: sub('SUSPENDED'), decision: 'noop', reason: 'transition_rejected' },
++      { raw: sub('ACTIVATED'), decision: 'noop', reason: 'transition_rejected' },
++    ],
++    expectState: { status: 'cancelled' },
++  },
++  {
++    name: '#2b with update_time: late SUSPENDED is stale, newer ACTIVATED cannot revive',
++    steps: [
++      { raw: sub('ACTIVATED', T0), decision: 'applied' },
++      { raw: sub('CANCELLED', T2), decision: 'applied' },
++      { raw: sub('SUSPENDED', T1), decision: 'noop', reason: 'stale' },
++      { raw: sub('ACTIVATED', T3), decision: 'noop', reason: 'transition_rejected' },
++    ],
++    expectState: { status: 'cancelled', stateAt: iso(T2) },
++  },
++  {
++    name: '#2b expired is terminal too',
++    start: { status: 'expired' },
++    steps: [{ raw: sub('RE-ACTIVATED'), decision: 'noop', reason: 'transition_rejected' }],
++    expectState: { status: 'expired' },
++  },
++  {
++    name: '#2c lookup ACTIVE wins over a stale CREATED, late CREATED afterwards is ignored',
++    steps: [
++      { raw: lookup('ACTIVE', T1), source: 'lookup', decision: 'applied', effects: ['status_changed'] },
++      { raw: sub('CREATED', T0), decision: 'noop', reason: 'stale' },
++    ],
++    expectState: { status: 'active', stateAt: iso(T1), providerPlanId: 'P-1' },
++  },
++  {
++    name: '#2c lookup older than the watermark still wins (provider is authoritative)',
++    start: { status: 'suspended', stateAt: iso(T2) },
++    steps: [{ raw: lookup('ACTIVE', T1), source: 'lookup', decision: 'applied', effects: ['status_changed'] }],
++    expectState: { status: 'active', stateAt: iso(T2) },
++  },
++  {
++    name: '#2c lookup cannot revive a cancelled subscription',
++    start: { status: 'cancelled' },
++    steps: [{ raw: lookup('ACTIVE', T1), source: 'lookup', decision: 'noop', reason: 'transition_rejected' }],
++    expectState: { status: 'cancelled' },
++  },
++  {
++    name: 'lookup with an unknown provider status changes nothing about the status',
++    start: { status: 'active' },
++    steps: [{ raw: lookup('SOMETHING_NEW', T1), source: 'lookup', decision: 'applied', effects: [] }],
++    expectState: { status: 'active' },
++  },
++  {
++    name: 'late CREATED never moves suspended back to approval_pending',
++    start: { status: 'suspended' },
++    steps: [{ raw: sub('CREATED'), decision: 'noop', reason: 'transition_rejected' }],
++    expectState: { status: 'suspended' },
++  },
++  {
++    name: 'APPROVED then ACTIVATED moves forward',
++    steps: [
++      { raw: sub('APPROVED', T0), decision: 'applied' },
++      { raw: sub('ACTIVATED', T1), decision: 'applied' },
++    ],
++    expectState: { status: 'active' },
++  },
++  {
++    name: 'suspend and re-activate toggle',
++    steps: [
++      { raw: sub('ACTIVATED', T0), decision: 'applied' },
++      { raw: sub('SUSPENDED', T1), decision: 'applied', effects: ['status_changed'] },
++      { raw: sub('RE-ACTIVATED', T2), decision: 'applied', effects: ['status_changed'] },
++    ],
++    expectState: { status: 'active', stateAt: iso(T2) },
++  },
++
++  // ---- Review focus 2: equal and missing timestamps -------------------------
++  {
++    name: 'equal stateAt with a conflicting status is a noop',
++    steps: [
++      { raw: sub('ACTIVATED', T1), decision: 'applied' },
++      { raw: sub('SUSPENDED', T1), decision: 'noop', reason: 'equal_conflict' },
++    ],
++    expectState: { status: 'active', stateAt: iso(T1) },
++  },
++  {
++    name: 'equal stateAt with the same status applies (redelivery of the same state)',
++    steps: [
++      { raw: sub('ACTIVATED', T1), decision: 'applied' },
++      { raw: sub('ACTIVATED', T1), decision: 'applied', effects: [] },
++    ],
++    expectState: { status: 'active', stateAt: iso(T1) },
++  },
++  {
++    name: 'missing timestamp after a watermark is a noop',
++    steps: [
++      { raw: sub('ACTIVATED', T1), decision: 'applied' },
++      { raw: sub('SUSPENDED'), decision: 'noop', reason: 'missing_timestamp' },
++    ],
++    expectState: { status: 'active', stateAt: iso(T1) },
++  },
++  {
++    name: 'missing timestamp without a watermark applies',
++    steps: [{ raw: sub('SUSPENDED'), decision: 'applied' }],
++    expectState: { status: 'suspended', stateAt: null },
++  },
++  {
++    name: 'invalid stored watermark is treated as absent',
++    start: { status: 'active', stateAt: 'not-a-date' },
++    steps: [{ raw: sub('SUSPENDED', T1), decision: 'applied' }],
++    expectState: { status: 'suspended', stateAt: iso(T1) },
++  },
++  {
++    name: 'duplicate delivery of the last event id is a noop',
++    steps: [
++      {
++        raw: JSON.stringify({
++          id: 'WH-DUP',
++          event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++          resource: { id: 'I-SUB' },
++        }),
++        decision: 'applied',
++      },
++      {
++        raw: JSON.stringify({
++          id: 'WH-DUP',
++          event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++          resource: { id: 'I-SUB' },
++        }),
++        decision: 'noop',
++        reason: 'duplicate_event',
++      },
++    ],
++    expectState: { status: 'active', lastEventId: 'WH-DUP' },
++  },
++
++  // ---- Issue #4: billing data and plan checks ------------------------------
++  {
++    name: '#4 UPDATED stores billing fields and reports period_updated',
++    start: { status: 'active', providerPlanId: 'P-1' },
++    steps: [
++      {
++        raw: sub('UPDATED', T1, {
++          status: 'ACTIVE',
++          plan_id: 'P-1',
++          start_time: '2026-10-22T00:00:00Z',
++          billing_info: {
++            next_billing_time: '2026-11-22T10:00:00Z',
++            last_payment: { amount: { currency_code: 'USD', value: '9.99' }, time: T0 },
++            failed_payments_count: 0,
++          },
++        }),
++        decision: 'applied',
++        effects: ['period_updated'],
++      },
++    ],
++    expectState: {
++      status: 'active',
++      nextBillingTime: '2026-11-22T10:00:00.000Z',
++      startTime: '2026-10-22T00:00:00.000Z',
++      lastPayment: { amountMinor: '999', currency: 'USD', time: iso(T0) },
++      failedPaymentsCount: 0,
++    },
++  },
++  {
++    name: '#4 ACTIVATED with another plan_id than the stored one does not apply',
++    start: { status: 'approval_pending', providerPlanId: 'P-1' },
++    steps: [
++      {
++        raw: sub('ACTIVATED', T1, { plan_id: 'P-OTHER' }),
++        decision: 'noop',
++        reason: 'plan_mismatch',
++        effects: ['plan_mismatch'],
++      },
++    ],
++    expectState: { status: 'approval_pending', providerPlanId: 'P-1', stateAt: null },
++  },
++  {
++    name: '#4 expectedPlanId overrides the stored plan (host-side plan change)',
++    start: { status: 'active', providerPlanId: 'P-1' },
++    steps: [
++      {
++        raw: sub('UPDATED', T1, { status: 'ACTIVE', plan_id: 'P-2' }),
++        options: { expectedPlanId: 'P-2' },
++        decision: 'applied',
++      },
++    ],
++    expectState: { status: 'active', providerPlanId: 'P-2' },
++  },
++  {
++    name: '#4 expectedPlanId rejects an event plan even when nothing is stored',
++    steps: [
++      {
++        raw: sub('ACTIVATED', T1, { plan_id: 'P-OTHER' }),
++        options: { expectedPlanId: 'P-1' },
++        decision: 'noop',
++        reason: 'plan_mismatch',
++        effects: ['plan_mismatch'],
++      },
++    ],
++    expectState: { status: 'approval_pending', providerPlanId: null },
++  },
++  {
++    name: '#4 PAYMENT.SALE.COMPLETED 0.01 JPY against a USD price is a currency mismatch',
++    start: { status: 'active' },
++    steps: [
++      {
++        raw: sale('COMPLETED', '0.01', 'JPY'),
++        options: { expectedPayment: PRICE },
++        decision: 'noop',
++        reason: 'currency_mismatch',
++        effects: ['currency_mismatch'],
++      },
++    ],
++    expectState: { status: 'active', lastPayment: null },
++  },
++  {
++    name: '#4 PAYMENT.SALE.COMPLETED 0.01 JPY against a JPY price is an amount mismatch',
++    start: { status: 'active' },
++    steps: [
++      {
++        raw: sale('COMPLETED', '0.01', 'JPY'),
++        options: { expectedPayment: { amountMinor: '1000', currency: 'JPY' } },
++        decision: 'noop',
++        reason: 'amount_mismatch',
++        effects: ['amount_mismatch'],
++      },
++    ],
++    expectState: { status: 'active', lastPayment: null },
++  },
++  {
++    name: '#4 lower amount is an amount mismatch and does not change status',
++    start: { status: 'suspended' },
++    steps: [
++      {
++        raw: sale('COMPLETED', '9.98', 'USD'),
++        options: { expectedPayment: PRICE },
++        decision: 'noop',
++        reason: 'amount_mismatch',
++        effects: ['amount_mismatch'],
++      },
++    ],
++    expectState: { status: 'suspended', lastPayment: null },
++  },
++  {
++    name: 'money: "10" and "10.00" are the same amount',
++    start: { status: 'active' },
++    steps: [
++      {
++        raw: sale('COMPLETED', '10', 'USD'),
++        options: { expectedPayment: { amountMinor: '1000', currency: 'USD' } },
++        decision: 'applied',
++        effects: ['payment_completed'],
++      },
++      {
++        raw: sale('COMPLETED', '10.00', 'usd'),
++        options: { expectedPayment: { amountMinor: '1000', currency: 'usd' } },
++        decision: 'applied',
++        effects: ['payment_completed'],
++      },
++    ],
++    expectState: { lastPayment: { amountMinor: '1000', currency: 'USD', time: iso(T0) } },
++  },
++  {
++    name: 'money: JPY has no minor digits',
++    start: { status: 'active' },
++    steps: [
++      {
++        raw: sale('COMPLETED', '1000', 'JPY'),
++        options: { expectedPayment: { amountMinor: '1000', currency: 'JPY' } },
++        decision: 'applied',
++        effects: ['payment_completed'],
++      },
++    ],
++    expectState: { lastPayment: { amountMinor: '1000', currency: 'JPY', time: iso(T0) } },
++  },
++  {
++    name: 'money: a higher amount (tax, setup fee) is accepted',
++    start: { status: 'active' },
++    steps: [
++      {
++        raw: sale('COMPLETED', '10.99', 'USD'),
++        options: { expectedPayment: PRICE },
++        decision: 'applied',
++        effects: ['payment_completed'],
++      },
++    ],
++    expectState: { lastPayment: { amountMinor: '1099', currency: 'USD', time: iso(T0) } },
++  },
++  {
++    name: 'money: a numeric amount is never trusted when a price is expected',
++    start: { status: 'active' },
++    steps: [
++      {
++        raw: sale('COMPLETED', 9.99, 'USD'),
++        options: { expectedPayment: PRICE },
++        decision: 'noop',
++        reason: 'amount_mismatch',
++        effects: ['amount_mismatch'],
++      },
++    ],
++    expectState: { lastPayment: null },
++  },
++  {
++    name: 'money: a malformed expected price fails closed',
++    start: { status: 'active' },
++    steps: [
++      {
++        raw: sale('COMPLETED', '9.99', 'USD'),
++        options: { expectedPayment: { amountMinor: '9.99', currency: 'USD' } },
++        decision: 'noop',
++        reason: 'amount_mismatch',
++        effects: ['amount_mismatch'],
++      },
++    ],
++    expectState: { lastPayment: null },
++  },
++  {
++    name: 'sale without an expected price records the payment',
++    start: { status: 'active' },
++    steps: [{ raw: sale('COMPLETED', '9.99', 'USD'), decision: 'applied', effects: ['payment_completed'] }],
++    expectState: { status: 'active', lastPayment: { amountMinor: '999', currency: 'USD', time: iso(T0) } },
++  },
++  {
++    name: 'an older sale does not move lastPayment back',
++    start: {
++      status: 'active',
++      lastPayment: { amountMinor: '999', currency: 'USD', time: iso(T2) },
++    },
++    steps: [{ raw: sale('COMPLETED', '9.99', 'USD'), decision: 'applied', effects: ['payment_completed'] }],
++    expectState: { lastPayment: { amountMinor: '999', currency: 'USD', time: iso(T2) } },
++  },
++  {
++    name: '#4 PAYMENT.FAILED takes the counter from the resource',
++    start: { status: 'active', failedPaymentsCount: 0 },
++    steps: [
++      {
++        raw: sub('PAYMENT.FAILED', T1, {
++          status: 'ACTIVE',
++          billing_info: {
++            failed_payments_count: 2,
++            outstanding_balance: { currency_code: 'USD', value: '9.99' },
++          },
++        }),
++        decision: 'applied',
++        effects: ['payment_failed'],
++      },
++    ],
++    expectState: { status: 'active', failedPaymentsCount: 2, stateAt: null },
++  },
++  {
++    name: '#4 PAYMENT.FAILED without a counter increments the stored one',
++    start: { status: 'active', failedPaymentsCount: 1 },
++    steps: [
++      { raw: sub('PAYMENT.FAILED'), decision: 'applied', effects: ['payment_failed'] },
++      { raw: sub('PAYMENT.FAILED'), decision: 'applied', effects: ['payment_failed'] },
++    ],
++    expectState: { status: 'active', failedPaymentsCount: 3 },
++  },
++  {
++    name: 'refund and reversal are reported and change no status',
++    start: { status: 'active' },
++    steps: [
++      { raw: sale('REFUNDED', '9.99', 'USD', { sale_id: 'SALE-X' }), decision: 'applied', effects: ['refund_or_reversal'] },
++      { raw: sale('REVERSED', '9.99', 'USD'), decision: 'applied', effects: ['refund_or_reversal'] },
++    ],
++    expectState: { status: 'active' },
++  },
++];
++
++describe('reduceSubscription vectors', () => {
++  it.each(vectors.map((v) => [v.name, v] as const))('%s', (_name, vector) => {
++    let state = initialSubscriptionState(vector.start);
++    vector.steps.forEach((step, index) => {
++      const event = normalize(step);
++      const before = structuredClone(state);
++      const frozen = Object.freeze(structuredClone(state));
++      const result: ReduceSubscriptionResult = reduceSubscription(frozen, event, {
++        source: step.source ?? 'webhook',
++        ...step.options,
++      });
++      const label = `step ${index + 1} (${event.eventType})`;
++      expect(state, `${label} mutated its input`).toEqual(before);
++      expect(result.decision, label).toBe(step.decision);
++      expect(result.reason, label).toBe(step.reason);
++      if (step.effects) {
++        expect(result.effects.map((e) => e.type), label).toEqual(step.effects);
++      }
++      if (result.decision === 'noop') {
++        expect(result.state, `${label} noop must return the input state`).toEqual(before);
++      }
++      // Deterministic: the same input gives the same output.
++      expect(reduceSubscription(frozen, event, { source: step.source ?? 'webhook', ...step.options })).toEqual(
++        result,
++      );
++      state = result.state;
++    });
++    expect(state).toMatchObject(vector.expectState);
++  });
++});
++
++describe('reduceSubscription effects payloads', () => {
++  const reduceRaw = (
++    state: SubscriptionState,
++    raw: string,
++    options: ReduceSubscriptionOptions = { source: 'webhook' },
++  ) => {
++    const result = normalizePaypalSubscriptionEvent(raw);
++    if (!result.ok) throw new Error(result.reason);
++    return reduceSubscription(state, result.event, options);
++  };
++
++  it('status_changed carries from and to', () => {
++    const result = reduceRaw(initialSubscriptionState(), sub('ACTIVATED', T0));
++    expect(result.effects).toEqual([{ type: 'status_changed', from: 'approval_pending', to: 'active' }]);
++    expect(result.state.lastEventId).toMatch(/^WH-/);
++  });
++
++  it('mismatch effects carry expected and actual values', () => {
++    const state = initialSubscriptionState({ status: 'active', providerPlanId: 'P-1' });
++    expect(reduceRaw(state, sub('ACTIVATED', T0, { plan_id: 'P-9' })).effects).toEqual([
++      { type: 'plan_mismatch', expectedPlanId: 'P-1', actualPlanId: 'P-9' },
++    ]);
++    const currency = reduceRaw(state, sale('COMPLETED', '9.99', 'EUR'), {
++      source: 'webhook',
++      expectedPayment: PRICE,
++    });
++    expect(currency.effects).toEqual([
++      {
++        type: 'currency_mismatch',
++        expectedCurrency: 'USD',
++        actualCurrency: 'EUR',
++        saleId: expect.stringMatching(/^SALE-/),
++      },
++    ]);
++    const amount = reduceRaw(state, sale('COMPLETED', '1.00', 'USD'), {
++      source: 'webhook',
++      expectedPayment: PRICE,
++    });
++    expect(amount.effects).toEqual([
++      {
++        type: 'amount_mismatch',
++        expected: { amountMinor: '999', currency: 'USD' },
++        actual: { amountMinor: '100', currency: 'USD' },
++        saleId: expect.stringMatching(/^SALE-/),
++      },
++    ]);
++  });
++
++  it('payment_completed, payment_failed, refund_or_reversal and period_updated payloads', () => {
++    const state = initialSubscriptionState({ status: 'active' });
++    expect(reduceRaw(state, sale('COMPLETED', '9.99', 'USD')).effects[0]).toEqual({
++      type: 'payment_completed',
++      amountMinor: '999',
++      currency: 'USD',
++      saleId: expect.stringMatching(/^SALE-/),
++      time: iso(T0),
++    });
++    expect(
++      reduceRaw(
++        state,
++        sub('PAYMENT.FAILED', undefined, {
++          billing_info: { outstanding_balance: { currency_code: 'USD', value: '9.99' } },
++        }),
++      ).effects[0],
++    ).toEqual({
++      type: 'payment_failed',
++      failedPaymentsCount: 1,
++      outstandingBalance: { amountMinor: '999', currency: 'USD' },
++    });
++    expect(reduceRaw(state, sale('REVERSED', '9.99', 'USD')).effects[0]).toEqual({
++      type: 'refund_or_reversal',
++      eventType: 'PAYMENT.SALE.REVERSED',
++      amountMinor: '999',
++      currency: 'USD',
++      saleId: expect.stringMatching(/^SALE-/),
++    });
++    expect(
++      reduceRaw(state, sub('UPDATED', T1, { billing_info: { next_billing_time: T3 } })).effects,
++    ).toEqual([{ type: 'period_updated', nextBillingTime: iso(T3), startTime: null }]);
++  });
++
++  it('an event for a different subscription is a noop when the state knows its id', () => {
++    const state = initialSubscriptionState({ status: 'active', providerSubscriptionId: 'I-OTHER' });
++    const result = reduceRaw(state, sub('CANCELLED', T0));
++    expect(result).toMatchObject({ decision: 'noop', reason: 'subscription_mismatch', effects: [] });
++    expect(result.state).toBe(state);
++  });
++});
++
++describe('initialSubscriptionState', () => {
++  it('starts at approval_pending with empty fields', () => {
++    expect(initialSubscriptionState()).toEqual({
++      status: 'approval_pending',
++      providerSubscriptionId: null,
++      providerPlanId: null,
++      stateAt: null,
++      nextBillingTime: null,
++      startTime: null,
++      lastPayment: null,
++      failedPaymentsCount: null,
++      lastEventId: null,
++    });
++  });
++});
+diff --git a/src/subscription-core/lib/__tests__/subscription-money.unit.test.ts b/src/subscription-core/lib/__tests__/subscription-money.unit.test.ts
+new file mode 100644
+index 0000000..22d3b7b
+--- /dev/null
++++ b/src/subscription-core/lib/__tests__/subscription-money.unit.test.ts
+@@ -0,0 +1,66 @@
++import { describe, expect, it } from 'vitest';
++import {
++  currencyMinorUnitExponent,
++  parseDecimalToMinorUnits,
++} from '../subscription-money';
++
++describe('currencyMinorUnitExponent', () => {
++  it.each([
++    ['USD', 2],
++    ['eur', 2],
++    ['JPY', 0],
++    ['KRW', 0],
++    ['VND', 0],
++    ['BHD', 3],
++    ['KWD', 3],
++    ['JOD', 3],
++    ['OMR', 3],
++    ['TND', 3],
++    ['XYZ', 2],
++  ])('%s -> %i', (currency, exponent) => {
++    expect(currencyMinorUnitExponent(currency)).toBe(exponent);
++  });
++});
++
++describe('parseDecimalToMinorUnits', () => {
++  it.each([
++    ['10.00', 'USD', '1000'],
++    ['10', 'USD', '1000'],
++    ['10.5', 'USD', '1050'],
++    ['0.01', 'USD', '1'],
++    ['0', 'USD', '0'],
++    ['000123.40', 'USD', '12340'],
++    ['1000', 'JPY', '1000'],
++    ['1000.00', 'JPY', '1000'],
++    ['1.234', 'KWD', '1234'],
++    ['1.2', 'BHD', '1200'],
++    ['10.000', 'USD', '1000'],
++    // A value well past Number.MAX_SAFE_INTEGER stays exact (no floating point).
++    ['123456789012345678.99', 'USD', '12345678901234567899'],
++  ])('%s %s -> %s', (value, currency, expected) => {
++    expect(parseDecimalToMinorUnits(value, currency)).toBe(expected);
++  });
++
++  it.each([
++    ['0.01', 'JPY'],
++    ['10.001', 'USD'],
++    ['-1.00', 'USD'],
++    ['1e3', 'USD'],
++    ['1,000.00', 'USD'],
++    ['', 'USD'],
++    [' 1.00', 'USD'],
++    ['.5', 'USD'],
++    ['5.', 'USD'],
++    ['10.00', 'US'],
++    ['10.00', 'US1'],
++    ['1'.repeat(40), 'USD'],
++  ])('rejects %j %j', (value, currency) => {
++    expect(parseDecimalToMinorUnits(value, currency)).toBeNull();
++  });
++
++  it('rejects non-string input instead of converting through a float', () => {
++    expect(parseDecimalToMinorUnits(10.1 as unknown as string, 'USD')).toBeNull();
++    expect(parseDecimalToMinorUnits(null as unknown as string, 'USD')).toBeNull();
++    expect(parseDecimalToMinorUnits('1.00', 5 as unknown as string)).toBeNull();
++  });
++});
+diff --git a/src/subscription-core/lib/normalize-paypal-subscription-event.ts b/src/subscription-core/lib/normalize-paypal-subscription-event.ts
+new file mode 100644
+index 0000000..0436125
+--- /dev/null
++++ b/src/subscription-core/lib/normalize-paypal-subscription-event.ts
+@@ -0,0 +1,274 @@
++import type { SubscriptionStatus } from '../../contracts/lib/subscription';
++import {
++  SUBSCRIPTION_LOOKUP_EVENT_TYPE,
++  type NormalizeSubscriptionEventResult,
++  type NormalizedSubscriptionEvent,
++  type SubscriptionLastPayment,
++  type SubscriptionMoney,
++  type SubscriptionSalePayment,
++} from './subscription-core-types';
++import { normalizeCurrencyCode, parseDecimalToMinorUnits } from './subscription-money';
++import {
++  SUBSCRIPTION_PAYMENT_FAILED_EVENT_TYPE,
++  SUBSCRIPTION_SALE_EVENT_TYPES,
++  mapPaypalSubscriptionStatus,
++  mapSubscriptionWebhookEventToStatus,
++  parseProviderTimestamp,
++} from './subscription-status-rules';
++
++export { isFreshTransmission } from './subscription-status-rules';
++
++type JsonObject = Record<string, unknown>;
++
++/** PayPal ids are printable ASCII without spaces (`WH-…`, `I-…`, `P-…`). */
++const PROVIDER_ID_PATTERN = /^[\x21-\x7e]{1,128}$/;
++const MAX_STATUS_LENGTH = 64;
++
++const SUBSCRIPTION_EVENT_TYPES: ReadonlySet<string> = new Set([
++  'BILLING.SUBSCRIPTION.CREATED',
++  'BILLING.SUBSCRIPTION.APPROVED',
++  'BILLING.SUBSCRIPTION.ACTIVATED',
++  'BILLING.SUBSCRIPTION.RE-ACTIVATED',
++  'BILLING.SUBSCRIPTION.UPDATED',
++  'BILLING.SUBSCRIPTION.SUSPENDED',
++  'BILLING.SUBSCRIPTION.CANCELLED',
++  'BILLING.SUBSCRIPTION.EXPIRED',
++  SUBSCRIPTION_PAYMENT_FAILED_EVENT_TYPE,
++]);
++
++const SALE_EVENT_TYPES: ReadonlySet<string> = new Set(SUBSCRIPTION_SALE_EVENT_TYPES);
++
++function isObject(value: unknown): value is JsonObject {
++  return typeof value === 'object' && value !== null && !Array.isArray(value);
++}
++
++/** Own property only, so `__proto__` / inherited keys never leak in. */
++function own(source: unknown, key: string): unknown {
++  if (!isObject(source) || !Object.prototype.hasOwnProperty.call(source, key)) {
++    return undefined;
++  }
++  return source[key];
++}
++
++function readId(value: unknown): string | null {
++  return typeof value === 'string' && PROVIDER_ID_PATTERN.test(value) ? value : null;
++}
++
++function readCount(value: unknown): number | null {
++  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
++}
++
++/** `{ currency_code, value }` (v2 shape) or `{ currency, total }` (v1 sale shape). */
++function readMoneyParts(value: unknown): { amountMinor: string | null; currency: string | null } | null {
++  if (!isObject(value)) {
++    return null;
++  }
++  const currency = normalizeCurrencyCode(own(value, 'currency_code') ?? own(value, 'currency'));
++  const amount = own(value, 'value') ?? own(value, 'total');
++  const amountMinor =
++    currency !== null && typeof amount === 'string' ? parseDecimalToMinorUnits(amount, currency) : null;
++  return { amountMinor, currency };
++}
++
++function readMoney(value: unknown): SubscriptionMoney | null {
++  const parts = readMoneyParts(value);
++  if (!parts || parts.amountMinor === null || parts.currency === null) {
++    return null;
++  }
++  return { amountMinor: parts.amountMinor, currency: parts.currency };
++}
++
++function readLastPayment(value: unknown): SubscriptionLastPayment | null {
++  const money = readMoney(own(value, 'amount'));
++  if (!money) {
++    return null;
++  }
++  return { ...money, time: parseProviderTimestamp(own(value, 'time')) };
++}
++
++function readStateAt(resource: JsonObject): string | null {
++  // `update_time ?? create_time`, as the engine's watermark has always read it.
++  const candidate = own(resource, 'update_time') ?? own(resource, 'create_time');
++  return parseProviderTimestamp(candidate);
++}
++
++function readProviderStatus(resource: JsonObject): string | null {
++  const status = own(resource, 'status');
++  return typeof status === 'string' && status.length > 0 && status.length <= MAX_STATUS_LENGTH
++    ? status
++    : null;
++}
++
++function statusFromResource(providerStatus: string | null): SubscriptionStatus | null {
++  if (!providerStatus) {
++    return null;
++  }
++  const mapped = mapPaypalSubscriptionStatus(providerStatus);
++  return mapped === 'unknown' ? null : mapped;
++}
++
++function parseJsonObject(rawBody: unknown): JsonObject | 'invalid_json' | 'not_an_object' {
++  if (typeof rawBody !== 'string' || rawBody.length === 0) {
++    return 'invalid_json';
++  }
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(rawBody);
++  } catch {
++    return 'invalid_json';
++  }
++  return isObject(parsed) ? parsed : 'not_an_object';
++}
++
++function subscriptionResourceFields(resource: JsonObject) {
++  const billingInfo = own(resource, 'billing_info');
++  return {
++    providerPlanId: readId(own(resource, 'plan_id')),
++    providerStatus: readProviderStatus(resource),
++    stateAt: readStateAt(resource),
++    nextBillingTime: parseProviderTimestamp(own(billingInfo, 'next_billing_time')),
++    startTime: parseProviderTimestamp(own(resource, 'start_time')),
++    lastPayment: readLastPayment(own(billingInfo, 'last_payment')),
++    failedPaymentsCount: readCount(own(billingInfo, 'failed_payments_count')),
++    outstandingBalance: readMoney(own(billingInfo, 'outstanding_balance')),
++  };
++}
++
++function normalizeOrThrow(rawBody: string): NormalizeSubscriptionEventResult {
++  const body = parseJsonObject(rawBody);
++  if (typeof body === 'string') {
++    return { ok: false, reason: body };
++  }
++
++  const providerEventId = readId(own(body, 'id'));
++  if (!providerEventId) {
++    return { ok: false, reason: 'missing_event_id' };
++  }
++  const eventType = own(body, 'event_type');
++  if (typeof eventType !== 'string' || eventType.length === 0) {
++    return { ok: false, reason: 'missing_event_type' };
++  }
++  const isSale = SALE_EVENT_TYPES.has(eventType);
++  if (!isSale && !SUBSCRIPTION_EVENT_TYPES.has(eventType)) {
++    return { ok: false, reason: 'unsupported_event_type' };
++  }
++  const resource = own(body, 'resource');
++  if (!isObject(resource)) {
++    return { ok: false, reason: 'missing_resource' };
++  }
++  const eventTime = parseProviderTimestamp(own(body, 'create_time'));
++
++  if (isSale) {
++    const providerSubscriptionId = readId(own(resource, 'billing_agreement_id'));
++    if (!providerSubscriptionId) {
++      return { ok: false, reason: 'missing_subscription_id' };
++    }
++    const money = readMoneyParts(own(resource, 'amount'));
++    const payment: SubscriptionSalePayment = {
++      amountMinor: money?.amountMinor ?? null,
++      currency: money?.currency ?? null,
++      saleId:
++        eventType === 'PAYMENT.SALE.COMPLETED'
++          ? readId(own(resource, 'id'))
++          : (readId(own(resource, 'sale_id')) ?? readId(own(resource, 'id'))),
++    };
++    return {
++      ok: true,
++      event: {
++        providerEventId,
++        eventType,
++        resourceType: 'sale',
++        providerSubscriptionId,
++        providerPlanId: null,
++        providerStatus: null,
++        subscriptionStatus: null,
++        stateAt: readStateAt(resource),
++        nextBillingTime: null,
++        startTime: null,
++        lastPayment: null,
++        failedPaymentsCount: null,
++        outstandingBalance: null,
++        payment,
++        eventTime,
++      },
++    };
++  }
++
++  const providerSubscriptionId = readId(own(resource, 'id'));
++  if (!providerSubscriptionId) {
++    return { ok: false, reason: 'missing_subscription_id' };
++  }
++  const fields = subscriptionResourceFields(resource);
++  const subscriptionStatus =
++    eventType === SUBSCRIPTION_PAYMENT_FAILED_EVENT_TYPE
++      ? null
++      : (mapSubscriptionWebhookEventToStatus(eventType) ?? statusFromResource(fields.providerStatus));
++  return {
++    ok: true,
++    event: {
++      providerEventId,
++      eventType,
++      resourceType: 'subscription',
++      providerSubscriptionId,
++      ...fields,
++      subscriptionStatus,
++      payment: null,
++      eventTime,
++    },
++  };
++}
++
++/**
++ * Normalise a PayPal subscription or subscription-sale webhook body. Never
++ * throws: invalid JSON, a wrong shape or an event that is not about a
++ * subscription gives `ok: false`. Invalid optional fields become null.
++ */
++export function normalizePaypalSubscriptionEvent(rawBody: string): NormalizeSubscriptionEventResult {
++  try {
++    return normalizeOrThrow(rawBody);
++  } catch {
++    return { ok: false, reason: 'invalid_json' };
++  }
++}
++
++/**
++ * Normalise a PayPal `GET /v1/billing/subscriptions/{id}` response body into
++ * the same event shape (`eventType` = `SUBSCRIPTION_LOOKUP_EVENT_TYPE`,
++ * `providerEventId` = null), for `reduceSubscription(..., { source: 'lookup' })`.
++ */
++export function normalizePaypalSubscriptionResource(rawBody: string): NormalizeSubscriptionEventResult {
++  try {
++    const resource = parseJsonObject(rawBody);
++    if (typeof resource === 'string') {
++      return { ok: false, reason: resource };
++    }
++    const providerSubscriptionId = readId(own(resource, 'id'));
++    if (!providerSubscriptionId) {
++      return { ok: false, reason: 'missing_subscription_id' };
++    }
++    const fields = subscriptionResourceFields(resource);
++    const event: NormalizedSubscriptionEvent = {
++      providerEventId: null,
++      eventType: SUBSCRIPTION_LOOKUP_EVENT_TYPE,
++      resourceType: 'subscription',
++      providerSubscriptionId,
++      ...fields,
++      subscriptionStatus: statusFromResource(fields.providerStatus),
++      payment: null,
++      eventTime: null,
++    };
++    return { ok: true, event };
++  } catch {
++    return { ok: false, reason: 'invalid_json' };
++  }
++}
++
++/** The webhook body `id`, or null when absent or not a valid provider id. Never throws. */
++export function deriveProviderEventId(rawBody: string): string | null {
++  try {
++    const body = parseJsonObject(rawBody);
++    return typeof body === 'string' ? null : readId(own(body, 'id'));
++  } catch {
++    return null;
++  }
++}
+diff --git a/src/subscription-core/lib/reduce-subscription.ts b/src/subscription-core/lib/reduce-subscription.ts
+new file mode 100644
+index 0000000..162a0ed
+--- /dev/null
++++ b/src/subscription-core/lib/reduce-subscription.ts
+@@ -0,0 +1,249 @@
++import {
++  type NormalizedSubscriptionEvent,
++  type ReduceSubscriptionNoopReason,
++  type ReduceSubscriptionOptions,
++  type ReduceSubscriptionResult,
++  type SubscriptionEffect,
++  type SubscriptionMoney,
++  type SubscriptionState,
++} from './subscription-core-types';
++import { compareMinorUnits, isMinorUnitString, normalizeCurrencyCode } from './subscription-money';
++import {
++  SUBSCRIPTION_PAYMENT_FAILED_EVENT_TYPE,
++  compareProviderStateTimestamps,
++  evaluateSubscriptionStateOrdering,
++  resolveSubscriptionStatusTransition,
++} from './subscription-status-rules';
++
++export type {
++  ReduceSubscriptionOptions,
++  ReduceSubscriptionResult,
++  SubscriptionState,
++} from './subscription-core-types';
++
++export function initialSubscriptionState(overrides: Partial<SubscriptionState> = {}): SubscriptionState {
++  return {
++    status: 'approval_pending',
++    providerSubscriptionId: null,
++    providerPlanId: null,
++    stateAt: null,
++    nextBillingTime: null,
++    startTime: null,
++    lastPayment: null,
++    failedPaymentsCount: null,
++    lastEventId: null,
++    ...overrides,
++  };
++}
++
++function noop(
++  state: SubscriptionState,
++  reason: ReduceSubscriptionNoopReason,
++  effects: SubscriptionEffect[] = [],
++): ReduceSubscriptionResult {
++  return { state, decision: 'noop', reason, effects };
++}
++
++function applied(state: SubscriptionState, effects: SubscriptionEffect[]): ReduceSubscriptionResult {
++  return { state, decision: 'applied', effects };
++}
++
++/** True when `candidate` is not older than `current` (null times never win over a known time). */
++function isNotOlder(candidate: string | null, current: string | null): boolean {
++  if (!current) {
++    return true;
++  }
++  if (!candidate) {
++    return false;
++  }
++  return compareProviderStateTimestamps(current, candidate) !== 'older';
++}
++
++function reduceSale(
++  state: SubscriptionState,
++  event: NormalizedSubscriptionEvent,
++  options: ReduceSubscriptionOptions,
++): ReduceSubscriptionResult {
++  const payment = event.payment ?? { amountMinor: null, currency: null, saleId: null };
++  const withEventId = { ...state, lastEventId: event.providerEventId ?? state.lastEventId };
++
++  if (event.eventType !== 'PAYMENT.SALE.COMPLETED') {
++    return applied(withEventId, [
++      {
++        type: 'refund_or_reversal',
++        eventType: event.eventType,
++        amountMinor: payment.amountMinor,
++        currency: payment.currency,
++        saleId: payment.saleId,
++      },
++    ]);
++  }
++
++  const expected = options.expectedPayment ?? null;
++  const expectedCurrency = expected ? normalizeCurrencyCode(expected.currency) : null;
++  if (expectedCurrency && payment.currency !== expectedCurrency) {
++    return noop(state, 'currency_mismatch', [
++      {
++        type: 'currency_mismatch',
++        expectedCurrency,
++        actualCurrency: payment.currency,
++        saleId: payment.saleId,
++      },
++    ]);
++  }
++  // A malformed expected price fails closed, as does an amount that cannot be represented.
++  if (
++    payment.amountMinor === null ||
++    payment.currency === null ||
++    (expected !== null &&
++      (!expectedCurrency ||
++        !isMinorUnitString(expected.amountMinor) ||
++        compareMinorUnits(payment.amountMinor, expected.amountMinor) < 0))
++  ) {
++    const expectedMoney: SubscriptionMoney | null = expected
++      ? { amountMinor: expected.amountMinor, currency: expectedCurrency ?? expected.currency }
++      : null;
++    return noop(state, 'amount_mismatch', [
++      {
++        type: 'amount_mismatch',
++        expected: expectedMoney,
++        actual: { amountMinor: payment.amountMinor, currency: payment.currency },
++        saleId: payment.saleId,
++      },
++    ]);
++  }
++
++  const time = event.stateAt ?? event.eventTime;
++  const lastPayment = isNotOlder(time, state.lastPayment?.time ?? null)
++    ? { amountMinor: payment.amountMinor, currency: payment.currency, time }
++    : state.lastPayment;
++  return applied({ ...withEventId, lastPayment }, [
++    {
++      type: 'payment_completed',
++      amountMinor: payment.amountMinor,
++      currency: payment.currency,
++      saleId: payment.saleId,
++      time,
++    },
++  ]);
++}
++
++function reducePaymentFailed(
++  state: SubscriptionState,
++  event: NormalizedSubscriptionEvent,
++): ReduceSubscriptionResult {
++  const failedPaymentsCount = event.failedPaymentsCount ?? (state.failedPaymentsCount ?? 0) + 1;
++  return applied(
++    {
++      ...state,
++      failedPaymentsCount,
++      lastEventId: event.providerEventId ?? state.lastEventId,
++    },
++    [{ type: 'payment_failed', failedPaymentsCount, outstandingBalance: event.outstandingBalance }],
++  );
++}
++
++function reduceSubscriptionResource(
++  state: SubscriptionState,
++  event: NormalizedSubscriptionEvent,
++  options: ReduceSubscriptionOptions,
++): ReduceSubscriptionResult {
++  const desired =
++    event.subscriptionStatus && event.subscriptionStatus !== 'unknown'
++      ? event.subscriptionStatus
++      : state.status;
++  const resolved = resolveSubscriptionStatusTransition(state.status, desired);
++  const isLookup = options.source === 'lookup';
++
++  const ordering = evaluateSubscriptionStateOrdering({
++    currentStatus: state.status,
++    storedStateAt: state.stateAt,
++    desiredStatus: resolved,
++    incomingStateAt: event.stateAt,
++    authoritative: isLookup,
++  });
++  if (ordering.action === 'noop') {
++    return noop(state, ordering.reason);
++  }
++  if (resolved !== desired) {
++    return noop(state, 'transition_rejected');
++  }
++
++  // A lookup never moves the watermark back; a webhook moves it to its own time.
++  const stateAt = isLookup
++    ? event.stateAt && isNotOlder(event.stateAt, state.stateAt)
++      ? event.stateAt
++      : state.stateAt
++    : (ordering.stateAt ?? state.stateAt);
++
++  const nextBillingTime = event.nextBillingTime ?? state.nextBillingTime;
++  const startTime = event.startTime ?? state.startTime;
++  const lastPayment =
++    event.lastPayment && isNotOlder(event.lastPayment.time, state.lastPayment?.time ?? null)
++      ? event.lastPayment
++      : state.lastPayment;
++
++  const next: SubscriptionState = {
++    ...state,
++    status: resolved,
++    providerPlanId: event.providerPlanId ?? state.providerPlanId,
++    stateAt,
++    nextBillingTime,
++    startTime,
++    lastPayment,
++    failedPaymentsCount: event.failedPaymentsCount ?? state.failedPaymentsCount,
++    lastEventId: event.providerEventId ?? state.lastEventId,
++  };
++
++  const effects: SubscriptionEffect[] = [];
++  if (resolved !== state.status) {
++    effects.push({ type: 'status_changed', from: state.status, to: resolved });
++  }
++  if (nextBillingTime !== state.nextBillingTime || startTime !== state.startTime) {
++    effects.push({ type: 'period_updated', nextBillingTime, startTime });
++  }
++  return applied(next, effects);
++}
++
++/**
++ * Pure subscription reducer: given the stored state and one normalised event,
++ * return the next state, whether the event applied, and plain-data effects the
++ * host maps to its own business hooks. Never mutates `state`; a noop returns
++ * the same `state` object.
++ *
++ * Rules: terminal `cancelled|expired` never move; nothing past approval moves
++ * back to `approval_pending`; for webhooks an older `stateAt` is a noop, an
++ * equal `stateAt` with a conflicting status is a noop, and a missing `stateAt`
++ * after a watermark is a noop; a `lookup` is authoritative over ordering. An
++ * event plan id that differs from `expectedPlanId` (default: the stored plan)
++ * is reported and not applied. A completed sale in another currency or below
++ * `expectedPayment` is reported and not applied. Payment events never change
++ * the status or the watermark.
++ */
++export function reduceSubscription(
++  state: SubscriptionState,
++  event: NormalizedSubscriptionEvent,
++  options: ReduceSubscriptionOptions,
++): ReduceSubscriptionResult {
++  if (event.providerEventId !== null && event.providerEventId === state.lastEventId) {
++    return noop(state, 'duplicate_event');
++  }
++  if (state.providerSubscriptionId && event.providerSubscriptionId !== state.providerSubscriptionId) {
++    return noop(state, 'subscription_mismatch');
++  }
++
++  const expectedPlanId = options.expectedPlanId ?? state.providerPlanId;
++  if (expectedPlanId && event.providerPlanId && event.providerPlanId !== expectedPlanId) {
++    return noop(state, 'plan_mismatch', [
++      { type: 'plan_mismatch', expectedPlanId, actualPlanId: event.providerPlanId },
++    ]);
++  }
++
++  if (event.resourceType === 'sale') {
++    return reduceSale(state, event, options);
++  }
++  if (event.eventType === SUBSCRIPTION_PAYMENT_FAILED_EVENT_TYPE) {
++    return reducePaymentFailed(state, event);
++  }
++  return reduceSubscriptionResource(state, event, options);
++}
+diff --git a/src/subscription-core/lib/subscription-core-types.ts b/src/subscription-core/lib/subscription-core-types.ts
+new file mode 100644
+index 0000000..b24b745
+--- /dev/null
++++ b/src/subscription-core/lib/subscription-core-types.ts
+@@ -0,0 +1,146 @@
++import type { CanonicalMoney } from '../../contracts/lib/money';
++import type { SubscriptionStatus } from '../../contracts/lib/subscription';
++
++/** Money in integer minor units as a decimal string, same shape as `CanonicalMoney`. */
++export type SubscriptionMoney = CanonicalMoney;
++
++export type SubscriptionLastPayment = {
++  amountMinor: string;
++  currency: string;
++  /** ISO timestamp of the payment, null when the provider did not send one. */
++  time: string | null;
++};
++
++/** Sale data of a `PAYMENT.SALE.*` event. `amountMinor` is null when the amount cannot be represented. */
++export type SubscriptionSalePayment = {
++  amountMinor: string | null;
++  currency: string | null;
++  saleId: string | null;
++};
++
++export type SubscriptionEventResourceType = 'subscription' | 'sale';
++
++/** Event type the core uses for a provider lookup (GET subscription), never sent by PayPal. */
++export const SUBSCRIPTION_LOOKUP_EVENT_TYPE = 'paypal.subscription.lookup';
++
++export type NormalizedSubscriptionEvent = {
++  /** Webhook body `id`; null for a provider lookup snapshot. */
++  providerEventId: string | null;
++  eventType: string;
++  resourceType: SubscriptionEventResourceType;
++  /** Subscription events: `resource.id`; sale events: `resource.billing_agreement_id`. */
++  providerSubscriptionId: string;
++  providerPlanId: string | null;
++  /** Raw `resource.status` (subscription resources only). */
++  providerStatus: string | null;
++  /** Status this event implies (event type first, then `resource.status`); null when it implies none. */
++  subscriptionStatus: SubscriptionStatus | null;
++  /** ISO `resource.update_time ?? resource.create_time`; null when absent or invalid. */
++  stateAt: string | null;
++  nextBillingTime: string | null;
++  startTime: string | null;
++  lastPayment: SubscriptionLastPayment | null;
++  failedPaymentsCount: number | null;
++  outstandingBalance: SubscriptionMoney | null;
++  /** Present for `PAYMENT.SALE.*` events only. */
++  payment: SubscriptionSalePayment | null;
++  /** ISO body `create_time`. */
++  eventTime: string | null;
++};
++
++export type NormalizeSubscriptionEventFailureReason =
++  | 'invalid_json'
++  | 'not_an_object'
++  | 'missing_event_id'
++  | 'missing_event_type'
++  | 'unsupported_event_type'
++  | 'missing_resource'
++  | 'missing_subscription_id';
++
++export type NormalizeSubscriptionEventResult =
++  | { ok: true; event: NormalizedSubscriptionEvent }
++  | { ok: false; reason: NormalizeSubscriptionEventFailureReason };
++
++/** The subscription fields a host persists and feeds back into `reduceSubscription`. */
++export type SubscriptionState = {
++  status: SubscriptionStatus;
++  /** When set, events for another subscription id are ignored. */
++  providerSubscriptionId: string | null;
++  providerPlanId: string | null;
++  /** Provider state watermark (ISO). Only status-bearing webhook events advance it. */
++  stateAt: string | null;
++  nextBillingTime: string | null;
++  startTime: string | null;
++  lastPayment: SubscriptionLastPayment | null;
++  failedPaymentsCount: number | null;
++  lastEventId: string | null;
++};
++
++export type ReduceSubscriptionOptions = {
++  /** Expected plan; defaults to the stored `providerPlanId`. */
++  expectedPlanId?: string | null;
++  /** Expected price of one billing cycle; a sale below it or in another currency is reported, not applied. */
++  expectedPayment?: SubscriptionMoney | null;
++  /** `lookup` is a provider GET: authoritative over event ordering, still bound by the transition rules. */
++  source: 'webhook' | 'lookup';
++};
++
++export type SubscriptionEffect =
++  | { type: 'status_changed'; from: SubscriptionStatus; to: SubscriptionStatus }
++  | {
++      type: 'payment_completed';
++      amountMinor: string;
++      currency: string;
++      saleId: string | null;
++      time: string | null;
++    }
++  | {
++      type: 'payment_failed';
++      failedPaymentsCount: number;
++      outstandingBalance: SubscriptionMoney | null;
++    }
++  | { type: 'plan_mismatch'; expectedPlanId: string; actualPlanId: string }
++  | {
++      type: 'amount_mismatch';
++      /** Null when no price was expected but the sale amount could not be read. */
++      expected: SubscriptionMoney | null;
++      actual: { amountMinor: string | null; currency: string | null };
++      saleId: string | null;
++    }
++  | {
++      type: 'currency_mismatch';
++      expectedCurrency: string;
++      actualCurrency: string | null;
++      saleId: string | null;
++    }
++  | {
++      type: 'refund_or_reversal';
++      eventType: string;
++      amountMinor: string | null;
++      currency: string | null;
++      saleId: string | null;
++    }
++  | { type: 'period_updated'; nextBillingTime: string | null; startTime: string | null };
++
++export type SubscriptionEffectType = SubscriptionEffect['type'];
++
++export type ReduceSubscriptionNoopReason =
++  | 'duplicate_event'
++  | 'subscription_mismatch'
++  | 'plan_mismatch'
++  | 'amount_mismatch'
++  | 'currency_mismatch'
++  | 'stale'
++  | 'equal_conflict'
++  | 'missing_timestamp'
++  | 'transition_rejected'
++  | 'unsupported_event_type';
++
++export type ReduceSubscriptionResult =
++  | { state: SubscriptionState; decision: 'applied'; reason?: undefined; effects: SubscriptionEffect[] }
++  | {
++      state: SubscriptionState;
++      decision: 'noop';
++      reason: ReduceSubscriptionNoopReason;
++      effects: SubscriptionEffect[];
++    };
+diff --git a/src/subscription-core/lib/subscription-money.ts b/src/subscription-core/lib/subscription-money.ts
+new file mode 100644
+index 0000000..e4ab26c
+--- /dev/null
++++ b/src/subscription-core/lib/subscription-money.ts
+@@ -0,0 +1,89 @@
++/*
++ * ISO 4217 minor-unit exponents that differ from the default of 2. PayPal
++ * sends amounts as decimal strings; they are converted to integer minor units
++ * with string arithmetic only, never through a float.
++ */
++const CURRENCY_EXPONENTS: Readonly<Record<string, number>> = {
++  BIF: 0,
++  CLP: 0,
++  DJF: 0,
++  GNF: 0,
++  ISK: 0,
++  JPY: 0,
++  KMF: 0,
++  KRW: 0,
++  PYG: 0,
++  RWF: 0,
++  UGX: 0,
++  UYI: 0,
++  VND: 0,
++  VUV: 0,
++  XAF: 0,
++  XOF: 0,
++  XPF: 0,
++  BHD: 3,
++  IQD: 3,
++  JOD: 3,
++  KWD: 3,
++  LYD: 3,
++  OMR: 3,
++  TND: 3,
++};
++
++const DEFAULT_EXPONENT = 2;
++const MAX_DECIMAL_LENGTH = 32;
++const DECIMAL_PATTERN = /^(\d+)(?:\.(\d+))?$/;
++
++/** Uppercase 3-letter currency code, or null. */
++export function normalizeCurrencyCode(currency: unknown): string | null {
++  if (typeof currency !== 'string' || !/^[A-Za-z]{3}$/.test(currency)) {
++    return null;
++  }
++  return currency.toUpperCase();
++}
++
++export function currencyMinorUnitExponent(currency: string): number {
++  const code = normalizeCurrencyCode(currency);
++  if (!code || !Object.prototype.hasOwnProperty.call(CURRENCY_EXPONENTS, code)) {
++    return DEFAULT_EXPONENT;
++  }
++  return CURRENCY_EXPONENTS[code] ?? DEFAULT_EXPONENT;
++}
++
++/**
++ * Convert a non-negative decimal string ("10", "10.00", "1.234") to integer
++ * minor units. Returns null for anything else: numbers, signs, exponents,
++ * separators, surrounding spaces, or fraction digits the currency cannot hold
++ * ("0.01" JPY). Trailing zero digits past the exponent are accepted.
++ */
++export function parseDecimalToMinorUnits(value: string, currency: string): string | null {
++  const code = normalizeCurrencyCode(currency);
++  if (!code || typeof value !== 'string' || value.length > MAX_DECIMAL_LENGTH) {
++    return null;
++  }
++  const match = DECIMAL_PATTERN.exec(value);
++  if (!match) {
++    return null;
++  }
++  const whole = match[1] ?? '0';
++  const fraction = match[2] ?? '';
++  const exponent = currencyMinorUnitExponent(code);
++  const kept = fraction.slice(0, exponent);
++  const dropped = fraction.slice(exponent);
++  if (/[^0]/.test(dropped)) {
++    return null;
++  }
++  const digits = `${whole}${kept.padEnd(exponent, '0')}`;
++  return digits.replace(/^0+(?=\d)/, '');
++}
++
++export function isMinorUnitString(value: unknown): value is string {
++  return typeof value === 'string' && /^\d{1,30}$/.test(value);
++}
++
++/** Compare two minor-unit strings without converting to a float. */
++export function compareMinorUnits(left: string, right: string): -1 | 0 | 1 {
++  const a = BigInt(left);
++  const b = BigInt(right);
++  return a < b ? -1 : a > b ? 1 : 0;
++}
+diff --git a/src/subscription-core/lib/subscription-status-rules.ts b/src/subscription-core/lib/subscription-status-rules.ts
+new file mode 100644
+index 0000000..449e611
+--- /dev/null
++++ b/src/subscription-core/lib/subscription-status-rules.ts
+@@ -0,0 +1,203 @@
++import type { SubscriptionStatus } from '../../contracts/lib/subscription';
++
++/*
++ * Single source of truth for PayPal subscription status mapping, transition
++ * guards and provider-state ordering. `core/lib/subscription-transition-policy`
++ * re-exports and builds on these; the engine and `reduceSubscription` share them.
++ */
++
++const SUBSCRIPTION_TERMINAL: ReadonlySet<SubscriptionStatus> = new Set(['cancelled', 'expired']);
++
++/** States a late `CREATED` (approval_pending) must never move back from. */
++const PAST_APPROVAL: ReadonlySet<SubscriptionStatus> = new Set(['approved', 'active', 'suspended']);
++
++const ISO_TIMESTAMP_PATTERN =
++  /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2}))?$/i;
++
++/**
++ * Parse a provider timestamp into a canonical ISO string. Accepts ISO 8601
++ * dates and date-times with an explicit zone (so the result never depends on
++ * the host time zone); anything else is null.
++ */
++export function parseProviderTimestamp(value: unknown): string | null {
++  if (typeof value !== 'string') {
++    return null;
++  }
++  const trimmed = value.trim();
++  if (trimmed.length === 0 || trimmed.length > 40 || !ISO_TIMESTAMP_PATTERN.test(trimmed)) {
++    return null;
++  }
++  const epochMs = Date.parse(trimmed);
++  if (Number.isNaN(epochMs)) {
++    return null;
++  }
++  return new Date(epochMs).toISOString();
++}
++
++/** Compare an incoming provider timestamp with the stored watermark. An unparseable watermark counts as absent. */
++export function compareProviderStateTimestamps(
++  stored: string | null,
++  incoming: string,
++): 'older' | 'newer' | 'equal' {
++  const storedMs = stored ? Date.parse(stored) : Number.NaN;
++  if (Number.isNaN(storedMs)) {
++    return 'newer';
++  }
++  const incomingMs = Date.parse(incoming);
++  if (incomingMs > storedMs) {
++    return 'newer';
++  }
++  if (incomingMs < storedMs) {
++    return 'older';
++  }
++  return 'equal';
++}
++
++/** Pure check that a transmission time lies within `maxSkewMs` of `now` (both directions). */
++export function isFreshTransmission(
++  transmissionTime: string | null | undefined,
++  now: Date | number,
++  maxSkewMs: number,
++): boolean {
++  const parsed = parseProviderTimestamp(transmissionTime);
++  if (!parsed || typeof maxSkewMs !== 'number' || !Number.isFinite(maxSkewMs) || maxSkewMs < 0) {
++    return false;
++  }
++  const nowMs = typeof now === 'number' ? now : now instanceof Date ? now.getTime() : Number.NaN;
++  if (!Number.isFinite(nowMs)) {
++    return false;
++  }
++  return Math.abs(nowMs - Date.parse(parsed)) <= maxSkewMs;
++}
++
++export function mapPaypalSubscriptionStatus(status: string): SubscriptionStatus {
++  switch (status.toUpperCase()) {
++    case 'APPROVAL_PENDING':
++      return 'approval_pending';
++    case 'APPROVED':
++      return 'approved';
++    case 'ACTIVE':
++      return 'active';
++    case 'SUSPENDED':
++      return 'suspended';
++    case 'CANCELLED':
++      return 'cancelled';
++    case 'EXPIRED':
++      return 'expired';
++    default:
++      return 'unknown';
++  }
++}
++
++export function isSubscriptionWebhookProviderRefreshEvent(eventType: string): boolean {
++  return eventType === 'BILLING.SUBSCRIPTION.UPDATED';
++}
++
++export function mapSubscriptionWebhookEventToStatus(eventType: string): SubscriptionStatus | null {
++  switch (eventType) {
++    case 'BILLING.SUBSCRIPTION.CREATED':
++      return 'approval_pending';
++    case 'BILLING.SUBSCRIPTION.ACTIVATED':
++    case 'BILLING.SUBSCRIPTION.RE-ACTIVATED':
++      return 'active';
++    case 'BILLING.SUBSCRIPTION.APPROVED':
++      return 'approved';
++    case 'BILLING.SUBSCRIPTION.SUSPENDED':
++      return 'suspended';
++    case 'BILLING.SUBSCRIPTION.CANCELLED':
++      return 'cancelled';
++    case 'BILLING.SUBSCRIPTION.EXPIRED':
++      return 'expired';
++    default:
++      return null;
++  }
++}
++
++export const SUBSCRIPTION_PAYMENT_FAILED_EVENT_TYPE = 'BILLING.SUBSCRIPTION.PAYMENT.FAILED';
++
++export const SUBSCRIPTION_SALE_EVENT_TYPES = [
++  'PAYMENT.SALE.COMPLETED',
++  'PAYMENT.SALE.REFUNDED',
++  'PAYMENT.SALE.REVERSED',
++] as const;
++
++export function isSubscriptionPaymentEvidenceEvent(eventType: string): boolean {
++  return (
++    eventType === SUBSCRIPTION_PAYMENT_FAILED_EVENT_TYPE ||
++    (SUBSCRIPTION_SALE_EVENT_TYPES as readonly string[]).includes(eventType)
++  );
++}
++
++/**
++ * Whether `current -> next` is allowed: terminal states never move, and a
++ * subscription past approval never regresses to `approval_pending`.
++ */
++export function isSubscriptionStatusTransitionAllowed(
++  current: SubscriptionStatus,
++  next: SubscriptionStatus,
++): boolean {
++  if (current === next) {
++    return true;
++  }
++  if (SUBSCRIPTION_TERMINAL.has(current)) {
++    return false;
++  }
++  if (next === 'approval_pending' && PAST_APPROVAL.has(current)) {
++    return false;
++  }
++  return true;
++}
++
++export function isTerminalSubscriptionStatus(status: SubscriptionStatus): boolean {
++  return SUBSCRIPTION_TERMINAL.has(status);
++}
++
++/** Rejected transitions keep the current subscription status. */
++export function resolveSubscriptionStatusTransition(
++  current: SubscriptionStatus,
++  next: SubscriptionStatus,
++): SubscriptionStatus {
++  return isSubscriptionStatusTransitionAllowed(current, next) ? next : current;
++}
++
++export type SubscriptionStateOrderingDecision =
++  | { action: 'apply'; stateAt: string | null }
++  | { action: 'noop'; reason: 'stale' | 'equal_conflict' | 'missing_timestamp' };
++
++/**
++ * Order an incoming provider state against the stored watermark. Older is a
++ * noop; equal with a different status is a noop; a missing timestamp after a
++ * watermark is a noop. `authoritative` (provider lookup or our own mutation)
++ * always applies and leaves the watermark to the caller.
++ */
++export function evaluateSubscriptionStateOrdering(input: {
++  currentStatus: SubscriptionStatus | null;
++  storedStateAt: string | null;
++  desiredStatus: SubscriptionStatus;
++  incomingStateAt: string | null;
++  authoritative: boolean;
++}): SubscriptionStateOrderingDecision {
++  if (input.authoritative) {
++    return { action: 'apply', stateAt: null };
++  }
++
++  const incoming = input.incomingStateAt;
++  if (!incoming) {
++    if (input.storedStateAt) {
++      return { action: 'noop', reason: 'missing_timestamp' };
++    }
++    return { action: 'apply', stateAt: null };
++  }
++
++  const ordering = compareProviderStateTimestamps(input.storedStateAt, incoming);
++  if (ordering === 'older') {
++    return { action: 'noop', reason: 'stale' };
++  }
++  if (ordering === 'equal') {
++    const current = input.currentStatus ?? 'approval_pending';
++    if (current !== input.desiredStatus) {
++      return { action: 'noop', reason: 'equal_conflict' };
++    }
++  }
++  return { action: 'apply', stateAt: incoming };
++}
+diff --git a/test/subscription-core-boundary.test.ts b/test/subscription-core-boundary.test.ts
+new file mode 100644
+index 0000000..9b8b09b
+--- /dev/null
++++ b/test/subscription-core-boundary.test.ts
+@@ -0,0 +1,154 @@
++import { readFileSync } from 'node:fs';
++import { join, relative, resolve, dirname } from 'node:path';
++import ts from 'typescript';
++import { describe, expect, it } from 'vitest';
++import { collectProductionTsFiles } from './architecture-boundary-scanner';
++
++/*
++ * The pure subscription core (`@idevconn/payment-providers/subscription`) may
++ * import only its own files at runtime and `contracts` for types. It must not
++ * do IO, read the clock or use randomness: time and ids come in as parameters.
++ */
++
++const srcRoot = join(import.meta.dirname, '../src');
++const coreRoot = join(srcRoot, 'subscription-core');
++const contractsRoot = join(srcRoot, 'contracts');
++
++type Violation = { file: string; detail: string };
++
++const FORBIDDEN_GLOBALS: Array<[RegExp, string]> = [
++  [/\bDate\s*\.\s*now\b/, 'Date.now'],
++  [/\bnew\s+Date\s*\(\s*\)/, 'new Date() without arguments'],
++  [/\bMath\s*\.\s*random\b/, 'Math.random'],
++  [/\bperformance\s*\.\s*now\b/, 'performance.now'],
++  [/\bcrypto\s*\.\s*(randomUUID|getRandomValues|randomBytes)\b/, 'crypto randomness'],
++  [/\bprocess\s*\.\s*(env|hrtime)\b/, 'process.env / process.hrtime'],
++  [/\b(setTimeout|setInterval|setImmediate|queueMicrotask)\s*\(/, 'timers'],
++  [/\bfetch\s*\(/, 'fetch'],
++  [/\brequire\s*\(/, 'require'],
++];
++
++function isInside(child: string, parent: string): boolean {
++  const rel = relative(parent, child);
++  return rel === '' || (!rel.startsWith('..') && !rel.startsWith('/'));
++}
++
++function scanSubscriptionCoreSource(file: string, text: string): Violation[] {
++  const violations: Violation[] = [];
++  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
++
++  const checkSpecifier = (specifier: string, typeOnly: boolean) => {
++    if (!specifier.startsWith('.')) {
++      violations.push({ file, detail: `imports package or builtin "${specifier}"` });
++      return;
++    }
++    const target = resolve(dirname(file), specifier);
++    if (isInside(target, coreRoot)) {
++      return;
++    }
++    if (isInside(target, contractsRoot) && typeOnly) {
++      return;
++    }
++    violations.push({
++      file,
++      detail: `${typeOnly ? 'type ' : ''}import of "${specifier}" leaves subscription-core`,
++    });
++  };
++
++  const visit = (node: ts.Node) => {
++    if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
++      const clause = node.importClause;
++      const typeOnly =
++        clause !== undefined &&
++        (clause.isTypeOnly ||
++          (clause.name === undefined &&
++            clause.namedBindings !== undefined &&
++            ts.isNamedImports(clause.namedBindings) &&
++            clause.namedBindings.elements.length > 0 &&
++            clause.namedBindings.elements.every((element) => element.isTypeOnly)));
++      checkSpecifier(node.moduleSpecifier.text, typeOnly);
++    }
++    if (
++      ts.isExportDeclaration(node) &&
++      node.moduleSpecifier &&
++      ts.isStringLiteral(node.moduleSpecifier)
++    ) {
++      checkSpecifier(node.moduleSpecifier.text, node.isTypeOnly);
++    }
++    if (
++      ts.isCallExpression(node) &&
++      node.expression.kind === ts.SyntaxKind.ImportKeyword
++    ) {
++      violations.push({ file, detail: 'dynamic import' });
++    }
++    ts.forEachChild(node, visit);
++  };
++  visit(source);
++
++  const withoutComments = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
++  for (const [pattern, label] of FORBIDDEN_GLOBALS) {
++    if (pattern.test(withoutComments)) {
++      violations.push({ file, detail: `uses ${label}` });
++    }
++  }
++  return violations;
++}
++
++describe('subscription-core purity boundary', () => {
++  it('imports only itself at runtime and contracts as types; no clock, randomness or IO', () => {
++    const files = collectProductionTsFiles(coreRoot);
++    expect(files.length).toBeGreaterThan(0);
++    const violations = files.flatMap((file) =>
++      scanSubscriptionCoreSource(file, readFileSync(file, 'utf8')),
++    );
++    expect(violations).toEqual([]);
++  });
++
++  it('self-test: the scanner catches each forbidden pattern', () => {
++    const file = join(coreRoot, 'lib/virtual.ts');
++    const bad = `
++      import { applySubscriptionTransition } from '../../core/lib/subscription-evidence-application';
++      import { PaypalSubscriptionExecutor } from '../../paypal/index';
++      import { readFileSync } from 'node:fs';
++      import http from 'http';
++      import { randomUUID } from 'crypto';
++      import { PaymentReliabilityError } from '../../contracts/index';
++      export { x } from '../../core/index';
++      const t = Date.now();
++      const r = Math.random();
++      const d = new Date();
++      const e = process.env.X;
++      const m = await import('./other');
++    `;
++    const details = scanSubscriptionCoreSource(file, bad).map((v) => v.detail);
++    expect(details).toEqual(
++      expect.arrayContaining([
++        'import of "../../core/lib/subscription-evidence-application" leaves subscription-core',
++        'import of "../../paypal/index" leaves subscription-core',
++        'imports package or builtin "node:fs"',
++        'imports package or builtin "http"',
++        'imports package or builtin "crypto"',
++        'import of "../../contracts/index" leaves subscription-core',
++        'import of "../../core/index" leaves subscription-core',
++        'uses Date.now',
++        'uses Math.random',
++        'uses new Date() without arguments',
++        'uses process.env / process.hrtime',
++        'dynamic import',
++      ]),
++    );
++  });
++
++  it('self-test: type-only contracts imports, own files and Date.parse are allowed', () => {
++    const file = join(coreRoot, 'lib/virtual.ts');
++    const ok = `
++      import type { SubscriptionStatus } from '../../contracts/lib/subscription';
++      import { type CanonicalMoney } from '../../contracts/lib/money';
++      import { parseDecimalToMinorUnits } from './subscription-money';
++      export type { SubscriptionStatus };
++      const ms = Date.parse('2026-10-22T10:00:00Z');
++      const iso = new Date(ms).toISOString();
++    `;
++    expect(scanSubscriptionCoreSource(file, ok)).toEqual([]);
++  });
++});
+diff --git a/test/subscription-entry-consumer.test.ts b/test/subscription-entry-consumer.test.ts
+new file mode 100644
+index 0000000..855ed1e
+--- /dev/null
++++ b/test/subscription-entry-consumer.test.ts
+@@ -0,0 +1,115 @@
++import { execFileSync } from 'node:child_process';
++import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
++import { createRequire } from 'node:module';
++import { join } from 'node:path';
++import { pathToFileURL } from 'node:url';
++import { afterAll, beforeAll, describe, expect, it } from 'vitest';
++
++/*
++ * Consumer smoke checks for the `./subscription` entry, run against the built
++ * package the way an installed consumer sees it: a scratch project under
++ * node_modules/.cache links the package by name and resolves it through the
++ * `exports` map (ESM and CJS) and through `typesVersions` (TypeScript
++ * `moduleResolution: node10`).
++ */
++
++const root = join(import.meta.dirname, '..');
++const distReady = existsSync(join(root, 'dist/subscription.js'));
++const consumerDir = join(root, 'node_modules/.cache/subscription-consumer-smoke');
++const tscBin = join(root, 'node_modules/typescript/bin/tsc');
++
++function run(args: string[]): string {
++  return execFileSync(process.execPath, args, { cwd: consumerDir, encoding: 'utf8' });
++}
++
++describe.skipIf(!distReady)('subscription entry consumer smoke', () => {
++  beforeAll(() => {
++    rmSync(consumerDir, { recursive: true, force: true });
++    mkdirSync(join(consumerDir, 'node_modules/@idevconn'), { recursive: true });
++    symlinkSync(root, join(consumerDir, 'node_modules/@idevconn/payment-providers'), 'dir');
++    writeFileSync(join(consumerDir, 'package.json'), JSON.stringify({ name: 'consumer', private: true }));
++  });
++
++  afterAll(() => {
++    rmSync(consumerDir, { recursive: true, force: true });
++  });
++
++  it('loads the built ESM and CJS files directly', async () => {
++    const esm = await import(pathToFileURL(join(root, 'dist/subscription.js')).href);
++    const require = createRequire(import.meta.url);
++    const cjs = require(join(root, 'dist/subscription.cjs'));
++    for (const mod of [esm, cjs]) {
++      expect(typeof mod.reduceSubscription).toBe('function');
++      expect(typeof mod.normalizePaypalSubscriptionEvent).toBe('function');
++      expect(typeof mod.isFreshTransmission).toBe('function');
++    }
++  });
++
++  it('resolves @idevconn/payment-providers/subscription under ESM import', () => {
++    const out = run([
++      '--input-type=module',
++      '-e',
++      `import { reduceSubscription, initialSubscriptionState, normalizePaypalSubscriptionEvent } from '@idevconn/payment-providers/subscription';
++       const n = normalizePaypalSubscriptionEvent(JSON.stringify({ id: 'WH-1', event_type: 'BILLING.SUBSCRIPTION.ACTIVATED', resource: { id: 'I-1' } }));
++       console.log(reduceSubscription(initialSubscriptionState(), n.event, { source: 'webhook' }).state.status);`,
++    ]);
++    expect(out.trim()).toBe('active');
++  });
++
++  it('resolves @idevconn/payment-providers/subscription under CJS require without loading the legacy runtime', () => {
++    const out = run([
++      '-e',
++      `const sub = require('@idevconn/payment-providers/subscription');
++       const loaded = Object.keys(require.cache).filter((k) => /node_modules[\\\\/](axios|zod|express|@idevconn[\\\\/]payment[\\\\/])/.test(k));
++       console.log(typeof sub.reduceSubscription, loaded.length);`,
++    ]);
++    expect(out.trim()).toBe('function 0');
++  });
++
++  it.each(['node10', 'node16'])(
++    'type-checks a consumer under moduleResolution %s',
++    (moduleResolution) => {
++      const dir = join(consumerDir, moduleResolution);
++      mkdirSync(dir, { recursive: true });
++      writeFileSync(
++        join(dir, 'index.ts'),
++        `import { reduceSubscription, initialSubscriptionState, type SubscriptionState, type NormalizedSubscriptionEvent } from '@idevconn/payment-providers/subscription';
++         import { WebhookProcessingService } from '@idevconn/payment-providers';
++         import { PaypalWebhookVerifier } from '@idevconn/payment-providers/paypal';
++         declare const event: NormalizedSubscriptionEvent;
++         const state: SubscriptionState = initialSubscriptionState();
++         const next: SubscriptionState = reduceSubscription(state, event, { source: 'lookup' }).state;
++         export { next, WebhookProcessingService, PaypalWebhookVerifier };
++        `,
++      );
++      writeFileSync(
++        join(dir, 'tsconfig.json'),
++        JSON.stringify({
++          compilerOptions: {
++            target: 'ES2022',
++            module: moduleResolution === 'node10' ? 'commonjs' : 'node16',
++            moduleResolution,
++            strict: true,
++            noEmit: true,
++            skipLibCheck: true,
++            types: [],
++          },
++          files: ['index.ts'],
++        }),
++      );
++      const result = (() => {
++        try {
++          return execFileSync(process.execPath, [tscBin, '-p', join(dir, 'tsconfig.json')], {
++            cwd: dir,
++            encoding: 'utf8',
++          });
++        } catch (error) {
++          const failure = error as { stdout?: string; stderr?: string };
++          return `FAILED\n${failure.stdout ?? ''}${failure.stderr ?? ''}`;
++        }
++      })();
++      expect(result).toBe('');
++    },
++    60_000,
++  );
++});

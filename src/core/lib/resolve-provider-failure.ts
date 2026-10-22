@@ -116,3 +116,19 @@ export function resolveProviderFailure(error: unknown): ResolvedProviderFailure 
     providerDebugId,
   };
 }
+
+const PROVIDER_DEBUG_ID_PATTERN = /^[\w.-]{1,128}$/;
+
+/**
+ * Operation `failureMessage` for a provider failure: the sanitised message plus the provider
+ * debug id, because the operation row has no dedicated column for it.
+ */
+export function formatProviderFailureMessage(
+  failure: Pick<ResolvedProviderFailure, 'message' | 'providerDebugId'>,
+): string {
+  const debugId = failure.providerDebugId;
+  if (!debugId || !PROVIDER_DEBUG_ID_PATTERN.test(debugId)) {
+    return failure.message;
+  }
+  return `${failure.message} (provider debug id: ${debugId})`;
+}

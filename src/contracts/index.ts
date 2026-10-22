@@ -17,3 +17,4 @@ export * from './lib/webhook';
 export * from './lib/reliability-errors';
 export * from './lib/operation-result';
 export * from './lib/recovery';
+export * from './lib/retry';

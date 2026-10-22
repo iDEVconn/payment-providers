@@ -4,7 +4,7 @@ import type {
 } from '../../contracts/index';
 import { evaluateSellerConnectionReadiness } from './seller-connection-readiness';
 import { deriveSellerConnectionStatus } from './seller-transition-policy';
-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
+import type { SellerStore } from './persistence/payment-reliability-store';
 
 const REQUIRED_SCOPE_HINTS = ['payments', 'refund'];
 
@@ -80,7 +80,7 @@ export function mapMerchantStatusToConnectionPatch(
 }
 
 export async function applySellerMerchantStatus(input: {
-  store: PaymentReliabilityStore;
+  store: SellerStore;
   connection: SellerConnectionRecord;
   snapshot: ExecuteGetSellerMerchantStatusResult;
 }): Promise<SellerConnectionRecord> {

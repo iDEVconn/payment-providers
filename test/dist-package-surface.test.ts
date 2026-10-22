@@ -35,6 +35,22 @@ describe.skipIf(!distReady)('built package surface', () => {
     expect(existsSync(join(root, 'dist/index.cjs'))).toBe(true);
     expect(existsSync(join(root, 'dist/paypal.js'))).toBe(true);
     expect(existsSync(join(root, 'dist/paypal.cjs'))).toBe(true);
+    expect(existsSync(join(root, 'dist/subscription.js'))).toBe(true);
+    expect(existsSync(join(root, 'dist/subscription.cjs'))).toBe(true);
+    expect(existsSync(join(root, 'dist/subscription.d.ts'))).toBe(true);
+    expect(existsSync(join(root, 'dist/subscription.d.cts'))).toBe(true);
+    expect(existsSync(join(root, 'dist/testing.js'))).toBe(true);
+    expect(existsSync(join(root, 'dist/testing.cjs'))).toBe(true);
+    expect(existsSync(join(root, 'dist/testing.d.ts'))).toBe(true);
+    expect(existsSync(join(root, 'dist/testing.d.cts'))).toBe(true);
+  });
+
+  it('loads the subscription subpath from dist (ESM and CJS)', async () => {
+    const esm = await import(pathToFileURL(join(root, 'dist/subscription.js')).href);
+    const require = createRequire(import.meta.url);
+    const cjs = require(join(root, 'dist/subscription.cjs'));
+    expect(esm.reduceSubscription).toBeDefined();
+    expect(cjs.reduceSubscription).toBeDefined();
   });
 });
 

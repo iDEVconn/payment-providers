@@ -2,7 +2,10 @@ import { PaymentConfigurationError } from '../../core/lib/payment-configuration-
 import type { PaymentExecutionStatus } from '../../contracts/index';
 import type { ResolvedPaymentRuntime } from '../../core/index';
 import { createBlockedWebhookVerificationClient } from './blocked-provider-network';
-import { shouldRejectProviderNetworkCalls } from './build-reject-only-executor';
+import {
+  assertProviderNetworkAllowedInProduction,
+  shouldRejectProviderNetworkCalls,
+} from './build-reject-only-executor';
 import { FakePaypalWebhookVerificationClient } from './fake-paypal-webhook-verification-client';
 import { FetchPaypalOAuthHttpClient } from './live-paypal-http-clients';
 import { LivePaypalWebhookVerificationClient } from './live-paypal-webhook-verification-client';
@@ -13,7 +16,17 @@ export type BuildPaypalWebhookVerifierInput = {
   runtime: ResolvedPaymentRuntime;
   nodeEnv?: string;
   executionStatus?: PaymentExecutionStatus;
+  /** See `resolvePaymentRuntime`: build a reject-only composition in production on purpose. */
+  allowRejectOnlyInProduction?: boolean;
   forceFake?: boolean;
+  /** PayPal webhook id (`PAYPAL_WEBHOOK_ID`); used when a verify request carries none. */
+  webhookId?: string;
+  /**
+   * Throw when the verifier is built without `webhookId`, instead of answering every request with
+   * `verification_unavailable`. Defaults to true when `nodeEnv === 'production'` and the verifier
+   * would call PayPal (not for a kill switch or an intentional reject-only composition).
+   */
+  requireWebhookId?: boolean;
 };
 
 export function buildPaypalWebhookVerifier(
@@ -21,12 +34,35 @@ export function buildPaypalWebhookVerifier(
 ): PaypalWebhookVerifier {
   const { runtime, nodeEnv, forceFake, executionStatus } = input;
   const isProduction = nodeEnv === 'production';
+  const webhookId = input.webhookId?.trim() || undefined;
+  const options = { webhookId };
+
+  assertProviderNetworkAllowedInProduction({
+    runtime,
+    executionStatus,
+    nodeEnv,
+    component: 'PayPal webhook verifier',
+    allowRejectOnlyInProduction: input.allowRejectOnlyInProduction,
+    allowKillSwitch: true,
+  });
+  // A blocked verifier (kill switch, intentional reject-only) never reaches PayPal, so the id is only
+  // required by default when production verification would actually call PayPal.
+  const requireWebhookId =
+    input.requireWebhookId ??
+    (isProduction && !shouldRejectProviderNetworkCalls(runtime, executionStatus));
+  if (requireWebhookId && !webhookId) {
+    throw new PaymentConfigurationError(
+      'PayPal webhook verification requires a webhook id (PAYPAL_WEBHOOK_ID)',
+      ['webhookId'],
+    );
+  }
 
   if (shouldRejectProviderNetworkCalls(runtime, executionStatus)) {
     return new PaypalWebhookVerifier(
       runtime,
       createBlockedWebhookVerificationClient(),
       nodeEnv,
+      options,
     );
   }
 
@@ -41,6 +77,7 @@ export function buildPaypalWebhookVerifier(
       runtime,
       new FakePaypalWebhookVerificationClient(),
       nodeEnv,
+      options,
     );
   }
 
@@ -50,6 +87,7 @@ export function buildPaypalWebhookVerifier(
       runtime,
       createBlockedWebhookVerificationClient(),
       nodeEnv,
+      options,
     );
   }
 
@@ -75,5 +113,6 @@ export function buildPaypalWebhookVerifier(
       credentials.requestTimeoutMs ?? 10_000,
     ),
     nodeEnv,
+    options,
   );
 }

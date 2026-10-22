@@ -4,6 +4,10 @@ export type SubscriptionProviderPlanSnapshot = {
   providerPlanId?: string | null;
 };
 
+/**
+ * @deprecated The engine checks plans with `reduceSubscription` (a mismatch blocks only access, a
+ * cancellation on another plan still applies). Kept for existing callers; no engine caller left.
+ */
 export function assertSubscriptionProviderPlanSnapshotConsistent(
   operation: { providerPlanId: string | null },
   snapshot: SubscriptionProviderPlanSnapshot,

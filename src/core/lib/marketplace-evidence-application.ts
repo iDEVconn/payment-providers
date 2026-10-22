@@ -8,7 +8,7 @@ import {
   deriveMarketplaceOrderStatusFromUnits,
   mapPaypalOrderStatusToMarketplace,
 } from './marketplace-transition-policy';
-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
+import type { MarketplaceStore } from './persistence/payment-reliability-store';
 
 function mapCaptureStatus(status: string | undefined): MarketplaceUnitStatus {
   switch (status) {
@@ -117,7 +117,7 @@ function majorToMinor(value: string, currency: string): string {
 }
 
 export async function applyMarketplaceUnitSnapshots(input: {
-  store: PaymentReliabilityStore;
+  store: MarketplaceStore;
   operationId: string;
   snapshots: ExecuteMarketplaceUnitSnapshot[];
   preserveCaptured: boolean;

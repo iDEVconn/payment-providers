@@ -11,6 +11,7 @@ import { WebhookProcessingService } from '../webhook-processing-service';
 import { buildOperationIdempotencyScope } from '../operation-idempotency';
 import { PaypalWebhookVerifier } from '../../../paypal/lib/paypal-webhook-verifier';
 import { resolvePaymentRuntime } from '../resolve-payment-runtime';
+import { DEFAULT_RETRY_MAX_DELAY_MS } from '../retry-backoff';
 
 const SENSITIVE = {
   secret: 'fake-client-secret',
@@ -187,10 +188,12 @@ describe('public error path sanitization', () => {
       const updated = await store.findEvidenceById(inserted.evidenceId);
       assertNoSensitiveLeak(updated?.consumerDeliveryLastError);
       expect(updated?.consumerDeliveryLastError).toBe('Consumer event delivery failed');
+      // A failed delivery waits for its backoff (issue #20): reset it like a host would.
       await store.updateEvidence({
         evidenceId: inserted.evidenceId,
         consumerDeliveryStatus: 'pending',
         consumerDeliveryLastError: null,
+        nextAttemptAt: null,
       });
     }
   });
@@ -255,7 +258,11 @@ describe('public error path sanitization', () => {
     const failedRow = await store.findEvidenceById(inserted.evidenceId);
     expect(failedRow?.consumerDeliveryLastError).toBe('Consumer event delivery failed');
 
+    // The failed delivery waits for its backoff (issue #20) before the next run retries it.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(Date.now() + DEFAULT_RETRY_MAX_DELAY_MS);
     const summary = await recovery.recover({ workerId: 'worker-retry-2', limit: 5 });
+    vi.useRealTimers();
     expect(summary.delivered).toBe(1);
     expect(attempts).toBe(2);
     const confirmed = await store.findEvidenceById(inserted.evidenceId);

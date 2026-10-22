@@ -1,7 +1,9 @@
 import type {
+  ExecuteGetSubscriptionResult,
   ExecuteMarketplaceUnitSnapshot,
   MarketplaceOrderStatus,
   PaymentOperation,
+  PaymentOperationKind,
   PaymentOperationStatus,
   PayoutFinancialStatus,
   PlanStatus,
@@ -9,8 +11,23 @@ import type {
   ReconcilePaymentOperationsResult,
   SubscriptionStatus,
 } from '../../contracts/index';
-import { PAYMENT_RELIABILITY_ERROR } from '../../contracts/index';
+import {
+  DEFAULT_SUBMITTED_STALE_KINDS,
+  PAYMENT_RELIABILITY_ERROR,
+  PaymentReliabilityError,
+} from '../../contracts/index';
 import { sanitizeOperationalErrorMessage } from './public-error-sanitizer';
+import {
+  CLEARED_RETRY_STATE,
+  DEFAULT_SUBMITTED_STALE_AFTER_MS,
+  clearResolvedOperationRetryState,
+  hasRetryState,
+  nextRetryDeferral,
+  resolvePositiveDurationMs,
+  resolveRetryBackoffPolicy,
+  type RetryBackoffOptions,
+  type RetryBackoffPolicy,
+} from './retry-backoff';
 import {
   assertTransitionAllowed,
   assertVerifiedEvidence,
@@ -27,41 +44,48 @@ import {
   parsePaypalPayoutWebhookPayload,
 } from './payout-webhook-correlation';
 import {
+  HELD_EFFECTS_OVERFLOW,
+  SUBSCRIPTION_EFFECTS_HOOK_FAILED,
+  SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP,
   applyPlanTransition,
-  applySubscriptionTransition,
+  applySubscriptionEvents,
+  deliverSubscriptionEffects,
+  normalizeSubscriptionEvidencePayload,
+  resolveExpectedSubscriptionPayment,
+  subscriptionEventFromProviderSnapshot,
+  type ApplySubscriptionEventsResult,
+  type SubscriptionEffectsHooks,
+  type SubscriptionEventStep,
 } from './subscription-evidence-application';
 import {
+  isSubscriptionPaymentEvidenceEvent,
   mapPlanWebhookEventToStatus,
-  mapSubscriptionWebhookEventToStatus,
-  parseSubscriptionResourceStateTimestamp,
   planStatusToOperationStatus,
-  resolveSubscriptionStatusTransition,
-  subscriptionStatusToOperationStatus,
-  type SubscriptionStateApplySource,
 } from './subscription-transition-policy';
+import { isSubscriptionEvidenceEvent } from './subscription-evidence-events';
 import { isSellerOnboardingWebhookEvent } from './seller-transition-policy';
 import { reconcileSellerConnectionAggregate } from './seller-connection-reconciliation';
 import type { ReconciliationProviderLookup } from './checkout-provider-port';
-import { subscriptionBillingFieldsFromProviderSnapshot } from './subscription-provider-snapshot-fields';
-import {
-  assertSubscriptionProviderPlanSnapshotConsistent,
-  isSubscriptionProviderPlanMismatchError,
-} from './subscription-provider-plan-consistency';
 import { applyMarketplaceUnitSnapshots } from './marketplace-evidence-application';
-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
-import { sha256Payload } from './persistence/memory-payment-reliability-store';
+import type {
+  MarketplaceStore,
+  PayoutStore,
+  SellerStore,
+  SubscriptionStore,
+} from './persistence/payment-reliability-store';
+import {
+  assertStoreCapabilitiesComplete,
+  hasMarketplaceStore,
+  hasPayoutStore,
+  hasSellerStore,
+} from './persistence/store-capabilities';
+import { sha256Payload } from './sha256-payload';
 
 type ReconcileCounters = ReconcilePaymentOperationsResult;
 
 type ReconciliationOutcome = {
   executionStatus: PaymentOperationStatus | null;
   payoutStatus: PayoutFinancialStatus | null;
-  subscriptionStatus?: SubscriptionStatus | null;
-  subscriptionStartTime?: string | null;
-  subscriptionNextBillingTime?: string | null;
-  subscriptionProviderPlanId?: string | null;
-  subscriptionApplySource?: SubscriptionStateApplySource;
-  subscriptionProviderStateTimestamp?: string | null;
   planStatus?: PlanStatus | null;
   providerTransactionId?: string | null;
   providerFeeMinor?: string | null;
@@ -74,15 +98,33 @@ type ReconciliationOutcome = {
   marketplaceCheckoutOperationId?: string;
 };
 
-function reconciliationSubscriptionBillingFieldsFromOutcome(outcome: ReconciliationOutcome): {
-  startTime?: string;
-  nextBillingTime?: string;
-} {
-  return subscriptionBillingFieldsFromProviderSnapshot({
-    startTime: outcome.subscriptionStartTime,
-    nextBillingTime: outcome.subscriptionNextBillingTime,
-  });
+type SubscriptionCommandKind =
+  | 'subscription_cancel'
+  | 'subscription_suspend'
+  | 'subscription_activate';
+
+/** The subscription status an accepted lifecycle command leads to. */
+const SUBSCRIPTION_COMMAND_TARGET: Record<SubscriptionCommandKind, SubscriptionStatus> = {
+  subscription_cancel: 'cancelled',
+  subscription_suspend: 'suspended',
+  subscription_activate: 'active',
+};
+
+/** Failure code of an uncertain lifecycle command the provider lookup shows did not take effect. */
+export const SUBSCRIPTION_COMMAND_NOT_APPLIED = 'SUBSCRIPTION_COMMAND_NOT_APPLIED';
+
+function isSubscriptionCommandKind(kind: PaymentOperationKind): kind is SubscriptionCommandKind {
+  return kind in SUBSCRIPTION_COMMAND_TARGET;
 }
+
+/** Plan mismatches found by provider lookups are remembered per foreign plan, not per row. */
+function lookupPlanMismatchKey(snapshot: ExecuteGetSubscriptionResult): string {
+  return `lookup:${snapshot.providerPlanId ?? ''}`;
+}
+
+type SubscriptionLookup =
+  | { kind: 'found'; snapshot: ExecuteGetSubscriptionResult }
+  | { kind: 'unavailable' };
 
 function mapMarketplaceStatusToOperationStatus(
   marketplaceStatus: MarketplaceOrderStatus,
@@ -149,64 +191,207 @@ function mapRefundLookupToStatus(refundStatus: string): PaymentOperationStatus |
   }
 }
 
-export class ReconciliationService {
-  constructor(
-    private readonly store: PaymentReliabilityStore,
-    private readonly providerLookup: ReconciliationProviderLookup,
-  ) {}
+/**
+ * A `SubscriptionStore` is enough. Seller connections are reconciled only when the store has the
+ * seller capability; payout and marketplace operations only with those capabilities. A capability
+ * with only some of its methods throws `PaymentConfigurationError`.
+ */
+export type ReconciliationServiceStore = SubscriptionStore &
+  Partial<PayoutStore & SellerStore & MarketplaceStore>;
 
+const CAPABILITY_NOT_CONFIGURED = 'STORE_CAPABILITY_NOT_CONFIGURED';
+
+/**
+ * Rows that correlate to no operation cost one store lookup each: they are deferred without using
+ * the `limit` budget, and one run scans at most `limit` times this many evidence rows.
+ */
+const UNMATCHED_SCAN_FACTOR = 10;
+
+/**
+ * Backoff (`retryBaseDelayMs`, `retryMaxDelayMs`, `maxAttempts`, see `RetryBackoffOptions`): a
+ * candidate that is still unresolved after its attempt is deferred and gives up after
+ * `maxAttempts` (issue #8). `submittedStaleAfterMs` (integer ms > 0, default
+ * `DEFAULT_SUBMITTED_STALE_AFTER_MS`): a `submitted` operation without a provider reference this
+ * long after its last write is treated as uncertain (issue #12).
+ */
+export type ReconciliationServiceOptions = RetryBackoffOptions & {
+  submittedStaleAfterMs?: number;
+};
+
+export class ReconciliationService {
+  private readonly retryPolicy: RetryBackoffPolicy;
+  private readonly submittedStaleAfterMs: number;
+
+  constructor(
+    private readonly store: ReconciliationServiceStore,
+    private readonly providerLookup: ReconciliationProviderLookup,
+    /** Optional host hooks; `onSubscriptionEffects` gets the reducer's effects after each save. */
+    private readonly hooks: SubscriptionEffectsHooks = {},
+    options: ReconciliationServiceOptions = {},
+  ) {
+    this.retryPolicy = resolveRetryBackoffPolicy(options, 'Reconciliation');
+    this.submittedStaleAfterMs = resolvePositiveDurationMs(
+      options.submittedStaleAfterMs,
+      'submittedStaleAfterMs',
+      'Reconciliation',
+      DEFAULT_SUBMITTED_STALE_AFTER_MS,
+    );
+    assertStoreCapabilitiesComplete(store, ['payout', 'seller', 'marketplace']);
+  }
+
+  /**
+   * One run: due evidence candidates (at most `limit` that correlate to an operation; rows that
+   * correlate to none are deferred and the batch is refilled), then due uncertain operations, then
+   * seller connections. Every candidate still unresolved afterwards is deferred with backoff.
+   */
   async reconcile(limit = 25): Promise<ReconcilePaymentOperationsResult> {
-    const evidenceCandidates = await this.store.listReconciliationCandidates(limit);
-    const uncertainOperations = await this.store.listUncertainOperations(limit);
-    const connectionCandidates = await this.store.listSellerConnectionsForReconciliation(limit);
+    const uncertainOperations = await this.store.listUncertainOperations(limit, {
+      submittedStaleBefore: new Date(Date.now() - this.submittedStaleAfterMs).toISOString(),
+      submittedStaleKinds: [...DEFAULT_SUBMITTED_STALE_KINDS],
+    });
+    const sellerStore = hasSellerStore(this.store) ? this.store : null;
+    const connectionCandidates = sellerStore
+      ? await sellerStore.listSellerConnectionsForReconciliation(limit)
+      : [];
     const result: ReconcileCounters = {
-      examined:
-        evidenceCandidates.length + uncertainOperations.length + connectionCandidates.length,
+      examined: uncertainOperations.length + connectionCandidates.length,
       applied: 0,
       retryableFailures: 0,
       terminalFailures: 0,
       noOps: 0,
     };
 
-    for (const evidence of evidenceCandidates) {
-      await this.reconcileEvidence(evidence, result);
-    }
-
-    const reconciledOperationIds = new Set(
-      evidenceCandidates
-        .map((row) => row.relatedOperationId)
-        .filter((operationId): operationId is string => Boolean(operationId)),
-    );
+    const reconciledOperationIds = await this.reconcileEvidenceCandidates(limit, result);
 
     for (const operation of uncertainOperations) {
       if (reconciledOperationIds.has(operation.operationId)) {
         continue;
       }
       await this.reconcileOperation(operation, result);
+      await this.deferOperationIfUnresolved(operation.operationId);
     }
 
-    for (const connection of connectionCandidates) {
-      const connectionResult = await reconcileSellerConnectionAggregate({
-        store: this.store,
-        providerLookup: this.providerLookup,
-        connection,
-      });
-      if (connectionResult.outcome === 'applied') {
-        result.applied += 1;
-      } else if (connectionResult.outcome === 'retryable_failure') {
-        result.retryableFailures += 1;
-      } else {
-        result.noOps += 1;
+    if (sellerStore) {
+      for (const connection of connectionCandidates) {
+        const connectionResult = await reconcileSellerConnectionAggregate({
+          store: sellerStore,
+          providerLookup: this.providerLookup,
+          connection,
+        });
+        if (connectionResult.outcome === 'applied') {
+          result.applied += 1;
+        } else if (connectionResult.outcome === 'retryable_failure') {
+          result.retryableFailures += 1;
+        } else {
+          result.noOps += 1;
+        }
       }
     }
-
     return result;
   }
 
+  /** Returns the ids of the operations the examined evidence belongs to. */
+  private async reconcileEvidenceCandidates(
+    limit: number,
+    result: ReconcileCounters,
+  ): Promise<Set<string>> {
+    const examined = new Set<string>();
+    const relatedOperationIds = new Set<string>();
+    const settledOperationIds = new Set<string>();
+    const maxScanned = limit * UNMATCHED_SCAN_FACTOR;
+    let correlated = 0;
+    while (correlated < limit && examined.size < maxScanned) {
+      // Deferred rows leave the due set, so the next page holds the rows behind them. A store that
+      // ignores `nextAttemptAt` returns the same rows again: the run then stops.
+      const page = (await this.store.listReconciliationCandidates(limit)).filter(
+        (row) => !examined.has(row.evidenceId),
+      );
+      if (page.length === 0) {
+        break;
+      }
+      for (const evidence of page) {
+        if (correlated >= limit || examined.size >= maxScanned) {
+          break;
+        }
+        examined.add(evidence.evidenceId);
+        result.examined += 1;
+        if (evidence.relatedOperationId) {
+          relatedOperationIds.add(evidence.relatedOperationId);
+        }
+        if (await this.reconcileEvidence(evidence, result)) {
+          correlated += 1;
+        }
+        await this.deferEvidenceIfStillCandidate(evidence.evidenceId);
+        // The operation phase skips this operation: it waits (or is cleared) here, once per run.
+        if (evidence.relatedOperationId && !settledOperationIds.has(evidence.relatedOperationId)) {
+          settledOperationIds.add(evidence.relatedOperationId);
+          await this.deferOperationIfUnresolved(evidence.relatedOperationId);
+        }
+      }
+    }
+    return relatedOperationIds;
+  }
+
+  /**
+   * Still `unmatched`, or its operation still `unknown`: wait for the backoff (issue #8). A row
+   * that resolved (no longer `pending`/`unmatched`, operation no longer `unknown`) keeps no retry
+   * state.
+   */
+  private async deferEvidenceIfStillCandidate(evidenceId: string): Promise<void> {
+    const fresh = await this.store.findEvidenceById(evidenceId);
+    if (!fresh || fresh.verificationStatus !== 'verified') {
+      return;
+    }
+    const related = fresh.relatedOperationId
+      ? await this.store.findOperationById(fresh.relatedOperationId)
+      : null;
+    if (fresh.processingStatus !== 'unmatched' && related?.status !== 'unknown') {
+      if (fresh.processingStatus !== 'pending' && hasRetryState(fresh)) {
+        await this.store.updateEvidence({ evidenceId, ...CLEARED_RETRY_STATE });
+      }
+      return;
+    }
+    await this.store.updateEvidence({
+      evidenceId,
+      ...nextRetryDeferral(fresh.attempts, this.retryPolicy),
+    });
+  }
+
+  /** Still `unknown` (or a `submitted` create without provider reference): wait for the backoff. */
+  private async deferOperationIfUnresolved(operationId: string): Promise<void> {
+    const fresh = await this.store.findOperationById(operationId);
+    if (!fresh) {
+      return;
+    }
+    if (
+      fresh.status !== 'unknown' &&
+      !(fresh.status === 'submitted' && !fresh.providerReferenceId)
+    ) {
+      await clearResolvedOperationRetryState(this.store, fresh);
+      return;
+    }
+    try {
+      await this.store.updateOperation({
+        operationId,
+        expectedVersion: fresh.version,
+        ...nextRetryDeferral(fresh.attempts, this.retryPolicy),
+      });
+    } catch (error) {
+      // Another writer moved the operation on; it is listed again by its new state.
+      if (
+        !(error instanceof PaymentReliabilityError) ||
+        error.code !== PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT
+      ) {
+        throw error;
+      }
+    }
+  }
+
+  /** `false` when no operation correlates (the row is foreign or not matchable yet). */
   private async reconcileEvidence(
     evidence: ProviderEvidenceRecord,
     result: ReconcileCounters,
-  ): Promise<void> {
+  ): Promise<boolean> {
     assertVerifiedEvidence(evidence.verificationStatus);
 
     const mappedFromEvent = evidence.eventType
@@ -214,9 +399,6 @@ export class ReconciliationService {
       : null;
     const mappedPayoutFromEvent = evidence.eventType
       ? mapPayoutWebhookEventToFinancialStatus(evidence.eventType)
-      : null;
-    const mappedSubscriptionFromEvent = evidence.eventType
-      ? mapSubscriptionWebhookEventToStatus(evidence.eventType)
       : null;
     const mappedPlanFromEvent = evidence.eventType
       ? mapPlanWebhookEventToStatus(evidence.eventType)
@@ -238,48 +420,28 @@ export class ReconciliationService {
         resultMessage: 'No operation correlated during reconciliation',
       });
       result.noOps += 1;
-      return;
+      return false;
+    }
+
+    if (operation.kind === 'subscription') {
+      await this.reconcileSubscriptionEvidence(evidence, operation, result);
+      return true;
+    }
+    if (isSubscriptionCommandKind(operation.kind)) {
+      await this.reconcileSubscriptionCommand(operation, result);
+      return true;
     }
 
     const providerOutcome = await this.lookupProviderOutcome(operation, evidence.resourceId);
-    const recognizedProviderSubscriptionStatus =
-      providerOutcome.subscriptionStatus && providerOutcome.subscriptionStatus !== 'unknown'
-        ? providerOutcome.subscriptionStatus
-        : null;
-    const subscriptionStatus = this.resolveReconciliationSubscriptionStatus(
-      operation,
-      mappedSubscriptionFromEvent,
-      providerOutcome.subscriptionStatus,
-    );
-    const subscriptionApplySource: SubscriptionStateApplySource | undefined =
-      mappedSubscriptionFromEvent || subscriptionStatus
-        ? recognizedProviderSubscriptionStatus
-          ? 'reconcile_provider'
-          : mappedSubscriptionFromEvent
-            ? 'reconcile_event'
-            : undefined
-        : undefined;
-    const subscriptionProviderStateTimestamp =
-      subscriptionApplySource === 'reconcile_event'
-        ? parseSubscriptionResourceStateTimestamp(evidence.rawPayload)
-        : null;
     const outcome: ReconciliationOutcome = {
       executionStatus:
         mappedFromEvent ??
         (mappedPayoutFromEvent
           ? payoutFinancialStatusToOperationStatus(mappedPayoutFromEvent)
-          : subscriptionStatus
-            ? subscriptionStatusToOperationStatus(subscriptionStatus)
-            : mappedPlanFromEvent
-              ? planStatusToOperationStatus(mappedPlanFromEvent)
-              : providerOutcome.executionStatus),
+          : mappedPlanFromEvent
+            ? planStatusToOperationStatus(mappedPlanFromEvent)
+            : providerOutcome.executionStatus),
       payoutStatus: mappedPayoutFromEvent ?? providerOutcome.payoutStatus,
-      subscriptionStatus,
-      subscriptionStartTime: providerOutcome.subscriptionStartTime,
-      subscriptionNextBillingTime: providerOutcome.subscriptionNextBillingTime,
-      subscriptionProviderPlanId: providerOutcome.subscriptionProviderPlanId,
-      subscriptionApplySource,
-      subscriptionProviderStateTimestamp,
       planStatus: mappedPlanFromEvent ?? providerOutcome.planStatus,
     };
 
@@ -292,15 +454,28 @@ export class ReconciliationService {
       result,
       providerReferenceId: evidence.resourceId ?? operation.providerReferenceId,
     });
+    return true;
   }
 
   private async reconcileOperation(
-    operation: PaymentOperation,
+    listed: PaymentOperation,
     result: ReconcileCounters,
   ): Promise<void> {
+    let operation = listed;
+    if (isSubscriptionCommandKind(operation.kind)) {
+      await this.reconcileSubscriptionCommand(operation, result);
+      return;
+    }
     const providerReferenceId = this.resolveProviderReferenceId(operation);
 
     if (!providerReferenceId) {
+      if (operation.status === 'submitted') {
+        const marked = await this.markStaleSubmittedUnknown(operation);
+        if (!marked) {
+          return;
+        }
+        operation = marked;
+      }
       const evidence = await this.insertReconciliationEvidence(operation, {
         resourceId: null,
         eventType: 'RECONCILIATION.MISSING_PROVIDER_REFERENCE',
@@ -313,6 +488,24 @@ export class ReconciliationService {
         resultMessage: 'Provider lookup cannot run without a stored provider id',
       });
       result.noOps += 1;
+      return;
+    }
+
+    if (operation.kind === 'subscription') {
+      const lookup = await this.lookupSubscription(operation, providerReferenceId);
+      const evidence = await this.insertReconciliationEvidence(operation, {
+        resourceId: providerReferenceId,
+        eventType: 'RECONCILIATION.PROVIDER_LOOKUP',
+      });
+      await this.applySubscriptionReconciliation({
+        evidence,
+        operation,
+        steps:
+          lookup.kind === 'found' ? [this.lookupStep(providerReferenceId, lookup.snapshot)] : [],
+        result,
+        planMismatchKey:
+          lookup.kind === 'found' ? lookupPlanMismatchKey(lookup.snapshot) : undefined,
+      });
       return;
     }
 
@@ -329,6 +522,35 @@ export class ReconciliationService {
       result,
       providerReferenceId,
     });
+  }
+
+  /**
+   * A `submitted` create without any provider id long after its claim: the worker died before it
+   * wrote the provider result (issue #12). Mark it `unknown` so the host's create retry (same
+   * provider request id) and the uncertain views pick it up. `null` when another writer moved it.
+   */
+  private async markStaleSubmittedUnknown(
+    operation: PaymentOperation,
+  ): Promise<PaymentOperation | null> {
+    try {
+      return await this.store.transitionOperation({
+        operationId: operation.operationId,
+        expectedVersion: operation.version,
+        nextStatus: 'unknown',
+        ...(operation.kind === 'subscription' ? { subscriptionStatus: 'unknown' as const } : {}),
+        failureCode: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
+        failureMessage: 'The provider call did not record a result',
+        reason: 'Reconciliation found a stale submitted operation without provider reference',
+      });
+    } catch (error) {
+      if (
+        error instanceof PaymentReliabilityError &&
+        error.code === PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT
+      ) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   private resolveProviderReferenceId(operation: PaymentOperation): string | null {
@@ -370,6 +592,9 @@ export class ReconciliationService {
       ? mapPayoutWebhookEventToFinancialStatus(evidence.eventType)
       : null;
     if (payoutKind) {
+      if (!hasPayoutStore(this.store)) {
+        return null;
+      }
       const correlation = await correlatePayoutOperation(this.store, {
         providerCode: evidence.providerCode,
         accountRef: evidence.accountRef,
@@ -382,21 +607,25 @@ export class ReconciliationService {
       return correlation?.operation ?? null;
     }
 
+    if (evidence.eventType && isSubscriptionEvidenceEvent(evidence.eventType)) {
+      // Sales carry the subscription id in `billing_agreement_id`, never in `resource.id`.
+      const event = normalizeSubscriptionEvidencePayload(
+        evidence.rawPayload,
+        evidence.providerEventId,
+      );
+      return event
+        ? this.store.findOperationByProviderSubscriptionId(
+            evidence.providerCode,
+            evidence.accountRef,
+            evidence.environment,
+            event.providerSubscriptionId,
+          )
+        : null;
+    }
+
     const resourceId = evidence.resourceId;
     if (!resourceId) {
       return null;
-    }
-
-    const subscriptionStatus = evidence.eventType
-      ? mapSubscriptionWebhookEventToStatus(evidence.eventType)
-      : null;
-    if (subscriptionStatus) {
-      return this.store.findOperationByProviderSubscriptionId(
-        evidence.providerCode,
-        evidence.accountRef,
-        evidence.environment,
-        resourceId,
-      );
     }
 
     const planStatus = evidence.eventType ? mapPlanWebhookEventToStatus(evidence.eventType) : null;
@@ -410,6 +639,9 @@ export class ReconciliationService {
     }
 
     if (evidence.eventType && isSellerOnboardingWebhookEvent(evidence.eventType)) {
+      if (!hasSellerStore(this.store)) {
+        return null;
+      }
       return this.store.findOperationByProviderReferralId(
         evidence.providerCode,
         evidence.accountRef,
@@ -424,22 +656,6 @@ export class ReconciliationService {
       evidence.environment,
       resourceId,
     );
-  }
-
-  private resolveReconciliationSubscriptionStatus(
-    operation: PaymentOperation,
-    fromEvent: SubscriptionStatus | null,
-    fromProvider: SubscriptionStatus | null | undefined,
-  ): SubscriptionStatus | null | undefined {
-    const stored = operation.subscriptionStatus ?? null;
-    if (fromProvider && fromProvider !== 'unknown') {
-      return fromProvider;
-    }
-    if (fromEvent) {
-      const current = stored ?? 'approval_pending';
-      return resolveSubscriptionStatusTransition(current, fromEvent);
-    }
-    return fromProvider ?? stored ?? null;
   }
 
   private async lookupProviderOutcome(
@@ -524,27 +740,6 @@ export class ReconciliationService {
         };
       }
 
-      if (
-        operation.kind === 'subscription' ||
-        operation.kind === 'subscription_cancel' ||
-        operation.kind === 'subscription_suspend' ||
-        operation.kind === 'subscription_activate'
-      ) {
-        const subscriptionId = operation.providerSubscriptionId ?? providerReferenceId;
-        const lookup = await this.providerLookup.getSubscription({
-          ...context,
-          providerSubscriptionId: subscriptionId,
-        });
-        return {
-          executionStatus: subscriptionStatusToOperationStatus(lookup.subscriptionStatus),
-          payoutStatus: null,
-          subscriptionStatus: lookup.subscriptionStatus,
-          subscriptionStartTime: lookup.startTime,
-          subscriptionNextBillingTime: lookup.nextBillingTime,
-          subscriptionProviderPlanId: lookup.providerPlanId,
-        };
-      }
-
       if (operation.kind === 'seller_referral') {
         const referralId = operation.providerReferralId ?? providerReferenceId;
         const lookup = await this.providerLookup.getReferral({
@@ -620,27 +815,14 @@ export class ReconciliationService {
       input;
 
     if (operation.kind === 'payout_batch' || operation.kind === 'payout_item') {
-      await this.applyPayoutReconciliationOutcome({
+      if (!hasPayoutStore(this.store)) {
+        await this.recordCapabilityNotConfigured(evidenceId, operation.operationId, result);
+        return;
+      }
+      await this.applyPayoutReconciliationOutcome(this.store, {
         evidenceId,
         eventType: eventType ?? null,
         rawPayload: rawPayload ?? '',
-        operation,
-        outcome,
-        result,
-        providerReferenceId,
-      });
-      return;
-    }
-
-    if (
-      operation.kind === 'subscription' ||
-      operation.kind === 'subscription_cancel' ||
-      operation.kind === 'subscription_suspend' ||
-      operation.kind === 'subscription_activate'
-    ) {
-      await this.applySubscriptionReconciliationOutcome({
-        evidenceId,
-        rawPayload,
         operation,
         outcome,
         result,
@@ -672,7 +854,11 @@ export class ReconciliationService {
     }
 
     if (operation.kind === 'marketplace_checkout' || operation.kind === 'marketplace_capture') {
-      await this.applyMarketplaceReconciliationOutcome({
+      if (!hasMarketplaceStore(this.store)) {
+        await this.recordCapabilityNotConfigured(evidenceId, operation.operationId, result);
+        return;
+      }
+      await this.applyMarketplaceReconciliationOutcome(this.store, {
         evidenceId,
         operation,
         outcome,
@@ -728,19 +914,245 @@ export class ReconciliationService {
     }
   }
 
-  private async applySubscriptionReconciliationOutcome(input: {
-    evidenceId: string;
-    rawPayload?: string;
+  /**
+   * Webhook evidence of a subscription: a payment event is reduced first (it records the payment),
+   * then the provider lookup as the current truth. Without a usable lookup a status event is
+   * reduced on its own, ordered by its resource time.
+   */
+  private async reconcileSubscriptionEvidence(
+    evidence: ProviderEvidenceRecord,
+    operation: PaymentOperation,
+    result: ReconcileCounters,
+  ): Promise<void> {
+    const event = normalizeSubscriptionEvidencePayload(
+      evidence.rawPayload,
+      evidence.providerEventId,
+    );
+    const steps: SubscriptionEventStep[] = [];
+    const isPayment =
+      event !== null &&
+      (event.resourceType === 'sale' || isSubscriptionPaymentEvidenceEvent(event.eventType));
+    if (event && isPayment) {
+      steps.push({
+        event,
+        options: {
+          source: 'webhook',
+          expectedPayment:
+            event.resourceType === 'sale'
+              ? await resolveExpectedSubscriptionPayment(this.store, operation)
+              : null,
+        },
+      });
+    }
+
+    // The subscription id comes from the operation, else from the event; never from a sale id.
+    const providerSubscriptionId =
+      operation.providerSubscriptionId ?? event?.providerSubscriptionId ?? null;
+    const lookup = providerSubscriptionId
+      ? await this.lookupSubscription(operation, providerSubscriptionId)
+      : ({ kind: 'unavailable' } as const);
+    if (lookup.kind === 'found' && providerSubscriptionId) {
+      steps.push(this.lookupStep(providerSubscriptionId, lookup.snapshot));
+    } else if (event && !isPayment) {
+      steps.push({ event, options: { source: 'webhook' } });
+    }
+
+    await this.applySubscriptionReconciliation({ evidence, operation, steps, result });
+  }
+
+  private lookupStep(
+    providerSubscriptionId: string,
+    snapshot: ExecuteGetSubscriptionResult,
+  ): SubscriptionEventStep {
+    return {
+      event: subscriptionEventFromProviderSnapshot(providerSubscriptionId, snapshot),
+      options: { source: 'lookup' },
+    };
+  }
+
+  /** A provider GET with a recognised status, or `unavailable` (failure, not found, unknown status). */
+  private async lookupSubscription(
+    operation: PaymentOperation,
+    providerSubscriptionId: string,
+  ): Promise<SubscriptionLookup> {
+    try {
+      const snapshot = await this.providerLookup.getSubscription({
+        providerCode: operation.providerCode,
+        accountRef: operation.accountRef,
+        applicationRef: operation.applicationRef,
+        environment: operation.environment,
+        providerSubscriptionId,
+      });
+      return snapshot.subscriptionStatus && snapshot.subscriptionStatus !== 'unknown'
+        ? { kind: 'found', snapshot }
+        : { kind: 'unavailable' };
+    } catch {
+      return { kind: 'unavailable' };
+    }
+  }
+
+  private async applySubscriptionReconciliation(input: {
+    evidence: ProviderEvidenceRecord;
     operation: PaymentOperation;
-    outcome: ReconciliationOutcome;
+    steps: SubscriptionEventStep[];
     result: ReconcileCounters;
-    providerReferenceId: string | null;
+    /** A lookup-only run gets a new evidence row each time: remember its mismatch by plan. */
+    planMismatchKey?: string | null;
   }): Promise<void> {
-    const { evidenceId, operation, outcome, result, providerReferenceId } = input;
-    const subscriptionStatus = outcome.subscriptionStatus;
-    if (!subscriptionStatus || subscriptionStatus === 'unknown') {
+    const { evidence, operation, steps, result } = input;
+    if (steps.length === 0) {
       await this.store.insertReconciliationAttempt({
-        evidenceId,
+        evidenceId: evidence.evidenceId,
+        operationId: operation.operationId,
+        outcome: 'retryable_failure',
+        resultCode: 'UNKNOWN_OUTCOME',
+        resultMessage: 'Subscription provider state remains unknown',
+      });
+      result.retryableFailures += 1;
+      return;
+    }
+
+    let applied: ApplySubscriptionEventsResult;
+    try {
+      applied = await applySubscriptionEvents(this.store, {
+        operation,
+        steps,
+        evidenceId: evidence.evidenceId,
+        planMismatchKey: input.planMismatchKey,
+        reason: 'Reconciliation applied subscription transition',
+        holdEffects: Boolean(this.hooks.onSubscriptionEffects),
+      });
+    } catch (error) {
+      await this.recordReconciliationFailure({
+        evidenceId: evidence.evidenceId,
+        operationId: operation.operationId,
+        result,
+        error,
+      });
+      return;
+    }
+    const delivered = await this.deliverSubscriptionEffects(evidence, applied);
+
+    if (applied.heldOverflow) {
+      await this.store.insertReconciliationAttempt({
+        evidenceId: evidence.evidenceId,
+        operationId: operation.operationId,
+        outcome: 'retryable_failure',
+        resultCode: HELD_EFFECTS_OVERFLOW,
+        resultMessage: 'Not applied: the subscription holds the maximum of undelivered effects',
+      });
+      result.retryableFailures += 1;
+      return;
+    }
+    if (applied.equalTimestampConflict) {
+      await this.store.insertReconciliationAttempt({
+        evidenceId: evidence.evidenceId,
+        operationId: operation.operationId,
+        outcome: 'retryable_failure',
+        resultCode: SUBSCRIPTION_STATE_CONFLICT_EQUAL_TIMESTAMP,
+        resultMessage: 'Status conflicts at the same provider state time; a lookup must settle it',
+      });
+      result.retryableFailures += 1;
+      return;
+    }
+    if (applied.planMismatch) {
+      await this.store.insertReconciliationAttempt({
+        evidenceId: evidence.evidenceId,
+        operationId: operation.operationId,
+        outcome: 'terminal_failure',
+        resultCode: PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
+        resultMessage: 'Provider subscription plan does not match the stored plan',
+      });
+      result.terminalFailures += 1;
+      return;
+    }
+    if (delivered) {
+      await this.store.updateEvidence({
+        evidenceId: evidence.evidenceId,
+        relatedOperationId: operation.operationId,
+        processingStatus: 'processed',
+        processedAt: new Date().toISOString(),
+      });
+    }
+    await this.store.insertReconciliationAttempt({
+      evidenceId: evidence.evidenceId,
+      operationId: operation.operationId,
+      outcome: 'applied',
+      resultCode: 'APPLIED',
+    });
+    result.applied += 1;
+  }
+
+  /**
+   * Hand the effects to the host hook. When it throws (or the effects cannot be held), the evidence
+   * row is left `pending` with the delivery code: held effects stay on the subscription operation
+   * and `PaymentRecoveryService` delivers them through the webhook service's hook.
+   */
+  private async deliverSubscriptionEffects(
+    evidence: ProviderEvidenceRecord,
+    applied: ApplySubscriptionEventsResult,
+  ): Promise<boolean> {
+    const delivery = await deliverSubscriptionEffects(this.store, this.hooks, applied, {
+      evidenceId: evidence.evidenceId,
+      eventType: evidence.eventType ?? 'RECONCILIATION.PROVIDER_LOOKUP',
+      source: 'reconciliation',
+    });
+    if (delivery.delivered) {
+      return true;
+    }
+    await this.store.updateEvidence({
+      evidenceId: evidence.evidenceId,
+      relatedOperationId: applied.operation.operationId,
+      processingStatus: 'pending',
+      errorCode: delivery.code,
+      errorMessage:
+        delivery.code === SUBSCRIPTION_EFFECTS_HOOK_FAILED
+          ? 'Subscription effects hook failed; the effects are delivered again on retry'
+          : 'Subscription effects were not delivered; the row is processed again on retry',
+      processedAt: null,
+    });
+    return false;
+  }
+
+  /**
+   * An uncertain cancel/suspend/activate command. The provider lookup is applied to the parent
+   * subscription operation (which holds the provider ids); the command itself only ends
+   * `succeeded` (the subscription reached the command's target status) or `failed`
+   * (`SUBSCRIPTION_COMMAND_NOT_APPLIED`). No provider id is ever written onto the command.
+   */
+  private async reconcileSubscriptionCommand(
+    operation: PaymentOperation,
+    result: ReconcileCounters,
+  ): Promise<void> {
+    const parentCandidate = operation.parentOperationId
+      ? await this.store.findOperationById(operation.parentOperationId)
+      : null;
+    const parent = parentCandidate?.kind === 'subscription' ? parentCandidate : null;
+    const providerSubscriptionId =
+      parent?.providerSubscriptionId ?? operation.providerSubscriptionId ?? null;
+
+    const evidence = await this.insertReconciliationEvidence(operation, {
+      resourceId: providerSubscriptionId,
+      eventType: providerSubscriptionId
+        ? 'RECONCILIATION.PROVIDER_LOOKUP'
+        : 'RECONCILIATION.MISSING_PROVIDER_REFERENCE',
+    });
+    if (!providerSubscriptionId) {
+      await this.store.insertReconciliationAttempt({
+        evidenceId: evidence.evidenceId,
+        operationId: operation.operationId,
+        outcome: 'no_op',
+        resultCode: 'MISSING_PROVIDER_REFERENCE',
+        resultMessage: 'Provider lookup cannot run without a stored provider id',
+      });
+      result.noOps += 1;
+      return;
+    }
+
+    const lookup = await this.lookupSubscription(operation, providerSubscriptionId);
+    if (lookup.kind !== 'found' || !isSubscriptionCommandKind(operation.kind)) {
+      await this.store.insertReconciliationAttempt({
+        evidenceId: evidence.evidenceId,
         operationId: operation.operationId,
         outcome: 'retryable_failure',
         resultCode: 'UNKNOWN_OUTCOME',
@@ -751,51 +1163,50 @@ export class ReconciliationService {
     }
 
     try {
-      assertSubscriptionProviderPlanSnapshotConsistent(operation, {
-        providerPlanId: outcome.subscriptionProviderPlanId,
+      let delivered = true;
+      if (parent) {
+        const applied = await applySubscriptionEvents(this.store, {
+          operation: parent,
+          steps: [this.lookupStep(providerSubscriptionId, lookup.snapshot)],
+          evidenceId: evidence.evidenceId,
+          planMismatchKey: lookupPlanMismatchKey(lookup.snapshot),
+          reason: 'Reconciliation applied subscription transition',
+          holdEffects: Boolean(this.hooks.onSubscriptionEffects),
+        });
+        delivered = await this.deliverSubscriptionEffects(evidence, applied);
+      }
+
+      const providerStatus = lookup.snapshot.subscriptionStatus;
+      const reached = providerStatus === SUBSCRIPTION_COMMAND_TARGET[operation.kind];
+      assertTransitionAllowed(operation.status, reached ? 'succeeded' : 'failed');
+      await this.store.transitionOperation({
+        operationId: operation.operationId,
+        expectedVersion: operation.version,
+        nextStatus: reached ? 'succeeded' : 'failed',
+        failureCode: reached ? null : SUBSCRIPTION_COMMAND_NOT_APPLIED,
+        failureMessage: reached
+          ? null
+          : `Provider subscription status is ${providerStatus} after the uncertain command`,
+        evidenceId: evidence.evidenceId,
+        reason: 'Reconciliation resolved subscription command',
       });
-      await applySubscriptionTransition(this.store, {
-        operation,
-        subscriptionStatus,
-        evidenceId,
-        reason: 'Reconciliation applied subscription transition',
-        providerReferenceId,
-        providerSubscriptionId: providerReferenceId ?? undefined,
-        applySource: outcome.subscriptionApplySource ?? 'reconcile_provider',
-        providerStateTimestamp:
-          (outcome.subscriptionApplySource ?? 'reconcile_provider') === 'reconcile_provider'
-            ? null
-            : (outcome.subscriptionProviderStateTimestamp ??
-              parseSubscriptionResourceStateTimestamp(input.rawPayload)),
-        ...reconciliationSubscriptionBillingFieldsFromOutcome(outcome),
-      });
-      await this.store.updateEvidence({
-        evidenceId,
-        relatedOperationId: operation.operationId,
-        processingStatus: 'processed',
-        processedAt: new Date().toISOString(),
-      });
+      if (delivered) {
+        await this.store.updateEvidence({
+          evidenceId: evidence.evidenceId,
+          processingStatus: 'processed',
+          processedAt: new Date().toISOString(),
+        });
+      }
       await this.store.insertReconciliationAttempt({
-        evidenceId,
+        evidenceId: evidence.evidenceId,
         operationId: operation.operationId,
         outcome: 'applied',
         resultCode: 'APPLIED',
       });
       result.applied += 1;
     } catch (error) {
-      if (isSubscriptionProviderPlanMismatchError(error)) {
-        await this.store.insertReconciliationAttempt({
-          evidenceId,
-          operationId: operation.operationId,
-          outcome: 'terminal_failure',
-          resultCode: PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
-          resultMessage: sanitizeOperationalErrorMessage(error, 'Subscription plan mismatch'),
-        });
-        result.terminalFailures += 1;
-        return;
-      }
       await this.recordReconciliationFailure({
-        evidenceId,
+        evidenceId: evidence.evidenceId,
         operationId: operation.operationId,
         result,
         error,
@@ -929,13 +1340,16 @@ export class ReconciliationService {
     }
   }
 
-  private async applyMarketplaceReconciliationOutcome(input: {
-    evidenceId: string;
-    operation: PaymentOperation;
-    outcome: ReconciliationOutcome;
-    result: ReconcileCounters;
-    providerReferenceId: string | null;
-  }): Promise<void> {
+  private async applyMarketplaceReconciliationOutcome(
+    store: ReconciliationServiceStore & MarketplaceStore,
+    input: {
+      evidenceId: string;
+      operation: PaymentOperation;
+      outcome: ReconciliationOutcome;
+      result: ReconcileCounters;
+      providerReferenceId: string | null;
+    },
+  ): Promise<void> {
     const { evidenceId, operation, outcome, result, providerReferenceId } = input;
     const checkoutOperationId =
       outcome.marketplaceCheckoutOperationId ??
@@ -970,7 +1384,7 @@ export class ReconciliationService {
 
     try {
       await applyMarketplaceUnitSnapshots({
-        store: this.store,
+        store,
         operationId: checkoutOperationId,
         snapshots: outcome.marketplaceUnits,
         preserveCaptured: true,
@@ -1009,15 +1423,18 @@ export class ReconciliationService {
     }
   }
 
-  private async applyPayoutReconciliationOutcome(input: {
-    evidenceId: string;
-    eventType: string | null;
-    rawPayload: string;
-    operation: PaymentOperation;
-    outcome: ReconciliationOutcome;
-    result: ReconcileCounters;
-    providerReferenceId: string | null;
-  }): Promise<void> {
+  private async applyPayoutReconciliationOutcome(
+    store: ReconciliationServiceStore & PayoutStore,
+    input: {
+      evidenceId: string;
+      eventType: string | null;
+      rawPayload: string;
+      operation: PaymentOperation;
+      outcome: ReconciliationOutcome;
+      result: ReconcileCounters;
+      providerReferenceId: string | null;
+    },
+  ): Promise<void> {
     const { evidenceId, eventType, rawPayload, operation, outcome, result, providerReferenceId } =
       input;
     const payoutStatus = outcome.payoutStatus;
@@ -1048,7 +1465,7 @@ export class ReconciliationService {
         };
 
     try {
-      await applyPayoutTransition(this.store, {
+      await applyPayoutTransition(store, {
         operation,
         payoutStatus,
         evidenceId,
@@ -1069,7 +1486,7 @@ export class ReconciliationService {
         const batch = await this.store.findOperationById(operation.parentOperationId);
         if (batch) {
           await refreshPayoutBatchAggregate(
-            this.store,
+            store,
             batch,
             evidenceId,
             'Derived payout batch aggregate after reconciliation',
@@ -1099,6 +1516,21 @@ export class ReconciliationService {
         error,
       });
     }
+  }
+
+  private async recordCapabilityNotConfigured(
+    evidenceId: string,
+    operationId: string,
+    result: ReconcileCounters,
+  ): Promise<void> {
+    await this.store.insertReconciliationAttempt({
+      evidenceId,
+      operationId,
+      outcome: 'no_op',
+      resultCode: CAPABILITY_NOT_CONFIGURED,
+      resultMessage: 'The store does not implement this operation family',
+    });
+    result.noOps += 1;
   }
 
   private async recordReconciliationFailure(input: {

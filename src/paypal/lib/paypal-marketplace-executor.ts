@@ -14,14 +14,23 @@ import {
 } from '../../contracts/index';
 import {
   assertCapabilityReady,
+  pathSegment,
   minorUnitsToMajorString,
   parsePurchaseUnitsFromOrderBody,
   type MarketplaceProviderPort,
   type ResolvedPaymentRuntime,
 } from '../../core/index';
+import {
+  resendWithFreshPaypalTokenOn401,
+  type PaypalAccessTokenScope,
+} from './paypal-access-token-retry';
 import type { PaypalCheckoutTokenProvider } from './paypal-checkout-executor';
 import { classifyPaypalMarketplaceCapture422 } from './paypal-marketplace-capture-policy';
-import type { PaypalOrdersHttpClient } from './paypal-orders-http-client';
+import type {
+  PaypalOrdersHttpClient,
+  PaypalOrdersHttpRequest,
+  PaypalOrdersHttpResponse,
+} from './paypal-orders-http-client';
 
 export type PaypalMarketplacePartnerConfig = {
   partnerAttributionId: string;
@@ -174,18 +183,25 @@ export class PaypalMarketplaceExecutor implements MarketplaceProviderPort {
     private readonly partnerConfig: PaypalMarketplacePartnerConfig,
   ) {}
 
+  private authorizedRequest(
+    scope: PaypalAccessTokenScope,
+    token: string,
+    request: Omit<PaypalOrdersHttpRequest, 'accessToken'>,
+  ): Promise<PaypalOrdersHttpResponse> {
+    return resendWithFreshPaypalTokenOn401(this.tokenProvider, scope, token, (accessToken) =>
+      this.httpClient.request({ ...request, accessToken }),
+    );
+  }
+
   async createOrder(
     input: ExecuteCreateMarketplaceOrderRequest,
   ): Promise<ExecuteCreateMarketplaceOrderResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
       path: `${baseUrl(input.environment)}/v2/checkout/orders`,
-      accessToken: token,
       attributionId: this.partnerConfig.partnerAttributionId,
       requestId: input.providerRequestId,
       body: {
@@ -220,14 +236,11 @@ export class PaypalMarketplaceExecutor implements MarketplaceProviderPort {
     input: ExecuteGetMarketplaceOrderRequest,
   ): Promise<ExecuteGetMarketplaceOrderResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl(input.environment)}/v2/checkout/orders/${input.providerOrderId}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v2/checkout/orders/${pathSegment(input.providerOrderId, 'providerOrderId')}`,
       attributionId: this.partnerConfig.partnerAttributionId,
     });
     if (response.status === 404) {
@@ -259,14 +272,11 @@ export class PaypalMarketplaceExecutor implements MarketplaceProviderPort {
     input: ExecuteCaptureMarketplaceOrderRequest,
   ): Promise<ExecuteCaptureMarketplaceOrderResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
-      path: `${baseUrl(input.environment)}/v2/checkout/orders/${input.providerOrderId}/capture`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v2/checkout/orders/${pathSegment(input.providerOrderId, 'providerOrderId')}/capture`,
       attributionId: this.partnerConfig.partnerAttributionId,
       requestId: input.providerRequestId,
       body: {},
@@ -318,10 +328,8 @@ export class PaypalMarketplaceExecutor implements MarketplaceProviderPort {
     input: ExecuteRefundMarketplaceUnitRequest,
   ): Promise<ExecuteRefundMarketplaceUnitResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
     const body: Record<string, unknown> = {};
     if (input.amount) {
       body['amount'] = {
@@ -344,10 +352,9 @@ export class PaypalMarketplaceExecutor implements MarketplaceProviderPort {
         ],
       };
     }
-    const response = await this.httpClient.request({
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'POST',
-      path: `${baseUrl(input.environment)}/v2/payments/captures/${input.providerCaptureId}/refund`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v2/payments/captures/${pathSegment(input.providerCaptureId, 'providerCaptureId')}/refund`,
       attributionId: this.partnerConfig.partnerAttributionId,
       requestId: input.providerRequestId,
       body: Object.keys(body).length > 0 ? body : undefined,
@@ -390,14 +397,11 @@ export class PaypalMarketplaceExecutor implements MarketplaceProviderPort {
 
   async getRefund(input: ExecuteGetRefundRequest): Promise<ExecuteGetRefundResult> {
     assertCapabilityReady(this.runtime.descriptor.capabilities, 'marketplace_checkout');
-    const token = await this.tokenProvider({
-      accountRef: input.accountRef,
-      environment: input.environment,
-    });
-    const response = await this.httpClient.request({
+    const tokenScope = { accountRef: input.accountRef, environment: input.environment };
+    const token = await this.tokenProvider(tokenScope);
+    const response = await this.authorizedRequest(tokenScope, token, {
       method: 'GET',
-      path: `${baseUrl(input.environment)}/v2/payments/refunds/${input.providerRefundId}`,
-      accessToken: token,
+      path: `${baseUrl(input.environment)}/v2/payments/refunds/${pathSegment(input.providerRefundId, 'providerRefundId')}`,
       attributionId: this.partnerConfig.partnerAttributionId,
     });
     if (response.status === 404) {

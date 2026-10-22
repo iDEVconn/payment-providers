@@ -1,5 +1,6 @@
 import {
   formatConfigurationIssue,
+  PaymentConfigurationError,
   requireApplicationRef,
 } from './payment-configuration-error';
 import type {
@@ -32,6 +33,12 @@ export type ResolvePaymentRuntimeInput = {
   config: PaymentProviderConfig;
   nodeEnv?: string;
   executionStatus?: PaymentExecutionStatus;
+  /**
+   * Production normally refuses a reject-only runtime (missing credentials, unconfigured or
+   * simulated execution) so a misconfigured deployment cannot boot "healthy". Set this only for a
+   * deployment that intentionally runs without payments. Forbidden/conflicting modes still throw.
+   */
+  allowRejectOnlyInProduction?: boolean;
 };
 
 function resolveContext(config: PaymentProviderConfig): PaymentAccountContext {
@@ -84,6 +91,19 @@ function forceFakeCapabilityReadiness(
   );
 }
 
+/**
+ * The documented network kill switch: a configured live/sandbox status with provider calls turned
+ * off. It is an intentional, temporary state, so production does not throw for it; PayPal calls are
+ * rejected and webhooks are stored pending (`verification_unavailable`) until it is lifted.
+ */
+export function isProviderCallsKillSwitch(status: PaymentExecutionStatus | undefined): boolean {
+  return (
+    status?.runtimeState === 'configured' &&
+    status.executionMode !== 'simulation' &&
+    !status.providerCallsEnabled
+  );
+}
+
 function executionRequiresRejectOnly(status: PaymentExecutionStatus | undefined): boolean {
   if (!status) {
     return false;
@@ -105,6 +125,7 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
   const descriptor: PaymentProviderDescriptor = { ...context, capabilities };
   const executionStatus = input.executionStatus;
   const isProduction = input.nodeEnv === 'production';
+  const refuseRejectOnly = isProduction && input.allowRejectOnlyInProduction !== true;
 
   if (
     executionStatus?.runtimeState === 'forbidden' ||
@@ -115,7 +136,10 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
       missingFields: executionStatus.issues.map((row) => row.code),
     });
     if (isProduction || executionStatus.deploymentEnvironment === 'live') {
-      throw new Error(banner);
+      throw new PaymentConfigurationError(banner, [
+        'executionStatus.runtimeState',
+        ...executionStatus.issues.map((row) => row.code),
+      ]);
     }
     return {
       mode: 'fake',
@@ -136,6 +160,17 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
             missingFields: executionStatus?.issues.map((row) => row.code) ?? [],
           })
         : undefined;
+    if (refuseRejectOnly && !isProviderCallsKillSwitch(executionStatus)) {
+      const missingFields = rejectOnlyExecutionFields(executionStatus);
+      throw new PaymentConfigurationError(
+        banner ??
+          formatConfigurationIssue({
+            headline: 'Payment execution rejects provider calls; production requires live execution',
+            missingFields,
+          }),
+        missingFields,
+      );
+    }
     return {
       mode: 'fake',
       context,
@@ -147,12 +182,22 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
     };
   }
 
+  const clientId = config.credentials?.clientId?.trim();
+  const clientSecret = config.credentials?.clientSecret?.trim();
+  const missingCredentialFields = missingCheckoutCredentialFields(clientId, clientSecret);
+
+  // A configured executionStatus never stands in for credentials (the kill switch returned above).
+  if (refuseRejectOnly && missingCredentialFields.length > 0) {
+    throw productionCredentialsError(
+      providerCode,
+      executionStatus ? missingCredentialFields : [...missingCredentialFields, 'executionStatus'],
+    );
+  }
+
   if (!checkoutEnabled(config)) {
     return { mode: 'live-provider', context, descriptor };
   }
 
-  const clientId = config.credentials?.clientId?.trim();
-  const clientSecret = config.credentials?.clientSecret?.trim();
   if (clientId && clientSecret) {
     return {
       mode: 'live-provider',
@@ -167,6 +212,10 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
     };
   }
 
+  if (refuseRejectOnly) {
+    throw productionCredentialsError(providerCode, missingCredentialFields);
+  }
+
   const banner = buildConfigBanner(providerCode, [...CHECKOUT_CREDENTIAL_FIELDS]);
   return {
     mode: 'fake',
@@ -177,6 +226,45 @@ export function resolvePaymentRuntime(input: ResolvePaymentRuntimeInput): Resolv
     },
     configBanner: banner,
   };
+}
+
+function rejectOnlyExecutionFields(status: PaymentExecutionStatus | undefined): string[] {
+  const fields: string[] = [];
+  if (status?.runtimeState !== 'configured') {
+    fields.push('executionStatus.runtimeState');
+  }
+  if (!status?.providerCallsEnabled) {
+    fields.push('executionStatus.providerCallsEnabled');
+  }
+  return [...fields, ...(status?.issues.map((row) => row.code) ?? [])];
+}
+
+function missingCheckoutCredentialFields(
+  clientId: string | undefined,
+  clientSecret: string | undefined,
+): string[] {
+  const fields: string[] = [];
+  if (!clientId) {
+    fields.push('credentials.clientId');
+  }
+  if (!clientSecret) {
+    fields.push('credentials.clientSecret');
+  }
+  return fields;
+}
+
+/** Production never boots reject-only: missing setting names are listed, values never are. */
+function productionCredentialsError(
+  providerCode: string,
+  missingFields: string[],
+): PaymentConfigurationError {
+  return new PaymentConfigurationError(
+    formatConfigurationIssue({
+      headline: `Payment provider "${providerCode}" is not configured for production`,
+      missingFields,
+    }),
+    missingFields,
+  );
 }
 
 function reinforceMissingCredentialReadiness(

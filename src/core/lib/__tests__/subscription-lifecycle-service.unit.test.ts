@@ -229,7 +229,14 @@ describe('SubscriptionLifecycleService', () => {
 
   it('copies billing-plan offeringRef onto the canonical subscription operation', async () => {
     const store = new MemoryPaymentReliabilityStore();
-    const service = new SubscriptionLifecycleService(store, provider);
+    const service = new SubscriptionLifecycleService(store, {
+      ...provider,
+      getPlan: async (input) => ({
+        providerPlanId: input.providerPlanId,
+        providerProductId: 'PROD-1',
+        planStatus: 'active',
+      }),
+    });
     const scope = buildOperationIdempotencyScope({
       applicationRef: 'test-app',
       accountRef: 'default',
@@ -498,16 +505,14 @@ describe('SubscriptionLifecycleService', () => {
     const cancelCommand = commandOps.find((op) => op.kind === 'subscription_cancel');
     expect(cancelCommand?.status).toBe('succeeded');
 
-    expect(result.subscriptionStateRefreshErrorCode).toBe(
-      PAYMENT_RELIABILITY_ERROR.SUBSCRIPTION_PLAN_MISMATCH,
-    );
-    expect(result.subscriptionStatus).toBe(before?.subscriptionStatus);
+    // T6a fix wave (review finding 1): the reducer rule, a cancellation on another plan applies;
+    // the plan mismatch is reported to the hook and the stored plan is kept.
+    expect(result.subscriptionStatus).toBe('cancelled');
     expect(result.providerPlanId).toBe(before?.providerPlanId);
 
     const after = await store.findOperationById(created.subscriptionOperationId);
     expect(after?.providerPlanId).toBe(before?.providerPlanId);
-    expect(after?.subscriptionStatus).toBe(before?.subscriptionStatus);
-    expect(after?.startTime).toBe(before?.startTime);
+    expect(after?.subscriptionStatus).toBe('cancelled');
   });
 
   it('returns refresh pending when provider POST succeeds but GET refresh does not', async () => {
@@ -688,7 +693,7 @@ describe('SubscriptionLifecycleService', () => {
     });
 
     const persistSpy = vi
-      .spyOn(subscriptionEvidence, 'applySubscriptionDomainUpdate')
+      .spyOn(subscriptionEvidence, 'applySubscriptionEvents')
       .mockRejectedValueOnce(
         new PaymentReliabilityError(
           PAYMENT_RELIABILITY_ERROR.PERSISTENCE_FAILURE,

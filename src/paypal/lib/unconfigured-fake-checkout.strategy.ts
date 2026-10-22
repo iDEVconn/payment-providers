@@ -4,7 +4,7 @@ import type {
   OrderResult,
   PaymentStrategy,
   RequestOptions,
-} from '@idevconn/payment';
+} from '../../contracts/lib/legacy-checkout';
 import { PAYMENT_CAPABILITY_UNAVAILABLE, PAYMENT_CAUSE_CODE } from '../../contracts/index';
 
 export class UnconfiguredFakeCheckoutStrategy implements PaymentStrategy {

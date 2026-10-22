@@ -26,6 +26,7 @@ import {
 import { buildOperationIdempotencyScope } from './operation-idempotency';
 import type { CheckoutProviderPort } from './checkout-provider-port';
 import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
+import { resolveFirstProviderExecutionAt } from './provider-execution-transition';
 import {
   isTerminalPreProviderFailureCode,
   resolveProviderFailure,
@@ -373,8 +374,6 @@ export type CheckoutCreateRetryOptions = {
     firstProviderExecutionAt: string | null,
   ) => CheckoutProviderCreateRetryEligibility;
 };
-
-const CHECKOUT_CLAIMED_FOR_EXECUTION_REASON = 'Claimed for provider execution';
 
 export class CheckoutLifecycleService {
   constructor(
@@ -1119,14 +1118,7 @@ export class CheckoutLifecycleService {
   private async resolveFirstCheckoutProviderExecutionAt(
     operationId: string,
   ): Promise<string | null> {
-    const transitions = await this.store.listOperationTransitions(operationId);
-    const executionTransitions = transitions
-      .filter(
-        (row) =>
-          row.toStatus === 'submitted' && row.reason === CHECKOUT_CLAIMED_FOR_EXECUTION_REASON,
-      )
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-    return executionTransitions[0]?.createdAt ?? null;
+    return resolveFirstProviderExecutionAt(await this.store.listOperationTransitions(operationId));
   }
 
   private async toCheckoutCreateRetryBlockedResult(

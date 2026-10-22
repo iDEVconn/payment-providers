@@ -1,0 +1,4655 @@
+diff --color -ruN .superpowers/snap-after-t4/src/contracts/lib/evidence.ts src/contracts/lib/evidence.ts
+--- .superpowers/snap-after-t4/src/contracts/lib/evidence.ts	2026-10-22 12:57:32.043165483 +0300
++++ src/contracts/lib/evidence.ts	2026-10-22 13:27:10.441835784 +0300
+@@ -11,7 +11,12 @@
+   | 'unsupported'
+   | 'failed';
+ 
+-export type ConsumerDeliveryStatus = 'pending' | 'confirmed' | 'failed';
++/**
++ * Consumer delivery of a processed event. `failed` is retried by recovery; `failed_terminal` means
++ * the attempt cap was reached and recovery no longer delivers the row (a host may reset it to
++ * `failed` to retry).
++ */
++export type ConsumerDeliveryStatus = 'pending' | 'confirmed' | 'failed' | 'failed_terminal';
+ 
+ export type ProviderEvidence = {
+   evidenceId: string;
+@@ -33,8 +38,14 @@
+   claimLeaseExpiresAt: string | null;
+   claimWorkerId: string | null;
+   processedAt: string | null;
++  /*
++   * Consumer delivery fields. A store MUST persist all four and return them as written: a row
++   * read back without `consumerDeliveryStatus` counts as delivered (legacy rows), so a store that
++   * drops them silently skips every consumer delivery (issue #24).
++   */
+   consumerDeliveryStatus?: ConsumerDeliveryStatus;
+   consumerDeliveredAt?: string | null;
++  /** Failed delivery attempts so far; recovery stops at `maxConsumerDeliveryAttempts`. */
+   consumerDeliveryAttempts?: number;
+   consumerDeliveryLastError?: string | null;
+   createdAt: string;
+diff --color -ruN .superpowers/snap-after-t4/src/contracts/lib/operations.ts src/contracts/lib/operations.ts
+--- .superpowers/snap-after-t4/src/contracts/lib/operations.ts	2026-10-22 12:57:32.043471647 +0300
++++ src/contracts/lib/operations.ts	2026-10-22 13:27:10.441597813 +0300
+@@ -176,7 +176,13 @@
+   executionLeaseExpiresAt?: string | null;
+   executionOwnerToken?: string | null;
+   expectedExecutionOwnerToken?: string | null;
++  /** Free text for people; never read by the services (issue #23). */
+   reason: string;
++  /**
++   * Typed marker of a claim transition. Stores persist it on the history row as given (`null`
++   * when absent); services identify claims by it, never by `reason`.
++   */
++  transitionKind?: OperationTransitionKind | null;
+ };
+ 
+ export type UpdatePaymentOperationInput = {
+@@ -219,6 +225,18 @@
+   providerReferralId?: string | null;
+ };
+ 
++/**
++ * Kind of a claim transition: `claim_execution` is the first claim of a `prepared` operation for a
++ * provider call (`claimOperationForExecution`, or a create execution lease taken from `prepared`);
++ * `claim_retry` is a create execution lease taken from `unknown` or a stale `submitted`.
++ */
++export type OperationTransitionKind = 'claim_execution' | 'claim_retry';
++
++export const OPERATION_TRANSITION_KIND = {
++  CLAIM_EXECUTION: 'claim_execution',
++  CLAIM_RETRY: 'claim_retry',
++} as const satisfies Record<string, OperationTransitionKind>;
++
+ export type PaymentOperationTransitionRecord = {
+   transitionId: string;
+   operationId: string;
+@@ -226,5 +244,7 @@
+   toStatus: PaymentOperationStatus;
+   evidenceId: string | null;
+   reason: string;
++  /** Absent or `null` for ordinary transitions and for rows written before 0.3. */
++  transitionKind?: OperationTransitionKind | null;
+   createdAt: string;
+ };
+diff --color -ruN .superpowers/snap-after-t4/src/contracts/lib/recovery.ts src/contracts/lib/recovery.ts
+--- .superpowers/snap-after-t4/src/contracts/lib/recovery.ts	2026-10-22 12:57:32.043600906 +0300
++++ src/contracts/lib/recovery.ts	2026-10-22 13:27:10.441938723 +0300
+@@ -8,6 +8,12 @@
+   environment?: PaymentEnvironment;
+   providerCode?: string;
+   accountRef?: string;
++  /**
++   * When `false`, rows whose only remaining work is consumer delivery (verified, processed,
++   * delivery not confirmed) are not claimed. Default `true`. Recovery passes `false` when no
++   * consumer is configured.
++   */
++  includeConsumerDelivery?: boolean;
+ };
+ 
+ export type RecoverPaymentReliabilityInput = {
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/checkout-lifecycle-service.ts src/core/lib/checkout-lifecycle-service.ts
+--- .superpowers/snap-after-t4/src/core/lib/checkout-lifecycle-service.ts	2026-10-22 12:57:32.046899181 +0300
++++ src/core/lib/checkout-lifecycle-service.ts	2026-10-22 13:28:26.948274418 +0300
+@@ -26,6 +26,7 @@
+ import { buildOperationIdempotencyScope } from './operation-idempotency';
+ import type { CheckoutProviderPort } from './checkout-provider-port';
+ import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import { resolveFirstProviderExecutionAt } from './provider-execution-transition';
+ import {
+   isTerminalPreProviderFailureCode,
+   resolveProviderFailure,
+@@ -374,8 +375,6 @@
+   ) => CheckoutProviderCreateRetryEligibility;
+ };
+ 
+-const CHECKOUT_CLAIMED_FOR_EXECUTION_REASON = 'Claimed for provider execution';
+-
+ export class CheckoutLifecycleService {
+   constructor(
+     private readonly store: PaymentReliabilityStore,
+@@ -1119,14 +1118,7 @@
+   private async resolveFirstCheckoutProviderExecutionAt(
+     operationId: string,
+   ): Promise<string | null> {
+-    const transitions = await this.store.listOperationTransitions(operationId);
+-    const executionTransitions = transitions
+-      .filter(
+-        (row) =>
+-          row.toStatus === 'submitted' && row.reason === CHECKOUT_CLAIMED_FOR_EXECUTION_REASON,
+-      )
+-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+-    return executionTransitions[0]?.createdAt ?? null;
++    return resolveFirstProviderExecutionAt(await this.store.listOperationTransitions(operationId));
+   }
+ 
+   private async toCheckoutCreateRetryBlockedResult(
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/marketplace-evidence-application.ts src/core/lib/marketplace-evidence-application.ts
+--- .superpowers/snap-after-t4/src/core/lib/marketplace-evidence-application.ts	2026-10-22 12:57:32.047030078 +0300
++++ src/core/lib/marketplace-evidence-application.ts	2026-10-22 13:27:10.447025473 +0300
+@@ -8,7 +8,7 @@
+   deriveMarketplaceOrderStatusFromUnits,
+   mapPaypalOrderStatusToMarketplace,
+ } from './marketplace-transition-policy';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type { MarketplaceStore } from './persistence/payment-reliability-store';
+ 
+ function mapCaptureStatus(status: string | undefined): MarketplaceUnitStatus {
+   switch (status) {
+@@ -117,7 +117,7 @@
+ }
+ 
+ export async function applyMarketplaceUnitSnapshots(input: {
+-  store: PaymentReliabilityStore;
++  store: MarketplaceStore;
+   operationId: string;
+   snapshots: ExecuteMarketplaceUnitSnapshot[];
+   preserveCaptured: boolean;
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/payment-event-consumer.ts src/core/lib/payment-event-consumer.ts
+--- .superpowers/snap-after-t4/src/core/lib/payment-event-consumer.ts	2026-10-22 12:57:32.047372747 +0300
++++ src/core/lib/payment-event-consumer.ts	2026-10-22 13:28:27.233273576 +0300
+@@ -1,5 +1,9 @@
+ import type { ProviderEvidenceRecord } from '../../contracts/index';
+ 
++/**
++ * What a consumer receives: the evidence identity and outcome, without the stored row internals.
++ * `rawPayload` (the provider body) is present only when the host sets `includeRawPayload`.
++ */
+ export type VerifiedProcessedPaymentEvent = Pick<
+   ProviderEvidenceRecord,
+   | 'evidenceId'
+@@ -7,13 +11,42 @@
+   | 'accountRef'
+   | 'applicationRef'
+   | 'environment'
++  | 'providerEventId'
+   | 'eventType'
+   | 'resourceId'
+   | 'relatedOperationId'
+   | 'processingStatus'
+   | 'verificationStatus'
+->;
++> & {
++  rawPayload?: string;
++};
+ 
++/**
++ * Delivery is at-least-once: an event can arrive again after a failed acknowledgement write or a
++ * lost lease, so `deliver` must be idempotent (dedupe on `providerEventId`). Throwing counts as a
++ * failed attempt; after `maxConsumerDeliveryAttempts` the row is `failed_terminal`.
++ */
+ export interface PaymentEventConsumer {
+   deliver(event: VerifiedProcessedPaymentEvent): Promise<void>;
+ }
++
++/** Builds the narrowed consumer event from a stored evidence row. */
++export function toVerifiedProcessedPaymentEvent(
++  evidence: ProviderEvidenceRecord,
++  options: { includeRawPayload?: boolean } = {},
++): VerifiedProcessedPaymentEvent {
++  return {
++    evidenceId: evidence.evidenceId,
++    providerCode: evidence.providerCode,
++    accountRef: evidence.accountRef,
++    applicationRef: evidence.applicationRef,
++    environment: evidence.environment,
++    providerEventId: evidence.providerEventId,
++    eventType: evidence.eventType,
++    resourceId: evidence.resourceId,
++    relatedOperationId: evidence.relatedOperationId,
++    processingStatus: evidence.processingStatus,
++    verificationStatus: evidence.verificationStatus,
++    ...(options.includeRawPayload ? { rawPayload: evidence.rawPayload } : {}),
++  };
++}
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/payment-recovery-service.ts src/core/lib/payment-recovery-service.ts
+--- .superpowers/snap-after-t4/src/core/lib/payment-recovery-service.ts	2026-10-22 12:57:32.047523642 +0300
++++ src/core/lib/payment-recovery-service.ts	2026-10-22 13:28:26.734275050 +0300
+@@ -7,23 +7,53 @@
+   type RecoverPaymentReliabilityInput,
+   type RecoverPaymentReliabilityResult,
+ } from '../../contracts/index';
++import { PaymentConfigurationError } from './payment-configuration-error';
+ import { sanitizeOperationalErrorMessage } from './public-error-sanitizer';
+ import { isConsumerDeliveryComplete } from './webhook-evidence-resume';
+ 
+ const CONSUMER_DELIVERY_FAILURE_MESSAGE = 'Consumer event delivery failed';
+ export { isRecoverableEvidenceRow } from './webhook-evidence-resume';
+-import type { PaymentEventConsumer } from './payment-event-consumer';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import {
++  toVerifiedProcessedPaymentEvent,
++  type PaymentEventConsumer,
++} from './payment-event-consumer';
++import type { EvidenceStore } from './persistence/payment-reliability-store';
+ import type { WebhookProcessingService } from './webhook-processing-service';
+ 
++/** Failed consumer deliveries per evidence row before it becomes `failed_terminal`. */
++export const DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS = 10;
++
+ export type PaymentRecoveryDependencies = {
+-  store: PaymentReliabilityStore;
++  store: EvidenceStore;
+   webhookProcessing: WebhookProcessingService;
++  /**
++   * Receives each processed event at least once (a failed acknowledgement write delivers it again),
++   * so it must be idempotent on `providerEventId`. `null`: rows are processed but never claimed for
++   * delivery; their delivery stays `pending`.
++   */
+   consumer: PaymentEventConsumer | null;
++  /**
++   * Failed deliveries after which a row gets `consumerDeliveryStatus: 'failed_terminal'` and is no
++   * longer claimed. Default `DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS`; must be an integer >= 1.
++   */
++  maxConsumerDeliveryAttempts?: number;
++  /** Pass the stored raw provider body to the consumer as `rawPayload`. Default false. */
++  includeRawPayload?: boolean;
+ };
+ 
+ export class PaymentRecoveryService {
+-  constructor(private readonly deps: PaymentRecoveryDependencies) {}
++  private readonly maxConsumerDeliveryAttempts: number;
++
++  constructor(private readonly deps: PaymentRecoveryDependencies) {
++    const max = deps.maxConsumerDeliveryAttempts ?? DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS;
++    if (!Number.isInteger(max) || max < 1) {
++      throw new PaymentConfigurationError(
++        'Payment recovery option maxConsumerDeliveryAttempts must be an integer of at least 1',
++        ['maxConsumerDeliveryAttempts'],
++      );
++    }
++    this.maxConsumerDeliveryAttempts = max;
++  }
+ 
+   async recover(input: RecoverPaymentReliabilityInput): Promise<RecoverPaymentReliabilityResult> {
+     const limit = input.limit ?? 25;
+@@ -38,6 +68,7 @@
+       environment: input.environment,
+       providerCode: input.providerCode,
+       accountRef: input.accountRef,
++      includeConsumerDelivery: this.deps.consumer !== null,
+     });
+ 
+     return this.executeRecoveryBatch(claimed);
+@@ -122,10 +153,9 @@
+     if (
+       evidence.verificationStatus === 'verified' &&
+       evidence.processingStatus === 'processed' &&
+-      evidence.consumerDeliveryStatus !== 'confirmed'
++      !isConsumerDeliveryComplete(evidence)
+     ) {
+-      await this.tryDeliverConsumer(evidence.evidenceId);
+-      return 'delivered';
++      return (await this.tryDeliverConsumer(evidence.evidenceId)) ? 'delivered' : 'skipped';
+     }
+ 
+     if (evidence.processingStatus === 'unmatched') {
+@@ -153,9 +183,10 @@
+     }
+   }
+ 
+-  private async tryDeliverConsumer(evidenceId: string): Promise<void> {
++  /** Delivers once; `true` only when the consumer received the event and it was acknowledged. */
++  private async tryDeliverConsumer(evidenceId: string): Promise<boolean> {
+     if (!this.deps.consumer) {
+-      return;
++      return false;
+     }
+     const fresh = await this.deps.store.findEvidenceById(evidenceId);
+     if (
+@@ -163,26 +194,39 @@
+       fresh.verificationStatus !== 'verified' ||
+       fresh.processingStatus !== 'processed'
+     ) {
+-      return;
++      return false;
+     }
+     if (isConsumerDeliveryComplete(fresh)) {
+-      return;
++      return false;
++    }
++    const attempts = fresh.consumerDeliveryAttempts ?? 0;
++    if (attempts >= this.maxConsumerDeliveryAttempts) {
++      await this.deps.store.updateEvidence({
++        evidenceId,
++        consumerDeliveryStatus: 'failed_terminal',
++      });
++      return false;
+     }
+ 
+     try {
+-      await this.deps.consumer.deliver(fresh);
++      await this.deps.consumer.deliver(
++        toVerifiedProcessedPaymentEvent(fresh, { includeRawPayload: this.deps.includeRawPayload }),
++      );
+       await this.deps.store.updateEvidence({
+         evidenceId,
+         consumerDeliveryStatus: 'confirmed',
+         consumerDeliveredAt: new Date().toISOString(),
+         consumerDeliveryLastError: null,
+       });
++      return true;
+     } catch (error) {
+       sanitizeOperationalErrorMessage(error, CONSUMER_DELIVERY_FAILURE_MESSAGE);
++      const failedAttempts = attempts + 1;
+       await this.deps.store.updateEvidence({
+         evidenceId,
+-        consumerDeliveryStatus: 'failed',
+-        consumerDeliveryAttempts: (fresh.consumerDeliveryAttempts ?? 0) + 1,
++        consumerDeliveryStatus:
++          failedAttempts >= this.maxConsumerDeliveryAttempts ? 'failed_terminal' : 'failed',
++        consumerDeliveryAttempts: failedAttempts,
+         consumerDeliveryLastError: CONSUMER_DELIVERY_FAILURE_MESSAGE,
+       });
+       throw new PaymentReliabilityError(
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/payout-evidence-application.ts src/core/lib/payout-evidence-application.ts
+--- .superpowers/snap-after-t4/src/core/lib/payout-evidence-application.ts	2026-10-22 12:57:32.047555289 +0300
++++ src/core/lib/payout-evidence-application.ts	2026-10-22 13:28:27.060274087 +0300
+@@ -4,7 +4,7 @@
+   deriveBatchPayoutStatus,
+   payoutFinancialStatusToOperationStatus,
+ } from './payout-transition-policy';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type { OperationStore, PayoutStore } from './persistence/payment-reliability-store';
+ import { assertTransitionAllowed } from './transition-policy';
+ import { persistValidatedPayoutProviderIds } from './payout-webhook-correlation';
+ 
+@@ -50,7 +50,7 @@
+ }
+ 
+ export async function applyPayoutTransition(
+-  store: PaymentReliabilityStore,
++  store: OperationStore & PayoutStore,
+   input: ApplyPayoutTransitionInput,
+ ): Promise<ApplyPayoutTransitionResult> {
+   const { operation, payoutStatus } = input;
+@@ -105,7 +105,7 @@
+ }
+ 
+ export async function refreshPayoutBatchAggregate(
+-  store: PaymentReliabilityStore,
++  store: OperationStore & PayoutStore,
+   batch: PaymentOperation,
+   evidenceId?: string | null,
+   reason = 'Derived payout batch aggregate status',
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/payout-webhook-correlation.ts src/core/lib/payout-webhook-correlation.ts
+--- .superpowers/snap-after-t4/src/core/lib/payout-webhook-correlation.ts	2026-10-22 12:57:32.047704259 +0300
++++ src/core/lib/payout-webhook-correlation.ts	2026-10-22 13:28:27.089274001 +0300
+@@ -2,7 +2,7 @@
+ import { majorUnitsToMinorString } from './money';
+ import type { PayoutFinancialStatus } from '../../contracts/index';
+ import { mapPayoutWebhookEventToOperationKind } from './payout-transition-policy';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type { OperationStore, PayoutStore } from './persistence/payment-reliability-store';
+ 
+ export type ParsedPaypalPayoutWebhook = {
+   payoutScope: 'payout_batch' | 'payout_item';
+@@ -141,7 +141,7 @@
+ }
+ 
+ export async function validatePayoutEvidenceMatch(
+-  store: PaymentReliabilityStore,
++  store: OperationStore & PayoutStore,
+   operation: PaymentOperation,
+   parsed: ParsedPaypalPayoutWebhook,
+   evidence: Pick<PayoutEvidenceCorrelationContext, 'applicationRef'>,
+@@ -218,7 +218,7 @@
+ }
+ 
+ async function findPrimaryPayoutOperation(
+-  store: PaymentReliabilityStore,
++  store: OperationStore & PayoutStore,
+   context: Pick<PayoutEvidenceCorrelationContext, 'providerCode' | 'accountRef' | 'environment'>,
+   parsed: ParsedPaypalPayoutWebhook,
+ ): Promise<PaymentOperation | null> {
+@@ -242,7 +242,7 @@
+ }
+ 
+ async function findFallbackPayoutOperation(
+-  store: PaymentReliabilityStore,
++  store: OperationStore & PayoutStore,
+   context: Pick<PayoutEvidenceCorrelationContext, 'providerCode' | 'accountRef' | 'environment'>,
+   parsed: ParsedPaypalPayoutWebhook,
+ ): Promise<PaymentOperation | null> {
+@@ -266,7 +266,7 @@
+ }
+ 
+ export async function correlatePayoutOperation(
+-  store: PaymentReliabilityStore,
++  store: OperationStore & PayoutStore,
+   evidence: PayoutEvidenceCorrelationContext,
+ ): Promise<PayoutCorrelationResult | null> {
+   const parsed = parsePaypalPayoutWebhookPayload(evidence.rawPayload, evidence.eventType);
+@@ -312,7 +312,7 @@
+ };
+ 
+ export async function persistValidatedPayoutProviderIds(
+-  store: PaymentReliabilityStore,
++  store: OperationStore & PayoutStore,
+   operation: PaymentOperation,
+   ids: PersistValidatedPayoutProviderIdsInput,
+   allowRetry = true,
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/persistence/memory-payment-reliability-store.ts src/core/lib/persistence/memory-payment-reliability-store.ts
+--- .superpowers/snap-after-t4/src/core/lib/persistence/memory-payment-reliability-store.ts	2026-10-22 12:57:32.047806809 +0300
++++ src/core/lib/persistence/memory-payment-reliability-store.ts	2026-10-22 13:32:22.989914366 +0300
+@@ -2,6 +2,7 @@
+ import { checkoutCreateExecutionLeaseExpiresAt } from '../checkout-create-execution-lease';
+ import type { AcquireCheckoutCreateExecutionLeaseResult } from './payment-reliability-store';
+ import {
++  OPERATION_TRANSITION_KIND,
+   PAYMENT_RELIABILITY_ERROR,
+   PAYMENT_RPC_TRANSITION_DETAIL,
+   PAYMENT_TRANSITION_REJECTION_REASON,
+@@ -29,13 +30,23 @@
+ } from '../../../contracts/index';
+ import { sha256Payload } from '../sha256-payload';
+ import { assertTransitionAllowed } from '../transition-policy';
+-import { isRecoverableEvidenceRow } from '../webhook-evidence-resume';
++import {
++  isAwaitingConsumerDeliveryOnly,
++  isRecoverableEvidenceRow,
++} from '../webhook-evidence-resume';
+ import type { PaymentReliabilityStore } from './payment-reliability-store';
+ 
+ function nowIso(): string {
+   return new Date().toISOString();
+ }
+ 
++function byReceivedAt(left: ProviderEvidenceRecord, right: ProviderEvidenceRecord): number {
++  return (
++    left.receivedAt.localeCompare(right.receivedAt) ||
++    left.evidenceId.localeCompare(right.evidenceId)
++  );
++}
++
+ export class MemoryPaymentReliabilityStore implements PaymentReliabilityStore {
+   private readonly operations = new Map<string, PaymentOperation>();
+   private readonly operationsByIdempotency = new Map<string, PaymentOperation>();
+@@ -58,6 +69,11 @@
+   private readonly sellerConnections = new Map<string, SellerConnectionRecord>();
+   private readonly marketplaceUnits = new Map<string, MarketplacePurchaseUnitRecord>();
+   private readonly marketplaceUnitsByCaptureId = new Map<string, MarketplacePurchaseUnitRecord>();
++  /** Index entries each operation occupies, so a cleared or changed provider id stops matching. */
++  private readonly operationIndexEntries = new Map<
++    string,
++    Array<[Map<string, PaymentOperation>, string]>
++  >();
+ 
+   async createOperation(input: CreatePaymentOperationInput): Promise<PaymentOperation> {
+     const idempotencyKey = `${input.idempotencyScope}::${input.idempotencyKey}`;
+@@ -129,6 +145,7 @@
+       createdAt: timestamp,
+       updatedAt: timestamp,
+     };
++    this.assertProviderIdsUnbound(operation);
+     this.operations.set(operation.operationId, operation);
+     this.operationsByIdempotency.set(idempotencyKey, operation);
+     this.indexOperationReferences(operation);
+@@ -327,6 +344,7 @@
+       expectedVersion: current.version,
+       nextStatus: 'submitted',
+       reason: 'Claimed for provider execution',
++      transitionKind: OPERATION_TRANSITION_KIND.CLAIM_EXECUTION,
+     });
+   }
+ 
+@@ -407,6 +425,9 @@
+       executionOwnerToken,
+       executionLeaseExpiresAt,
+       reason,
++      transitionKind: claimableFromPrepared
++        ? OPERATION_TRANSITION_KIND.CLAIM_EXECUTION
++        : OPERATION_TRANSITION_KIND.CLAIM_RETRY,
+     });
+ 
+     return { kind: 'acquired', operation, executionOwnerToken };
+@@ -509,6 +530,7 @@
+       version: current.version + 1,
+       updatedAt: nowIso(),
+     };
++    this.assertProviderIdsUnbound(updated);
+     this.operations.set(updated.operationId, updated);
+     this.operationsByIdempotency.set(
+       `${updated.idempotencyScope}::${updated.idempotencyKey}`,
+@@ -546,32 +568,14 @@
+       );
+     }
+ 
+-    if (input.providerReferenceId) {
+-      const bound = await this.findOperationByProviderReference(
+-        current.providerCode,
+-        current.accountRef,
+-        current.environment,
+-        input.providerReferenceId,
+-      );
+-      if (bound && bound.operationId !== current.operationId) {
+-        throw new PaymentReliabilityError(
+-          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
+-          PAYMENT_RPC_TRANSITION_DETAIL.PROVIDER_REFERENCE_BOUND,
+-          {
+-            rejectionReason: PAYMENT_TRANSITION_REJECTION_REASON.PROVIDER_REFERENCE_BOUND,
+-          },
+-        );
+-      }
+-    }
+-
+-    assertTransitionAllowed(current.status, input.nextStatus);
+-
+     const updated: PaymentOperation = {
+       ...current,
+       status: input.nextStatus,
++      // A transition never unbinds a provider reference: `null` keeps it too.
+       providerReferenceId: input.providerReferenceId ?? current.providerReferenceId,
+-      failureCode: input.failureCode ?? current.failureCode,
+-      failureMessage: input.failureMessage ?? current.failureMessage,
++      failureCode: input.failureCode !== undefined ? input.failureCode : current.failureCode,
++      failureMessage:
++        input.failureMessage !== undefined ? input.failureMessage : current.failureMessage,
+       approvalUrl: input.approvalUrl !== undefined ? input.approvalUrl : current.approvalUrl,
+       amountMinor: input.amountMinor !== undefined ? input.amountMinor : current.amountMinor,
+       currencyCode: input.currencyCode !== undefined ? input.currencyCode : current.currencyCode,
+@@ -657,6 +661,9 @@
+       version: current.version + 1,
+       updatedAt: nowIso(),
+     };
++    this.assertProviderIdsUnbound(updated);
++    assertTransitionAllowed(current.status, input.nextStatus);
++
+     this.operations.set(updated.operationId, updated);
+     this.operationsByIdempotency.set(
+       `${updated.idempotencyScope}::${updated.idempotencyKey}`,
+@@ -671,6 +678,7 @@
+       toStatus: input.nextStatus,
+       evidenceId: input.evidenceId ?? null,
+       reason: input.reason,
++      transitionKind: input.transitionKind ?? null,
+       createdAt: updated.updatedAt,
+     });
+ 
+@@ -754,17 +762,17 @@
+         input.relatedOperationId !== undefined
+           ? input.relatedOperationId
+           : current.relatedOperationId,
+-      eventType: input.eventType ?? current.eventType,
+-      resourceId: input.resourceId ?? current.resourceId,
+-      errorCode: 'errorCode' in input ? (input.errorCode ?? null) : current.errorCode,
+-      errorMessage: 'errorMessage' in input ? (input.errorMessage ?? null) : current.errorMessage,
++      eventType: input.eventType !== undefined ? input.eventType : current.eventType,
++      resourceId: input.resourceId !== undefined ? input.resourceId : current.resourceId,
++      errorCode: input.errorCode !== undefined ? input.errorCode : current.errorCode,
++      errorMessage: input.errorMessage !== undefined ? input.errorMessage : current.errorMessage,
+       claimLeaseExpiresAt:
+         input.claimLeaseExpiresAt !== undefined
+           ? input.claimLeaseExpiresAt
+           : current.claimLeaseExpiresAt,
+       claimWorkerId:
+         input.claimWorkerId !== undefined ? input.claimWorkerId : current.claimWorkerId,
+-      processedAt: input.processedAt ?? current.processedAt,
++      processedAt: input.processedAt !== undefined ? input.processedAt : current.processedAt,
+       consumerDeliveryStatus:
+         input.consumerDeliveryStatus !== undefined
+           ? input.consumerDeliveryStatus
+@@ -817,9 +825,17 @@
+       }
+       return true;
+     };
++    const deliveryWanted = (row: ProviderEvidenceRecord) =>
++      input.includeConsumerDelivery !== false || !isAwaitingConsumerDeliveryOnly(row);
+     const candidates = [...this.evidence.values()]
+-      .filter((row) => leaseAvailable(row) && scopeMatch(row) && isRecoverableEvidenceRow(row))
+-      .sort((a, b) => a.receivedAt.localeCompare(b.receivedAt))
++      .filter(
++        (row) =>
++          leaseAvailable(row) &&
++          scopeMatch(row) &&
++          isRecoverableEvidenceRow(row) &&
++          deliveryWanted(row),
++      )
++      .sort(byReceivedAt)
+       .slice(0, input.limit);
+     const leaseUntil = new Date(now + input.leaseMs).toISOString();
+     return Promise.all(
+@@ -863,12 +879,18 @@
+             (row.relatedOperationId &&
+               this.operations.get(row.relatedOperationId)?.status === 'unknown')),
+       )
++      .sort(byReceivedAt)
+       .slice(0, limit);
+   }
+ 
+   async listUncertainOperations(limit: number): Promise<PaymentOperation[]> {
+     return [...this.operations.values()]
+       .filter((operation) => operation.status === 'unknown')
++      .sort(
++        (left, right) =>
++          left.createdAt.localeCompare(right.createdAt) ||
++          left.operationId.localeCompare(right.operationId),
++      )
+       .slice(0, limit);
+   }
+ 
+@@ -935,56 +957,82 @@
+     return attempt;
+   }
+ 
+-  private indexOperationReferences(operation: PaymentOperation): void {
++  /** Unique provider-id indexes: what a SQL store enforces with partial unique indexes. */
++  private uniqueProviderIdEntries(
++    operation: PaymentOperation,
++  ): Array<[Map<string, PaymentOperation>, string]> {
+     const scope = `${operation.providerCode}::${operation.accountRef}::${operation.environment}`;
++    const entries: Array<[Map<string, PaymentOperation>, string]> = [];
+     if (operation.providerReferenceId) {
+-      this.operationsByProviderRef.set(`${scope}::${operation.providerReferenceId}`, operation);
+-    }
+-    if (operation.providerOrderId) {
+-      this.operationsByProviderOrderId.set(`${scope}::${operation.providerOrderId}`, operation);
+-    }
+-    if (operation.providerCaptureId) {
+-      this.operationsByProviderCaptureId.set(`${scope}::${operation.providerCaptureId}`, operation);
+-    }
+-    if (operation.providerRefundId) {
+-      this.operationsByProviderRefundId.set(`${scope}::${operation.providerRefundId}`, operation);
+-    }
+-    if (operation.senderBatchId) {
+-      this.operationsBySenderBatchId.set(`${scope}::${operation.senderBatchId}`, operation);
+-    }
+-    if (operation.senderItemId) {
+-      this.operationsBySenderItemId.set(`${scope}::${operation.senderItemId}`, operation);
+-    }
+-    if (operation.providerPayoutBatchId) {
+-      this.operationsByProviderPayoutBatchId.set(
+-        `${scope}::${operation.providerPayoutBatchId}`,
+-        operation,
+-      );
+-    }
+-    if (operation.providerPayoutItemId) {
+-      this.operationsByProviderPayoutItemId.set(
+-        `${scope}::${operation.providerPayoutItemId}`,
+-        operation,
+-      );
++      entries.push([this.operationsByProviderRef, `${scope}::${operation.providerReferenceId}`]);
+     }
+     if (operation.providerProductId && operation.kind === 'catalog_product') {
+-      this.operationsByProviderProductId.set(`${scope}::${operation.providerProductId}`, operation);
++      entries.push([
++        this.operationsByProviderProductId,
++        `${scope}::${operation.providerProductId}`,
++      ]);
+     }
+     if (operation.providerPlanId && operation.kind === 'billing_plan') {
+-      this.operationsByProviderPlanId.set(`${scope}::${operation.providerPlanId}`, operation);
++      entries.push([this.operationsByProviderPlanId, `${scope}::${operation.providerPlanId}`]);
+     }
+     if (operation.providerSubscriptionId && operation.kind === 'subscription') {
+-      this.operationsByProviderSubscriptionId.set(
++      entries.push([
++        this.operationsByProviderSubscriptionId,
+         `${scope}::${operation.providerSubscriptionId}`,
+-        operation,
+-      );
++      ]);
+     }
+     if (operation.providerReferralId && operation.kind === 'seller_referral') {
+-      this.operationsByProviderReferralId.set(
++      entries.push([
++        this.operationsByProviderReferralId,
+         `${scope}::${operation.providerReferralId}`,
+-        operation,
+-      );
++      ]);
++    }
++    return entries;
++  }
++
++  /** Rejects a write that would bind a unique provider id held by another operation. */
++  private assertProviderIdsUnbound(operation: PaymentOperation): void {
++    for (const [index, key] of this.uniqueProviderIdEntries(operation)) {
++      const bound = index.get(key);
++      if (bound && bound.operationId !== operation.operationId) {
++        throw new PaymentReliabilityError(
++          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
++          PAYMENT_RPC_TRANSITION_DETAIL.PROVIDER_REFERENCE_BOUND,
++          {
++            rejectionReason: PAYMENT_TRANSITION_REJECTION_REASON.PROVIDER_REFERENCE_BOUND,
++          },
++        );
++      }
++    }
++  }
++
++  private indexOperationReferences(operation: PaymentOperation): void {
++    for (const [index, key] of this.operationIndexEntries.get(operation.operationId) ?? []) {
++      if (index.get(key)?.operationId === operation.operationId) {
++        index.delete(key);
++      }
++    }
++    const scope = `${operation.providerCode}::${operation.accountRef}::${operation.environment}`;
++    // Checkout and payout ids are not unique (a capture shares its order id): latest write wins.
++    const entries = this.uniqueProviderIdEntries(operation);
++    const shared: Array<[Map<string, PaymentOperation>, string | null]> = [
++      [this.operationsByProviderOrderId, operation.providerOrderId],
++      [this.operationsByProviderCaptureId, operation.providerCaptureId],
++      [this.operationsByProviderRefundId, operation.providerRefundId],
++      [this.operationsBySenderBatchId, operation.senderBatchId],
++      [this.operationsBySenderItemId, operation.senderItemId],
++      [this.operationsByProviderPayoutBatchId, operation.providerPayoutBatchId],
++      [this.operationsByProviderPayoutItemId, operation.providerPayoutItemId],
++    ];
++    for (const [index, id] of shared) {
++      if (id) {
++        entries.push([index, `${scope}::${id}`]);
++      }
++    }
++    for (const [index, key] of entries) {
++      index.set(key, operation);
+     }
++    this.operationIndexEntries.set(operation.operationId, entries);
+   }
+ 
+   async createSellerConnection(
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/persistence/payment-reliability-store.ts src/core/lib/persistence/payment-reliability-store.ts
+--- .superpowers/snap-after-t4/src/core/lib/persistence/payment-reliability-store.ts	2026-10-22 12:57:32.047875795 +0300
++++ src/core/lib/persistence/payment-reliability-store.ts	2026-10-22 13:28:27.207273653 +0300
+@@ -20,24 +20,202 @@
+   ListPaymentEvidenceForRecoveryResult,
+ } from '../../../contracts/index';
+ 
++/*
++ * Store contract, split by capability (issue #6). A host implements the interfaces of the flows it
++ * uses: `SubscriptionStore` is enough for subscriptions (lifecycle, webhooks, reconciliation and
++ * recovery). `PaymentReliabilityStore` is the union of every capability.
++ *
++ * Guarantees every implementation must give (checked by `runStoreConformance` from
++ * `@idevconn/payment-providers/testing`; the in-memory store is the reference):
++ *
++ * - Errors are `PaymentReliabilityError` with the codes named below: services branch on `code`.
++ * - Patch semantics for every optional field of an update/transition input: `undefined` keeps the
++ *   stored value, `null` clears it. Exceptions are listed on the method.
++ * - Each successful write of an operation increments `version` by exactly 1 and sets `updatedAt`.
++ * - Methods that check `expectedVersion` are compare-and-set: on a mismatch they change nothing.
++ *   Two concurrent calls with the same `expectedVersion` never both succeed (SQL:
++ *   `UPDATE ... WHERE operation_id = $1 AND version = $2`, zero rows = conflict).
++ * - Concurrency is the store's job: the services run in several workers at once.
++ */
++
+ export type AcquireCheckoutCreateExecutionLeaseResult =
+-  | { kind: 'acquired'; operation: PaymentOperation; executionOwnerToken: string }
++  | {
++      kind: 'acquired';
++      operation: PaymentOperation;
++      executionOwnerToken: string;
++    }
+   | { kind: 'in_flight'; operation: PaymentOperation }
+   | { kind: 'not_eligible'; operation: PaymentOperation };
+ 
+-export interface PaymentReliabilityStore {
++/** Operations, their compare-and-set updates and the transition history. */
++export interface OperationStore {
++  /**
++   * Inserts an operation in `prepared` with `version` 1, or returns the existing row for the same
++   * `(idempotencyScope, idempotencyKey)` when its `commandFingerprint` is equal. A different
++   * fingerprint throws `IDEMPOTENCY_CONFLICT`. Concurrent creates with one key return one row
++   * (SQL: unique index + `INSERT ... ON CONFLICT DO NOTHING`, then re-select). Provider ids are
++   * bound as in `transitionOperation`.
++   */
+   createOperation(input: CreatePaymentOperationInput): Promise<PaymentOperation>;
+   findOperationById(operationId: string): Promise<PaymentOperation | null>;
+   findOperationByIdempotency(
+     idempotencyScope: string,
+     idempotencyKey: string,
+   ): Promise<PaymentOperation | null>;
++  /**
++   * `providerReferenceId` is unique per `(providerCode, accountRef, environment)` across all kinds:
++   * binding an id held by another operation throws `TRANSITION_REJECTED` with rejection reason
++   * `PROVIDER_REFERENCE_BOUND`.
++   */
+   findOperationByProviderReference(
+     providerCode: string,
+     accountRef: string,
+     environment: string,
+     providerReferenceId: string,
+   ): Promise<PaymentOperation | null>;
++  /**
++   * Compare-and-set `prepared -> submitted` at `expectedVersion`. Throws `OPERATION_CONFLICT` when
++   * the row is missing, the version differs or the status is not `prepared`; of two concurrent
++   * claims exactly one wins. Writes the history row with `transitionKind: 'claim_execution'`
++   * (the reason text is free).
++   */
++  claimOperationForExecution(input: {
++    operationId: string;
++    expectedVersion: number;
++  }): Promise<PaymentOperation>;
++  /**
++   * Compare-and-set field patch at `expectedVersion` (`TRANSITION_CONFLICT` on a mismatch). No
++   * status change and no history row. `undefined` keeps, `null` clears; a cleared provider id no
++   * longer matches its lookup. Provider ids are bound as in `transitionOperation`.
++   */
++  updateOperation(input: UpdatePaymentOperationInput): Promise<PaymentOperation>;
++  /**
++   * Status change plus field patch at `expectedVersion`, and exactly one history row, in ONE
++   * transaction: when any check fails nothing is written. Checks, in order: version
++   * (`TRANSITION_CONFLICT`), `expectedExecutionOwnerToken` when given (`TRANSITION_REJECTED`,
++   * `EXECUTION_OWNER_MISMATCH`), provider ids bound to another operation (`TRANSITION_REJECTED`,
++   * `PROVIDER_REFERENCE_BOUND`), then `assertTransitionAllowed` (`TRANSITION_REJECTED`).
++   *
++   * Provider ids unique per `(providerCode, accountRef, environment)`: `providerReferenceId` (any
++   * kind), `providerSubscriptionId` among `subscription` operations, `providerPlanId` among
++   * `billing_plan`, `providerProductId` among `catalog_product`, `providerReferralId` among
++   * `seller_referral` (SQL: partial unique indexes).
++   *
++   * Patch exceptions: `providerReferenceId` keeps the stored value for `null` as well (a transition
++   * never unbinds a reference). `failureCode`/`failureMessage` follow the general rule (`null`
++   * clears). The history row stores `reason`, `evidenceId` and `transitionKind` (`null` when absent).
++   */
++  transitionOperation(input: TransitionPaymentOperationInput): Promise<PaymentOperation>;
++  /** History rows of one operation, oldest first. */
++  listOperationTransitions(operationId: string): Promise<PaymentOperationTransitionRecord[]>;
++}
++
++/** Create execution lease for checkout and subscription creates (single provider call in flight). */
++export interface CreateExecutionLeaseStore {
++  /**
++   * For a `checkout` or `subscription` operation without a provider create reference: when no
++   * unexpired lease is held and the status is `prepared`, `unknown` or `submitted` (with an expired
++   * or missing lease), moves it to `submitted` with a new owner token and lease expiry and returns
++   * `acquired`. The history row has `transitionKind` `claim_execution` from `prepared`,
++   * `claim_retry` otherwise. An unexpired lease gives `in_flight` (also when `expectedVersion` is
++   * stale); a provider reference or a terminal status gives `not_eligible`; another stale version
++   * throws `OPERATION_CONFLICT`. Of two concurrent calls at most one is `acquired`.
++   */
++  acquireCheckoutCreateExecutionLease(input: {
++    operationId: string;
++    expectedVersion: number;
++  }): Promise<AcquireCheckoutCreateExecutionLeaseResult>;
++}
++
++/** Kind-scoped lookups for catalog products, billing plans and subscriptions. */
++export interface SubscriptionOperationLookupStore {
++  /** Only `catalog_product` operations. */
++  findOperationByProviderProductId(
++    providerCode: string,
++    accountRef: string,
++    environment: string,
++    providerProductId: string,
++  ): Promise<PaymentOperation | null>;
++  /** Only `billing_plan` operations. */
++  findOperationByProviderPlanId(
++    providerCode: string,
++    accountRef: string,
++    environment: string,
++    providerPlanId: string,
++  ): Promise<PaymentOperation | null>;
++  /** Only `subscription` operations (lifecycle command operations are not returned). */
++  findOperationByProviderSubscriptionId(
++    providerCode: string,
++    accountRef: string,
++    environment: string,
++    providerSubscriptionId: string,
++  ): Promise<PaymentOperation | null>;
++}
++
++/** Provider evidence inbox: webhooks and reconciliation lookups, with recovery leases. */
++export interface EvidenceStore {
++  /**
++   * Inserts with `verificationStatus` and `processingStatus` `pending`. `providerEventId` is unique
++   * per `(providerCode, accountRef, environment)`: a duplicate throws `EVIDENCE_DUPLICATE`, also
++   * for concurrent inserts (one wins).
++   */
++  insertEvidence(input: InsertProviderEvidenceInput): Promise<ProviderEvidenceRecord>;
++  findEvidenceById(evidenceId: string): Promise<ProviderEvidenceRecord | null>;
++  findEvidenceByProviderEvent(
++    providerCode: string,
++    accountRef: string,
++    environment: string,
++    providerEventId: string,
++  ): Promise<ProviderEvidenceRecord | null>;
++  /**
++   * Field patch, `undefined` keeps and `null` clears (`errorCode`, `errorMessage`, `processedAt`,
++   * `relatedOperationId`, lease and consumer fields). The consumer-delivery fields
++   * (`consumerDeliveryStatus`, `consumerDeliveredAt`, `consumerDeliveryAttempts`,
++   * `consumerDeliveryLastError`) MUST be persisted and returned as written. No version check:
++   * the recovery lease serialises writers.
++   */
++  updateEvidence(input: UpdateProviderEvidenceInput): Promise<ProviderEvidenceRecord>;
++  /**
++   * Leases up to `limit` recoverable rows (see `isRecoverableEvidenceRow`) whose lease is free,
++   * expired or already held by `workerId`, oldest `receivedAt` first, and returns them with the
++   * new lease (`claimWorkerId`, `claimLeaseExpiresAt` = now + `leaseMs`). Two workers never get
++   * the same row while its lease is unexpired (SQL: `FOR UPDATE SKIP LOCKED`). With
++   * `includeConsumerDelivery: false` rows that only await consumer delivery are skipped. A blank
++   * `workerId` throws `INVALID_REQUEST`.
++   */
++  claimPendingEvidence(input: ClaimPendingEvidenceInput): Promise<ProviderEvidenceRecord[]>;
++}
++
++/** Candidates for `ReconciliationService` and its attempt log. */
++export interface ReconciliationStore {
++  /**
++   * Verified evidence that is `unmatched` or whose related operation is `unknown`, oldest
++   * `receivedAt` first (`ORDER BY received_at, evidence_id`), at most `limit` rows.
++   */
++  listReconciliationCandidates(limit: number): Promise<ProviderEvidenceRecord[]>;
++  /** Operations in `unknown`, oldest `createdAt` first (`ORDER BY created_at, operation_id`). */
++  listUncertainOperations(limit: number): Promise<PaymentOperation[]>;
++  insertReconciliationAttempt(
++    input: InsertReconciliationAttemptInput,
++  ): Promise<ReconciliationAttempt>;
++}
++
++/**
++ * Everything a subscriptions-only host implements. `SubscriptionLifecycleService`,
++ * `WebhookProcessingService`, `ReconciliationService` and `PaymentRecoveryService` run with it;
++ * webhook and reconciliation paths of other families detect the missing capability and record the
++ * evidence as `unsupported` (or a no-op attempt) instead of calling a missing method.
++ */
++export interface SubscriptionStore
++  extends
++    OperationStore,
++    CreateExecutionLeaseStore,
++    SubscriptionOperationLookupStore,
++    EvidenceStore,
++    ReconciliationStore {}
++
++/** One-off checkout, capture and refund flows. Provider ids here are not unique (latest row wins). */
++export interface CheckoutStore extends CreateExecutionLeaseStore {
+   findOperationByProviderOrderId(
+     providerCode: string,
+     accountRef: string,
+@@ -56,6 +234,16 @@
+     environment: string,
+     providerRefundId: string,
+   ): Promise<PaymentOperation | null>;
++  /** Throws `INVALID_REQUEST` when the refund exceeds the capture's remaining balance. */
++  reserveRefundCapacity(input: {
++    captureOperationId: string;
++    requestedAmountMinor: string;
++    excludeOperationId?: string;
++  }): Promise<void>;
++}
++
++/** Payout batches and items. */
++export interface PayoutStore {
+   findOperationBySenderBatchId(
+     providerCode: string,
+     accountRef: string,
+@@ -80,68 +268,20 @@
+     environment: string,
+     providerPayoutItemId: string,
+   ): Promise<PaymentOperation | null>;
+-  findOperationByProviderProductId(
+-    providerCode: string,
+-    accountRef: string,
+-    environment: string,
+-    providerProductId: string,
+-  ): Promise<PaymentOperation | null>;
+-  findOperationByProviderPlanId(
+-    providerCode: string,
+-    accountRef: string,
+-    environment: string,
+-    providerPlanId: string,
+-  ): Promise<PaymentOperation | null>;
+-  findOperationByProviderSubscriptionId(
+-    providerCode: string,
+-    accountRef: string,
+-    environment: string,
+-    providerSubscriptionId: string,
+-  ): Promise<PaymentOperation | null>;
++  /** Child operations (payout items of a batch, refunds of a capture). */
++  listOperationsByParent(parentOperationId: string): Promise<PaymentOperation[]>;
++}
++
++/** Seller onboarding (partner referrals and seller connections). */
++export interface SellerStore {
++  /** Only `seller_referral` operations. */
+   findOperationByProviderReferralId(
+     providerCode: string,
+     accountRef: string,
+     environment: string,
+     providerReferralId: string,
+   ): Promise<PaymentOperation | null>;
+-  claimOperationForExecution(input: {
+-    operationId: string;
+-    expectedVersion: number;
+-  }): Promise<PaymentOperation>;
+-  acquireCheckoutCreateExecutionLease(input: {
+-    operationId: string;
+-    expectedVersion: number;
+-  }): Promise<AcquireCheckoutCreateExecutionLeaseResult>;
+-  updateOperation(input: UpdatePaymentOperationInput): Promise<PaymentOperation>;
+-  transitionOperation(input: TransitionPaymentOperationInput): Promise<PaymentOperation>;
+-  listOperationTransitions(operationId: string): Promise<PaymentOperationTransitionRecord[]>;
+-
+-  insertEvidence(input: InsertProviderEvidenceInput): Promise<ProviderEvidenceRecord>;
+-  findEvidenceById(evidenceId: string): Promise<ProviderEvidenceRecord | null>;
+-  findEvidenceByProviderEvent(
+-    providerCode: string,
+-    accountRef: string,
+-    environment: string,
+-    providerEventId: string,
+-  ): Promise<ProviderEvidenceRecord | null>;
+-  updateEvidence(input: UpdateProviderEvidenceInput): Promise<ProviderEvidenceRecord>;
+-  claimPendingEvidence(input: ClaimPendingEvidenceInput): Promise<ProviderEvidenceRecord[]>;
+-  listProviderEvidenceForRecovery(
+-    input: ListPaymentEvidenceForRecoveryInput,
+-  ): Promise<ListPaymentEvidenceForRecoveryResult>;
+-  listReconciliationCandidates(limit: number): Promise<ProviderEvidenceRecord[]>;
+-  listUncertainOperations(limit: number): Promise<PaymentOperation[]>;
+-  listOperationsByParent(parentOperationId: string): Promise<PaymentOperation[]>;
+-  reserveRefundCapacity(input: {
+-    captureOperationId: string;
+-    requestedAmountMinor: string;
+-    excludeOperationId?: string;
+-  }): Promise<void>;
+-
+-  insertReconciliationAttempt(
+-    input: InsertReconciliationAttemptInput,
+-  ): Promise<ReconciliationAttempt>;
+-
++  /** Returns the existing connection for the same seller ref instead of inserting a second one. */
+   createSellerConnection(input: CreateSellerConnectionInput): Promise<SellerConnectionRecord>;
+   findSellerConnectionById(connectionId: string): Promise<SellerConnectionRecord | null>;
+   findSellerConnectionBySellerRef(
+@@ -171,9 +311,14 @@
+     environment: string,
+     trackingId: string,
+   ): Promise<SellerConnectionRecord | null>;
++  /** Compare-and-set at `expectedVersion` (`TRANSITION_CONFLICT`). */
+   updateSellerConnection(input: UpdateSellerConnectionInput): Promise<SellerConnectionRecord>;
++  /** Oldest `updatedAt` first. */
+   listSellerConnectionsForReconciliation(limit: number): Promise<SellerConnectionRecord[]>;
++}
+ 
++/** Marketplace (multi-seller) checkout purchase units. */
++export interface MarketplaceStore {
+   insertMarketplacePurchaseUnits(
+     units: InsertMarketplacePurchaseUnitInput[],
+   ): Promise<MarketplacePurchaseUnitRecord[]>;
+@@ -186,9 +331,11 @@
+   findMarketplacePurchaseUnitByCaptureId(
+     providerCaptureId: string,
+   ): Promise<MarketplacePurchaseUnitRecord | null>;
++  /** Compare-and-set at `expectedVersion` (`TRANSITION_CONFLICT`). */
+   updateMarketplacePurchaseUnit(
+     input: UpdateMarketplacePurchaseUnitInput,
+   ): Promise<MarketplacePurchaseUnitRecord>;
++  /** Latest verified reconciliation evidence for a seller resource. */
+   findLatestReconciliationEvidenceForResource(input: {
+     applicationRef: string;
+     providerCode: string;
+@@ -197,3 +344,20 @@
+     resourceId: string;
+   }): Promise<ProviderEvidenceRecord | null>;
+ }
++
++/** Admin listing of evidence for recovery screens. */
++export interface EvidenceAdminStore {
++  listProviderEvidenceForRecovery(
++    input: ListPaymentEvidenceForRecoveryInput,
++  ): Promise<ListPaymentEvidenceForRecoveryResult>;
++}
++
++/** Every capability: what `MemoryPaymentReliabilityStore` implements. */
++export interface PaymentReliabilityStore
++  extends
++    SubscriptionStore,
++    CheckoutStore,
++    PayoutStore,
++    SellerStore,
++    MarketplaceStore,
++    EvidenceAdminStore {}
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/persistence/store-capabilities.ts src/core/lib/persistence/store-capabilities.ts
+--- .superpowers/snap-after-t4/src/core/lib/persistence/store-capabilities.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/core/lib/persistence/store-capabilities.ts	2026-10-22 13:28:27.219273617 +0300
+@@ -0,0 +1,71 @@
++import type {
++  CheckoutStore,
++  MarketplaceStore,
++  PayoutStore,
++  SellerStore,
++} from './payment-reliability-store';
++
++/*
++ * Feature detection for the optional store capabilities: a store has a capability when it has every
++ * method of that interface. Services use these guards so a subscriptions-only store is enough.
++ */
++
++export const CHECKOUT_STORE_METHODS = [
++  'acquireCheckoutCreateExecutionLease',
++  'findOperationByProviderOrderId',
++  'findOperationByProviderCaptureId',
++  'findOperationByProviderRefundId',
++  'reserveRefundCapacity',
++] as const satisfies ReadonlyArray<keyof CheckoutStore>;
++
++export const PAYOUT_STORE_METHODS = [
++  'findOperationBySenderBatchId',
++  'findOperationBySenderItemId',
++  'findOperationByProviderPayoutBatchId',
++  'findOperationByProviderPayoutItemId',
++  'listOperationsByParent',
++] as const satisfies ReadonlyArray<keyof PayoutStore>;
++
++export const SELLER_STORE_METHODS = [
++  'findOperationByProviderReferralId',
++  'createSellerConnection',
++  'findSellerConnectionById',
++  'findSellerConnectionBySellerRef',
++  'findSellerConnectionByMerchantId',
++  'findSellerConnectionByReferralId',
++  'findSellerConnectionByTrackingId',
++  'updateSellerConnection',
++  'listSellerConnectionsForReconciliation',
++] as const satisfies ReadonlyArray<keyof SellerStore>;
++
++export const MARKETPLACE_STORE_METHODS = [
++  'insertMarketplacePurchaseUnits',
++  'listMarketplacePurchaseUnits',
++  'findMarketplacePurchaseUnitById',
++  'findMarketplacePurchaseUnitByReference',
++  'findMarketplacePurchaseUnitByCaptureId',
++  'updateMarketplacePurchaseUnit',
++  'findLatestReconciliationEvidenceForResource',
++] as const satisfies ReadonlyArray<keyof MarketplaceStore>;
++
++function hasMethods(store: object, methods: ReadonlyArray<string>): boolean {
++  return methods.every(
++    (method) => typeof (store as Record<string, unknown>)[method] === 'function',
++  );
++}
++
++export function hasCheckoutStore<T extends object>(store: T): store is T & CheckoutStore {
++  return hasMethods(store, CHECKOUT_STORE_METHODS);
++}
++
++export function hasPayoutStore<T extends object>(store: T): store is T & PayoutStore {
++  return hasMethods(store, PAYOUT_STORE_METHODS);
++}
++
++export function hasSellerStore<T extends object>(store: T): store is T & SellerStore {
++  return hasMethods(store, SELLER_STORE_METHODS);
++}
++
++export function hasMarketplaceStore<T extends object>(store: T): store is T & MarketplaceStore {
++  return hasMethods(store, MARKETPLACE_STORE_METHODS);
++}
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/provider-execution-transition.ts src/core/lib/provider-execution-transition.ts
+--- .superpowers/snap-after-t4/src/core/lib/provider-execution-transition.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/core/lib/provider-execution-transition.ts	2026-10-22 13:28:27.226273596 +0300
+@@ -0,0 +1,23 @@
++import type { PaymentOperationTransitionRecord } from '../../contracts/index';
++
++/**
++ * Whether a history row is the first claim of an operation for a provider call. Uses the typed
++ * `transitionKind`; for rows without one (older rows, stores that do not record it) the structural
++ * `prepared -> submitted` move. Never reads the free-text `reason` (issue #23).
++ */
++export function isProviderExecutionClaimTransition(row: PaymentOperationTransitionRecord): boolean {
++  if (row.transitionKind != null) {
++    return row.transitionKind === 'claim_execution';
++  }
++  return row.fromStatus === 'prepared' && row.toStatus === 'submitted';
++}
++
++/** `createdAt` of the earliest provider execution claim, or `null` when there is none. */
++export function resolveFirstProviderExecutionAt(
++  transitions: ReadonlyArray<PaymentOperationTransitionRecord>,
++): string | null {
++  const claims = transitions
++    .filter(isProviderExecutionClaimTransition)
++    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
++  return claims[0]?.createdAt ?? null;
++}
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/reconciliation-service.ts src/core/lib/reconciliation-service.ts
+--- .superpowers/snap-after-t4/src/core/lib/reconciliation-service.ts	2026-10-22 12:57:32.047941893 +0300
++++ src/core/lib/reconciliation-service.ts	2026-10-22 13:15:28.325815962 +0300
+@@ -48,7 +48,17 @@
+   isSubscriptionProviderPlanMismatchError,
+ } from './subscription-provider-plan-consistency';
+ import { applyMarketplaceUnitSnapshots } from './marketplace-evidence-application';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type {
++  MarketplaceStore,
++  PayoutStore,
++  SellerStore,
++  SubscriptionStore,
++} from './persistence/payment-reliability-store';
++import {
++  hasMarketplaceStore,
++  hasPayoutStore,
++  hasSellerStore,
++} from './persistence/store-capabilities';
+ import { sha256Payload } from './sha256-payload';
+ 
+ type ReconcileCounters = ReconcilePaymentOperationsResult;
+@@ -149,16 +159,28 @@
+   }
+ }
+ 
++/**
++ * A `SubscriptionStore` is enough. Seller connections are reconciled only when the store has the
++ * seller capability; payout and marketplace operations only with those capabilities.
++ */
++export type ReconciliationServiceStore = SubscriptionStore &
++  Partial<PayoutStore & SellerStore & MarketplaceStore>;
++
++const CAPABILITY_NOT_CONFIGURED = 'STORE_CAPABILITY_NOT_CONFIGURED';
++
+ export class ReconciliationService {
+   constructor(
+-    private readonly store: PaymentReliabilityStore,
++    private readonly store: ReconciliationServiceStore,
+     private readonly providerLookup: ReconciliationProviderLookup,
+   ) {}
+ 
+   async reconcile(limit = 25): Promise<ReconcilePaymentOperationsResult> {
+     const evidenceCandidates = await this.store.listReconciliationCandidates(limit);
+     const uncertainOperations = await this.store.listUncertainOperations(limit);
+-    const connectionCandidates = await this.store.listSellerConnectionsForReconciliation(limit);
++    const sellerStore = hasSellerStore(this.store) ? this.store : null;
++    const connectionCandidates = sellerStore
++      ? await sellerStore.listSellerConnectionsForReconciliation(limit)
++      : [];
+     const result: ReconcileCounters = {
+       examined:
+         evidenceCandidates.length + uncertainOperations.length + connectionCandidates.length,
+@@ -185,21 +207,22 @@
+       await this.reconcileOperation(operation, result);
+     }
+ 
+-    for (const connection of connectionCandidates) {
+-      const connectionResult = await reconcileSellerConnectionAggregate({
+-        store: this.store,
+-        providerLookup: this.providerLookup,
+-        connection,
+-      });
+-      if (connectionResult.outcome === 'applied') {
+-        result.applied += 1;
+-      } else if (connectionResult.outcome === 'retryable_failure') {
+-        result.retryableFailures += 1;
+-      } else {
+-        result.noOps += 1;
++    if (sellerStore) {
++      for (const connection of connectionCandidates) {
++        const connectionResult = await reconcileSellerConnectionAggregate({
++          store: sellerStore,
++          providerLookup: this.providerLookup,
++          connection,
++        });
++        if (connectionResult.outcome === 'applied') {
++          result.applied += 1;
++        } else if (connectionResult.outcome === 'retryable_failure') {
++          result.retryableFailures += 1;
++        } else {
++          result.noOps += 1;
++        }
+       }
+     }
+-
+     return result;
+   }
+ 
+@@ -370,6 +393,9 @@
+       ? mapPayoutWebhookEventToFinancialStatus(evidence.eventType)
+       : null;
+     if (payoutKind) {
++      if (!hasPayoutStore(this.store)) {
++        return null;
++      }
+       const correlation = await correlatePayoutOperation(this.store, {
+         providerCode: evidence.providerCode,
+         accountRef: evidence.accountRef,
+@@ -410,6 +436,9 @@
+     }
+ 
+     if (evidence.eventType && isSellerOnboardingWebhookEvent(evidence.eventType)) {
++      if (!hasSellerStore(this.store)) {
++        return null;
++      }
+       return this.store.findOperationByProviderReferralId(
+         evidence.providerCode,
+         evidence.accountRef,
+@@ -620,7 +649,11 @@
+       input;
+ 
+     if (operation.kind === 'payout_batch' || operation.kind === 'payout_item') {
+-      await this.applyPayoutReconciliationOutcome({
++      if (!hasPayoutStore(this.store)) {
++        await this.recordCapabilityNotConfigured(evidenceId, operation.operationId, result);
++        return;
++      }
++      await this.applyPayoutReconciliationOutcome(this.store, {
+         evidenceId,
+         eventType: eventType ?? null,
+         rawPayload: rawPayload ?? '',
+@@ -672,7 +705,11 @@
+     }
+ 
+     if (operation.kind === 'marketplace_checkout' || operation.kind === 'marketplace_capture') {
+-      await this.applyMarketplaceReconciliationOutcome({
++      if (!hasMarketplaceStore(this.store)) {
++        await this.recordCapabilityNotConfigured(evidenceId, operation.operationId, result);
++        return;
++      }
++      await this.applyMarketplaceReconciliationOutcome(this.store, {
+         evidenceId,
+         operation,
+         outcome,
+@@ -929,13 +966,16 @@
+     }
+   }
+ 
+-  private async applyMarketplaceReconciliationOutcome(input: {
+-    evidenceId: string;
+-    operation: PaymentOperation;
+-    outcome: ReconciliationOutcome;
+-    result: ReconcileCounters;
+-    providerReferenceId: string | null;
+-  }): Promise<void> {
++  private async applyMarketplaceReconciliationOutcome(
++    store: ReconciliationServiceStore & MarketplaceStore,
++    input: {
++      evidenceId: string;
++      operation: PaymentOperation;
++      outcome: ReconciliationOutcome;
++      result: ReconcileCounters;
++      providerReferenceId: string | null;
++    },
++  ): Promise<void> {
+     const { evidenceId, operation, outcome, result, providerReferenceId } = input;
+     const checkoutOperationId =
+       outcome.marketplaceCheckoutOperationId ??
+@@ -970,7 +1010,7 @@
+ 
+     try {
+       await applyMarketplaceUnitSnapshots({
+-        store: this.store,
++        store,
+         operationId: checkoutOperationId,
+         snapshots: outcome.marketplaceUnits,
+         preserveCaptured: true,
+@@ -1009,15 +1049,18 @@
+     }
+   }
+ 
+-  private async applyPayoutReconciliationOutcome(input: {
+-    evidenceId: string;
+-    eventType: string | null;
+-    rawPayload: string;
+-    operation: PaymentOperation;
+-    outcome: ReconciliationOutcome;
+-    result: ReconcileCounters;
+-    providerReferenceId: string | null;
+-  }): Promise<void> {
++  private async applyPayoutReconciliationOutcome(
++    store: ReconciliationServiceStore & PayoutStore,
++    input: {
++      evidenceId: string;
++      eventType: string | null;
++      rawPayload: string;
++      operation: PaymentOperation;
++      outcome: ReconciliationOutcome;
++      result: ReconcileCounters;
++      providerReferenceId: string | null;
++    },
++  ): Promise<void> {
+     const { evidenceId, eventType, rawPayload, operation, outcome, result, providerReferenceId } =
+       input;
+     const payoutStatus = outcome.payoutStatus;
+@@ -1048,7 +1091,7 @@
+         };
+ 
+     try {
+-      await applyPayoutTransition(this.store, {
++      await applyPayoutTransition(store, {
+         operation,
+         payoutStatus,
+         evidenceId,
+@@ -1069,7 +1112,7 @@
+         const batch = await this.store.findOperationById(operation.parentOperationId);
+         if (batch) {
+           await refreshPayoutBatchAggregate(
+-            this.store,
++            store,
+             batch,
+             evidenceId,
+             'Derived payout batch aggregate after reconciliation',
+@@ -1101,6 +1144,21 @@
+     }
+   }
+ 
++  private async recordCapabilityNotConfigured(
++    evidenceId: string,
++    operationId: string,
++    result: ReconcileCounters,
++  ): Promise<void> {
++    await this.store.insertReconciliationAttempt({
++      evidenceId,
++      operationId,
++      outcome: 'no_op',
++      resultCode: CAPABILITY_NOT_CONFIGURED,
++      resultMessage: 'The store does not implement this operation family',
++    });
++    result.noOps += 1;
++  }
++
+   private async recordReconciliationFailure(input: {
+     evidenceId: string;
+     operationId: string;
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/seller-connection-reconciliation.ts src/core/lib/seller-connection-reconciliation.ts
+--- .superpowers/snap-after-t4/src/core/lib/seller-connection-reconciliation.ts	2026-10-22 12:57:32.048149297 +0300
++++ src/core/lib/seller-connection-reconciliation.ts	2026-10-22 13:27:10.446800629 +0300
+@@ -7,7 +7,11 @@
+ import { applySellerMerchantStatus } from './seller-evidence-application';
+ import { readinessFromConnection } from './seller-connection-readiness';
+ import type { ReconciliationProviderLookup } from './checkout-provider-port';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type {
++  EvidenceStore,
++  ReconciliationStore,
++  SellerStore,
++} from './persistence/payment-reliability-store';
+ import { sha256Payload } from './sha256-payload';
+ 
+ export type SellerConnectionReconcileResult = {
+@@ -36,7 +40,7 @@
+ }
+ 
+ async function insertConnectionReconciliationEvidence(
+-  store: PaymentReliabilityStore,
++  store: EvidenceStore & ReconciliationStore & SellerStore,
+   connection: SellerConnectionRecord,
+   input: { eventType: string; resourceId: string | null },
+ ): Promise<ProviderEvidenceRecord> {
+@@ -80,7 +84,7 @@
+  * Never creates a referral or duplicate connection aggregate.
+  */
+ export async function reconcileSellerConnectionAggregate(input: {
+-  store: PaymentReliabilityStore;
++  store: EvidenceStore & ReconciliationStore & SellerStore;
+   providerLookup: SellerConnectionReconciliationLookup;
+   connection: SellerConnectionRecord;
+ }): Promise<SellerConnectionReconcileResult> {
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/seller-evidence-application.ts src/core/lib/seller-evidence-application.ts
+--- .superpowers/snap-after-t4/src/core/lib/seller-evidence-application.ts	2026-10-22 12:57:32.048185699 +0300
++++ src/core/lib/seller-evidence-application.ts	2026-10-22 13:27:10.446910317 +0300
+@@ -4,7 +4,7 @@
+ } from '../../contracts/index';
+ import { evaluateSellerConnectionReadiness } from './seller-connection-readiness';
+ import { deriveSellerConnectionStatus } from './seller-transition-policy';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type { SellerStore } from './persistence/payment-reliability-store';
+ 
+ const REQUIRED_SCOPE_HINTS = ['payments', 'refund'];
+ 
+@@ -80,7 +80,7 @@
+ }
+ 
+ export async function applySellerMerchantStatus(input: {
+-  store: PaymentReliabilityStore;
++  store: SellerStore;
+   connection: SellerConnectionRecord;
+   snapshot: ExecuteGetSellerMerchantStatusResult;
+ }): Promise<SellerConnectionRecord> {
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/subscription-evidence-application.ts src/core/lib/subscription-evidence-application.ts
+--- .superpowers/snap-after-t4/src/core/lib/subscription-evidence-application.ts	2026-10-22 12:57:32.048379139 +0300
++++ src/core/lib/subscription-evidence-application.ts	2026-10-22 13:27:10.447191451 +0300
+@@ -15,7 +15,7 @@
+   subscriptionStatusToOperationStatus,
+   type SubscriptionStateApplySource,
+ } from './subscription-transition-policy';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type { OperationStore } from './persistence/payment-reliability-store';
+ import { assertTransitionAllowed } from './transition-policy';
+ 
+ const SUBSCRIPTION_TRANSITION_MAX_VERSION_RETRIES = 8;
+@@ -50,7 +50,7 @@
+ }
+ 
+ async function persistDomainAwareOperationUpdate(
+-  store: PaymentReliabilityStore,
++  store: OperationStore,
+   operation: PaymentOperation,
+   input: {
+     nextExecution: PaymentOperationStatus;
+@@ -171,7 +171,7 @@
+ }
+ 
+ async function applySubscriptionTransitionOnce(
+-  store: PaymentReliabilityStore,
++  store: OperationStore,
+   input: ApplySubscriptionTransitionInput,
+ ): Promise<PaymentOperation> {
+   const { operation, subscriptionStatus } = input;
+@@ -222,7 +222,7 @@
+ }
+ 
+ export async function applySubscriptionTransition(
+-  store: PaymentReliabilityStore,
++  store: OperationStore,
+   input: ApplySubscriptionTransitionInput,
+ ): Promise<PaymentOperation> {
+   let operation = input.operation;
+@@ -246,7 +246,7 @@
+ }
+ 
+ export async function applyPlanTransition(
+-  store: PaymentReliabilityStore,
++  store: OperationStore,
+   input: ApplyPlanTransitionInput,
+ ): Promise<PaymentOperation> {
+   const { operation, planStatus } = input;
+@@ -270,7 +270,7 @@
+ }
+ 
+ export async function applyPlanDomainUpdate(
+-  store: PaymentReliabilityStore,
++  store: OperationStore,
+   operation: PaymentOperation,
+   input: {
+     planStatus: PlanStatus;
+@@ -294,7 +294,7 @@
+ }
+ 
+ export async function applySubscriptionDomainUpdate(
+-  store: PaymentReliabilityStore,
++  store: OperationStore,
+   operation: PaymentOperation,
+   input: {
+     subscriptionStatus: SubscriptionStatus;
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/subscription-lifecycle-service.ts src/core/lib/subscription-lifecycle-service.ts
+--- .superpowers/snap-after-t4/src/core/lib/subscription-lifecycle-service.ts	2026-10-22 12:57:32.048420041 +0300
++++ src/core/lib/subscription-lifecycle-service.ts	2026-10-22 13:28:26.837274746 +0300
+@@ -45,7 +45,11 @@
+   planStatusToOperationStatus,
+   subscriptionStatusToOperationStatus,
+ } from './subscription-transition-policy';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type {
++  CreateExecutionLeaseStore,
++  OperationStore,
++} from './persistence/payment-reliability-store';
++import { resolveFirstProviderExecutionAt } from './provider-execution-transition';
+ import {
+   applyPlanDomainUpdate,
+   applySubscriptionDomainUpdate,
+@@ -55,8 +59,6 @@
+   isSubscriptionProviderPlanMismatchError,
+ } from './subscription-provider-plan-consistency';
+ 
+-const SUBSCRIPTION_CLAIMED_FOR_EXECUTION_REASON = 'Claimed for provider execution';
+-
+ function isTerminal(status: PaymentOperation['status']): boolean {
+   return status === 'succeeded' || status === 'failed';
+ }
+@@ -163,7 +165,7 @@
+ }
+ 
+ async function markSubscriptionLifecycleCommandSucceeded(
+-  store: PaymentReliabilityStore,
++  store: OperationStore,
+   commandOp: PaymentOperation,
+   kind: string,
+ ): Promise<PaymentOperation> {
+@@ -223,9 +225,12 @@
+   return { form: 'provider_plan', providerPlanId, offeringRef };
+ }
+ 
++/** The store capabilities `SubscriptionLifecycleService` uses (a `SubscriptionStore` has them). */
++export type SubscriptionLifecycleStore = OperationStore & CreateExecutionLeaseStore;
++
+ export class SubscriptionLifecycleService {
+   constructor(
+-    private readonly store: PaymentReliabilityStore,
++    private readonly store: SubscriptionLifecycleStore,
+     private readonly provider: SubscriptionProviderPort,
+   ) {}
+ 
+@@ -944,14 +949,7 @@
+   private async resolveFirstSubscriptionProviderExecutionAt(
+     operationId: string,
+   ): Promise<string | null> {
+-    const transitions = await this.store.listOperationTransitions(operationId);
+-    const executionTransitions = transitions
+-      .filter(
+-        (row) =>
+-          row.toStatus === 'submitted' && row.reason === SUBSCRIPTION_CLAIMED_FOR_EXECUTION_REASON,
+-      )
+-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+-    return executionTransitions[0]?.createdAt ?? null;
++    return resolveFirstProviderExecutionAt(await this.store.listOperationTransitions(operationId));
+   }
+ 
+   private async executeSubscriptionCreateProviderRetry(
+@@ -1028,7 +1026,7 @@
+     operation: PaymentOperation,
+     executionOwnerToken: string,
+     input: Omit<
+-      Parameters<PaymentReliabilityStore['transitionOperation']>[0],
++      Parameters<OperationStore['transitionOperation']>[0],
+       | 'operationId'
+       | 'expectedVersion'
+       | 'expectedExecutionOwnerToken'
+@@ -1085,7 +1083,7 @@
+       failureCode: resolved.code,
+       failureMessage: formatProviderFailureMessage(resolved),
+       reason: 'Subscription provider mutation returned uncertain or terminal outcome',
+-    } as Parameters<PaymentReliabilityStore['transitionOperation']>[0];
++    } as Parameters<OperationStore['transitionOperation']>[0];
+ 
+     try {
+       return await this.store.transitionOperation(transitionInput);
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/__tests__/claim-transition-kind.unit.test.ts src/core/lib/__tests__/claim-transition-kind.unit.test.ts
+--- .superpowers/snap-after-t4/src/core/lib/__tests__/claim-transition-kind.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/core/lib/__tests__/claim-transition-kind.unit.test.ts	2026-10-22 13:28:27.455272920 +0300
+@@ -0,0 +1,201 @@
++import { readFileSync, readdirSync } from 'node:fs';
++import { join } from 'node:path';
++import { describe, expect, it, vi } from 'vitest';
++import {
++  PAYMENT_RELIABILITY_ERROR,
++  PaymentReliabilityError,
++  type PaymentOperationTransitionRecord,
++} from '../../../contracts/index';
++import { evaluatePaypalSubscriptionCreateRetryEligibility } from '../../../paypal/lib/paypal-subscription-create-retry-policy';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import { resolveFirstProviderExecutionAt } from '../provider-execution-transition';
++import { SubscriptionLifecycleService } from '../subscription-lifecycle-service';
++import type { SubscriptionProviderPort } from '../subscription-provider-port';
++
++/*
++ * Issue #23: the create retry must not depend on the free-text reason a store writes for the
++ * claim transition. The claim is identified by the typed `transitionKind`, and for stores that do
++ * not record it, by the structural `prepared -> submitted` move.
++ */
++
++const scope = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'test-app',
++  environment: 'sandbox' as const,
++};
++
++const request = {
++  ...scope,
++  idempotencyKey: 'k',
++  providerPlanId: 'PLAN-1',
++  offeringRef: 'pro',
++  subscriber: { subscriberRef: 'u1' },
++};
++
++function timeoutThenCreatedProvider(): SubscriptionProviderPort {
++  return {
++    createProduct: vi.fn(),
++    getProduct: vi.fn(),
++    createPlan: vi.fn(),
++    getPlan: vi.fn().mockResolvedValue({
++      providerPlanId: 'PLAN-1',
++      providerProductId: 'PROD-1',
++      planStatus: 'active',
++    }),
++    activatePlan: vi.fn(),
++    deactivatePlan: vi.fn(),
++    createSubscription: vi
++      .fn()
++      .mockRejectedValueOnce({
++        code: PAYMENT_RELIABILITY_ERROR.PROVIDER_UNCERTAIN,
++        message: 'PayPal subscription HTTP request timed out',
++        retryable: true,
++        uncertain: true,
++      })
++      .mockResolvedValue({
++        providerSubscriptionId: 'SUB-1',
++        providerPlanId: 'PLAN-1',
++        subscriptionStatus: 'approval_pending',
++        approvalUrl: 'https://sandbox.paypal.com/approve/sub-1',
++        startTime: null,
++        nextBillingTime: null,
++      }),
++    getSubscription: vi.fn(),
++    cancelSubscription: vi.fn(),
++    suspendSubscription: vi.fn(),
++    activateSubscription: vi.fn(),
++  };
++}
++
++/** A host store written from the interface alone: its claim writes its own reason text. */
++function storeWithHostClaim(withKind: boolean): MemoryPaymentReliabilityStore {
++  const store = new MemoryPaymentReliabilityStore();
++  store.claimOperationForExecution = async (input) => {
++    const current = await store.findOperationById(input.operationId);
++    if (!current || current.version !== input.expectedVersion || current.status !== 'prepared') {
++      throw new PaymentReliabilityError(PAYMENT_RELIABILITY_ERROR.OPERATION_CONFLICT, 'conflict');
++    }
++    return store.transitionOperation({
++      operationId: input.operationId,
++      expectedVersion: input.expectedVersion,
++      nextStatus: 'submitted',
++      reason: 'host: picked up by worker 7',
++      ...(withKind ? { transitionKind: 'claim_execution' as const } : {}),
++    });
++  };
++  return store;
++}
++
++const retryOptions = {
++  evaluateProviderCreateRetryEligibility: (firstAt: string | null) =>
++    evaluatePaypalSubscriptionCreateRetryEligibility(firstAt),
++};
++
++describe('create retry does not depend on the claim reason text', () => {
++  it.each([
++    ['with transitionKind', true],
++    ['without transitionKind (structural prepared -> submitted)', false],
++  ])(
++    'retries an unknown create when the store claim writes another reason %s',
++    async (_label, withKind) => {
++      const store = storeWithHostClaim(withKind);
++      const provider = timeoutThenCreatedProvider();
++      const lifecycle = new SubscriptionLifecycleService(store, provider);
++
++      const created = await lifecycle.createSubscription(request);
++      expect(created.operationStatus).toBe('unknown');
++
++      const retried = await lifecycle.retrySubscriptionCreate(
++        {
++          ...request,
++          subscriptionOperationId: created.subscriptionOperationId,
++        },
++        retryOptions,
++      );
++      expect(provider.createSubscription).toHaveBeenCalledTimes(2);
++      expect(retried.operationStatus).toBe('submitted');
++      expect(retried.providerSubscriptionId).toBe('SUB-1');
++    },
++  );
++
++  it('the memory store records claim_execution for a claim and claim_retry for a retry lease', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const provider = timeoutThenCreatedProvider();
++    const lifecycle = new SubscriptionLifecycleService(store, provider);
++    const created = await lifecycle.createSubscription(request);
++    await lifecycle.retrySubscriptionCreate(
++      { ...request, subscriptionOperationId: created.subscriptionOperationId },
++      retryOptions,
++    );
++    const kinds = (await store.listOperationTransitions(created.subscriptionOperationId)).map(
++      (row) => `${row.fromStatus}->${row.toStatus}:${row.transitionKind ?? '-'}`,
++    );
++    expect(kinds).toEqual([
++      'prepared->submitted:claim_execution',
++      'submitted->unknown:-',
++      'unknown->submitted:claim_retry',
++      'submitted->submitted:-',
++    ]);
++  });
++});
++
++describe('resolveFirstProviderExecutionAt', () => {
++  const row = (
++    over: Partial<PaymentOperationTransitionRecord>,
++  ): PaymentOperationTransitionRecord => ({
++    transitionId: Math.random().toString(36),
++    operationId: 'op',
++    fromStatus: 'prepared',
++    toStatus: 'submitted',
++    evidenceId: null,
++    reason: 'anything at all',
++    createdAt: '2026-01-01T00:00:00.000Z',
++    ...over,
++  });
++
++  it('uses the earliest claim_execution transition whatever its reason', () => {
++    expect(
++      resolveFirstProviderExecutionAt([
++        row({
++          createdAt: '2026-01-01T00:00:05.000Z',
++          transitionKind: 'claim_execution',
++        }),
++        row({
++          fromStatus: 'unknown',
++          createdAt: '2026-01-01T00:00:01.000Z',
++          transitionKind: 'claim_retry',
++        }),
++        row({
++          createdAt: '2026-01-01T00:00:03.000Z',
++          transitionKind: 'claim_execution',
++        }),
++      ]),
++    ).toBe('2026-01-01T00:00:03.000Z');
++  });
++
++  it('falls back to an untyped prepared -> submitted move, never to a retry claim', () => {
++    expect(
++      resolveFirstProviderExecutionAt([
++        row({ fromStatus: 'unknown', transitionKind: 'claim_retry' }),
++        row({ createdAt: '2026-01-01T00:00:07.000Z', transitionKind: null }),
++      ]),
++    ).toBe('2026-01-01T00:00:07.000Z');
++    expect(
++      resolveFirstProviderExecutionAt([row({ fromStatus: 'unknown', toStatus: 'submitted' })]),
++    ).toBeNull();
++  });
++});
++
++describe('services never branch on free-text transition reasons', () => {
++  it('no core module compares a transition reason or uses the old claim reason literal', () => {
++    const dir = join(import.meta.dirname, '..');
++    const offenders = readdirSync(dir)
++      .filter((file) => file.endsWith('.ts'))
++      .filter((file) => {
++        const text = readFileSync(join(dir, file), 'utf8');
++        return /\.reason\s*===|===\s*\w*\.reason\b|Claimed for provider execution/.test(text);
++      });
++    expect(offenders).toEqual([]);
++  });
++});
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/__tests__/payment-recovery-consumer-delivery.unit.test.ts src/core/lib/__tests__/payment-recovery-consumer-delivery.unit.test.ts
+--- .superpowers/snap-after-t4/src/core/lib/__tests__/payment-recovery-consumer-delivery.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/core/lib/__tests__/payment-recovery-consumer-delivery.unit.test.ts	2026-10-22 13:30:48.151847489 +0300
+@@ -0,0 +1,348 @@
++import { describe, expect, it, vi } from 'vitest';
++import { buildOperationIdempotencyScope } from '../operation-idempotency';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import {
++  DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS,
++  PaymentRecoveryService,
++} from '../payment-recovery-service';
++import type { VerifiedProcessedPaymentEvent } from '../payment-event-consumer';
++import { WebhookProcessingService } from '../webhook-processing-service';
++
++/*
++ * Issues #21 and #24: consumer delivery through `PaymentRecoveryService`. Ports probes p5b
++ * (no consumer configured) and p7 (failing consumer, failing acknowledgement write).
++ */
++
++const scope = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'app',
++  environment: 'sandbox' as const,
++};
++
++async function seedProcessedEvents(
++  store: MemoryPaymentReliabilityStore,
++  webhooks: WebhookProcessingService,
++  count: number,
++): Promise<string[]> {
++  const eventIds: string[] = [];
++  for (let i = 0; i < count; i += 1) {
++    const subscriptionId = `S-${i}`;
++    const op = await store.createOperation({
++      ...scope,
++      idempotencyKey: subscriptionId,
++      idempotencyScope: buildOperationIdempotencyScope({
++        ...scope,
++        kind: 'subscription',
++      }),
++      commandFingerprint: 'fp',
++      kind: 'subscription',
++      subscriptionStatus: 'approval_pending',
++      providerSubscriptionId: subscriptionId,
++      providerPlanId: 'P-1',
++    });
++    await store.transitionOperation({
++      operationId: op.operationId,
++      expectedVersion: op.version,
++      nextStatus: 'submitted',
++      providerReferenceId: subscriptionId,
++      reason: 'seed',
++    });
++    const eventId = `WH-${i}`;
++    const receipt = await webhooks.receiveWebhook({
++      ...scope,
++      rawBody: JSON.stringify({
++        id: eventId,
++        event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++        resource: { id: subscriptionId },
++      }),
++      verify: async () => ({
++        verified: true,
++        transmissionId: 't',
++        eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
++        resourceId: subscriptionId,
++      }),
++    });
++    expect(receipt.processingStatus).toBe('processed');
++    eventIds.push(eventId);
++  }
++  return eventIds;
++}
++
++async function evidenceFor(store: MemoryPaymentReliabilityStore, eventId: string) {
++  const row = await store.findEvidenceByProviderEvent('paypal', 'default', 'sandbox', eventId);
++  if (!row) {
++    throw new Error(`missing evidence ${eventId}`);
++  }
++  return row;
++}
++
++describe('recover() without a consumer (issue #21)', () => {
++  it('claims no rows for delivery and reports delivered 0 on every run (probe p5b)', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const eventIds = await seedProcessedEvents(store, webhooks, 30);
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: null,
++    });
++
++    for (let run = 0; run < 3; run += 1) {
++      const summary = await recovery.recover({ workerId: 'w', limit: 25 });
++      expect(summary).toEqual({
++        claimed: 0,
++        verified: 0,
++        processed: 0,
++        delivered: 0,
++        skipped: 0,
++        failed: 0,
++      });
++    }
++    for (const eventId of eventIds) {
++      const row = await evidenceFor(store, eventId);
++      expect(row.consumerDeliveryStatus).toBe('pending');
++      expect(row.claimWorkerId).toBeNull();
++    }
++  });
++
++  it('counts rows a store returns anyway as skipped, never as delivered, and releases them', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const eventIds = await seedProcessedEvents(store, webhooks, 3);
++    const claim = store.claimPendingEvidence.bind(store);
++    // A host store that ignores `includeConsumerDelivery`.
++    store.claimPendingEvidence = (input) => claim({ ...input, includeConsumerDelivery: undefined });
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: null,
++    });
++
++    const summary = await recovery.recover({ workerId: 'w', limit: 25 });
++    expect(summary).toMatchObject({
++      claimed: 3,
++      delivered: 0,
++      skipped: 3,
++      failed: 0,
++    });
++    for (const eventId of eventIds) {
++      const row = await evidenceFor(store, eventId);
++      expect(row.consumerDeliveryStatus).toBe('pending');
++      expect(row.claimLeaseExpiresAt).toBeNull();
++    }
++  });
++
++  it('still processes verified pending evidence without a consumer', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const inserted = await store.insertEvidence({
++      ...scope,
++      evidenceKind: 'webhook',
++      providerEventId: 'WH-PENDING',
++      rawPayload: '{"event_type":"SOMETHING.ELSE","resource":{"id":"x"}}',
++      payloadSha256: 'sha',
++      eventType: 'SOMETHING.ELSE',
++      resourceId: 'x',
++    });
++    await store.updateEvidence({
++      evidenceId: inserted.evidenceId,
++      verificationStatus: 'verified',
++    });
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: null,
++    });
++    const summary = await recovery.recover({ workerId: 'w' });
++    expect(summary).toMatchObject({ claimed: 1, delivered: 0, skipped: 1 });
++    expect((await store.findEvidenceById(inserted.evidenceId))?.processingStatus).toBe(
++      'unsupported',
++    );
++  });
++});
++
++describe('consumer delivery attempts (issue #24)', () => {
++  it('defaults the attempt cap to 10', () => {
++    expect(DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS).toBe(10);
++  });
++
++  it('stops after maxConsumerDeliveryAttempts with a terminal failed_terminal status (probe p7)', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const [eventId] = await seedProcessedEvents(store, webhooks, 1);
++    const deliver = vi.fn(async () => {
++      throw new Error('entitlement db down');
++    });
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: { deliver },
++      maxConsumerDeliveryAttempts: 3,
++    });
++
++    const runs = [];
++    for (let run = 0; run < 5; run += 1) {
++      runs.push(await recovery.recover({ workerId: 'w' }));
++    }
++    expect(deliver).toHaveBeenCalledTimes(3);
++    expect(runs.map((summary) => summary.failed)).toEqual([1, 1, 1, 0, 0]);
++    expect(runs.map((summary) => summary.claimed)).toEqual([1, 1, 1, 0, 0]);
++    const row = await evidenceFor(store, eventId!);
++    expect(row.consumerDeliveryStatus).toBe('failed_terminal');
++    expect(row.consumerDeliveryAttempts).toBe(3);
++    expect(row.consumerDeliveryLastError).toBe('Consumer event delivery failed');
++
++    // A redelivered webhook for a terminal row is acknowledged as a duplicate.
++    const again = await webhooks.receiveWebhook({
++      ...scope,
++      rawBody: JSON.stringify({
++        id: eventId,
++        event_type: 'BILLING.SUBSCRIPTION.ACTIVATED',
++        resource: { id: 'S-0' },
++      }),
++      verify: async () => ({
++        verified: true,
++        transmissionId: 't',
++        eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
++        resourceId: 'S-0',
++      }),
++    });
++    expect(again.duplicate).toBe(true);
++  });
++
++  it('uses the default cap of 10 attempts', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const [eventId] = await seedProcessedEvents(store, webhooks, 1);
++    const deliver = vi.fn(async () => {
++      throw new Error('down');
++    });
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: { deliver },
++    });
++    for (let run = 0; run < 12; run += 1) {
++      await recovery.recover({ workerId: 'w' });
++    }
++    expect(deliver).toHaveBeenCalledTimes(10);
++    expect((await evidenceFor(store, eventId!)).consumerDeliveryStatus).toBe('failed_terminal');
++  });
++
++  it('marks a row terminal without delivering when it already reached the cap', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const [eventId] = await seedProcessedEvents(store, webhooks, 1);
++    const row = await evidenceFor(store, eventId!);
++    await store.updateEvidence({
++      evidenceId: row.evidenceId,
++      consumerDeliveryStatus: 'failed',
++      consumerDeliveryAttempts: 4,
++    });
++    const deliver = vi.fn(async () => undefined);
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: { deliver },
++      maxConsumerDeliveryAttempts: 4,
++    });
++    const summary = await recovery.recover({ workerId: 'w' });
++    expect(summary).toMatchObject({ claimed: 1, delivered: 0, skipped: 1 });
++    expect(deliver).not.toHaveBeenCalled();
++    expect((await evidenceFor(store, eventId!)).consumerDeliveryStatus).toBe('failed_terminal');
++  });
++
++  it('rejects an invalid attempt cap', () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    for (const value of [0, -1, 1.5, Number.NaN]) {
++      expect(
++        () =>
++          new PaymentRecoveryService({
++            store,
++            webhookProcessing: webhooks,
++            consumer: null,
++            maxConsumerDeliveryAttempts: value,
++          }),
++      ).toThrow(/maxConsumerDeliveryAttempts/);
++    }
++  });
++
++  it('delivers at least once: a failed acknowledgement write causes one more delivery', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const [eventId] = await seedProcessedEvents(store, webhooks, 1);
++    const deliver = vi.fn(async () => undefined);
++    const update = store.updateEvidence.bind(store);
++    let failOnce = true;
++    store.updateEvidence = async (input) => {
++      if (failOnce && input.consumerDeliveryStatus === 'confirmed') {
++        failOnce = false;
++        throw new Error('db blip');
++      }
++      return update(input);
++    };
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: { deliver },
++    });
++    const first = await recovery.recover({ workerId: 'w' });
++    const second = await recovery.recover({ workerId: 'w' });
++    expect(first).toMatchObject({ delivered: 0, failed: 1 });
++    expect(second).toMatchObject({ delivered: 1, failed: 0 });
++    expect(deliver).toHaveBeenCalledTimes(2);
++    expect((await evidenceFor(store, eventId!)).consumerDeliveryStatus).toBe('confirmed');
++  });
++});
++
++describe('the consumer receives a narrowed event (issue #24)', () => {
++  const narrowedKeys = [
++    'accountRef',
++    'applicationRef',
++    'environment',
++    'eventType',
++    'evidenceId',
++    'processingStatus',
++    'providerCode',
++    'providerEventId',
++    'relatedOperationId',
++    'resourceId',
++    'verificationStatus',
++  ];
++
++  it('omits rawPayload and other row internals by default', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    const [eventId] = await seedProcessedEvents(store, webhooks, 1);
++    const received: VerifiedProcessedPaymentEvent[] = [];
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: { deliver: async (event) => void received.push(event) },
++    });
++    expect(await recovery.recover({ workerId: 'w' })).toMatchObject({
++      delivered: 1,
++    });
++    expect(Object.keys(received[0]!).sort()).toEqual(narrowedKeys);
++    expect(received[0]!.providerEventId).toBe(eventId);
++    expect(received[0]!.verificationStatus).toBe('verified');
++  });
++
++  it('includes rawPayload only when the host asks for it', async () => {
++    const store = new MemoryPaymentReliabilityStore();
++    const webhooks = new WebhookProcessingService(store);
++    await seedProcessedEvents(store, webhooks, 1);
++    const received: VerifiedProcessedPaymentEvent[] = [];
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: { deliver: async (event) => void received.push(event) },
++      includeRawPayload: true,
++    });
++    await recovery.recover({ workerId: 'w' });
++    expect(Object.keys(received[0]!).sort()).toEqual([...narrowedKeys, 'rawPayload'].sort());
++    expect(JSON.parse(received[0]!.rawPayload!).event_type).toBe('BILLING.SUBSCRIPTION.ACTIVATED');
++  });
++});
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/__tests__/payment-recovery-service.unit.test.ts src/core/lib/__tests__/payment-recovery-service.unit.test.ts
+--- .superpowers/snap-after-t4/src/core/lib/__tests__/payment-recovery-service.unit.test.ts	2026-10-22 12:57:32.044946636 +0300
++++ src/core/lib/__tests__/payment-recovery-service.unit.test.ts	2026-10-22 13:18:15.368767547 +0300
+@@ -249,10 +249,11 @@
+ 
+   it('respects recovery batch limit', async () => {
+     const store = new MemoryPaymentReliabilityStore();
++    // Rows awaiting delivery are claimed only when a consumer is configured (issue #21).
+     const recovery = new PaymentRecoveryService({
+       store,
+       webhookProcessing: new WebhookProcessingService(store),
+-      consumer: null,
++      consumer: { deliver: vi.fn(async () => undefined) },
+     });
+     for (let i = 0; i < 3; i += 1) {
+       const row = await store.insertEvidence({
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/__tests__/store-contract-exports.unit.test.ts src/core/lib/__tests__/store-contract-exports.unit.test.ts
+--- .superpowers/snap-after-t4/src/core/lib/__tests__/store-contract-exports.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/core/lib/__tests__/store-contract-exports.unit.test.ts	2026-10-22 13:31:25.102732869 +0300
+@@ -0,0 +1,47 @@
++import { describe, expect, it } from 'vitest';
++import type {
++  CheckoutStore,
++  CreateExecutionLeaseStore,
++  EvidenceAdminStore,
++  EvidenceStore,
++  MarketplaceStore,
++  OperationStore,
++  PaymentReliabilityStore,
++  PayoutStore,
++  ReconciliationStore,
++  SellerStore,
++  SubscriptionOperationLookupStore,
++  SubscriptionStore,
++} from '../../../index';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++
++describe('store contract exports (issues #6, #23, #24)', () => {
++  it('exports the runtime values from the root entry', async () => {
++    const root = await import('../../../index');
++    expect(root.OPERATION_TRANSITION_KIND).toEqual({
++      CLAIM_EXECUTION: 'claim_execution',
++      CLAIM_RETRY: 'claim_retry',
++    });
++    expect(root.DEFAULT_MAX_CONSUMER_DELIVERY_ATTEMPTS).toBe(10);
++    expect(typeof root.toVerifiedProcessedPaymentEvent).toBe('function');
++    expect(typeof root.isAwaitingConsumerDeliveryOnly).toBe('function');
++  });
++
++  it('keeps PaymentReliabilityStore the union of the capability interfaces', () => {
++    const store: PaymentReliabilityStore = new MemoryPaymentReliabilityStore();
++    const parts: [
++      OperationStore,
++      CreateExecutionLeaseStore,
++      SubscriptionOperationLookupStore,
++      EvidenceStore,
++      ReconciliationStore,
++      SubscriptionStore,
++      CheckoutStore,
++      PayoutStore,
++      SellerStore,
++      MarketplaceStore,
++      EvidenceAdminStore,
++    ] = [store, store, store, store, store, store, store, store, store, store, store];
++    expect(parts.length).toBe(11);
++  });
++});
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/__tests__/subscription-store-only.unit.test.ts src/core/lib/__tests__/subscription-store-only.unit.test.ts
+--- .superpowers/snap-after-t4/src/core/lib/__tests__/subscription-store-only.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/core/lib/__tests__/subscription-store-only.unit.test.ts	2026-10-22 13:28:27.438272970 +0300
+@@ -0,0 +1,271 @@
++import { describe, expect, it, vi } from 'vitest';
++import { buildOperationIdempotencyScope } from '../operation-idempotency';
++import { MemoryPaymentReliabilityStore } from '../persistence/memory-payment-reliability-store';
++import type { SubscriptionStore } from '../persistence/payment-reliability-store';
++import { PaymentRecoveryService } from '../payment-recovery-service';
++import { ReconciliationService } from '../reconciliation-service';
++import type { ReconciliationProviderLookup } from '../checkout-provider-port';
++import { SubscriptionLifecycleService } from '../subscription-lifecycle-service';
++import type { SubscriptionProviderPort } from '../subscription-provider-port';
++import { WebhookProcessingService } from '../webhook-processing-service';
++
++/*
++ * Issue #6: a subscriptions-only host implements `SubscriptionStore` and nothing else. The four
++ * services a subscription host wires must run against such a store: no checkout, payout, seller
++ * or marketplace method may be called (or even exist).
++ */
++
++// Listed here by hand (not imported) so the test pins the composite independently of the source.
++const SUBSCRIPTION_STORE_METHODS = [
++  'createOperation',
++  'findOperationById',
++  'findOperationByIdempotency',
++  'findOperationByProviderReference',
++  'claimOperationForExecution',
++  'updateOperation',
++  'transitionOperation',
++  'listOperationTransitions',
++  'acquireCheckoutCreateExecutionLease',
++  'findOperationByProviderProductId',
++  'findOperationByProviderPlanId',
++  'findOperationByProviderSubscriptionId',
++  'insertEvidence',
++  'findEvidenceById',
++  'findEvidenceByProviderEvent',
++  'updateEvidence',
++  'claimPendingEvidence',
++  'listReconciliationCandidates',
++  'listUncertainOperations',
++  'insertReconciliationAttempt',
++] as const;
++
++const NON_SUBSCRIPTION_METHODS = [
++  'findOperationByProviderOrderId',
++  'findOperationByProviderCaptureId',
++  'findOperationByProviderRefundId',
++  'reserveRefundCapacity',
++  'findOperationBySenderBatchId',
++  'findOperationBySenderItemId',
++  'findOperationByProviderPayoutBatchId',
++  'findOperationByProviderPayoutItemId',
++  'listOperationsByParent',
++  'findOperationByProviderReferralId',
++  'createSellerConnection',
++  'findSellerConnectionByMerchantId',
++  'findSellerConnectionByTrackingId',
++  'listSellerConnectionsForReconciliation',
++  'updateSellerConnection',
++  'insertMarketplacePurchaseUnits',
++  'findMarketplacePurchaseUnitByCaptureId',
++  'listMarketplacePurchaseUnits',
++  'updateMarketplacePurchaseUnit',
++  'findLatestReconciliationEvidenceForResource',
++  'listProviderEvidenceForRecovery',
++] as const;
++
++function subscriptionOnlyStore(): {
++  store: SubscriptionStore;
++  calls: string[];
++} {
++  const backing = new MemoryPaymentReliabilityStore();
++  const calls: string[] = [];
++  const store: Record<string, unknown> = {};
++  for (const method of SUBSCRIPTION_STORE_METHODS) {
++    const fn = (backing[method] as (...args: unknown[]) => unknown).bind(backing);
++    store[method] = (...args: unknown[]) => {
++      calls.push(method);
++      return fn(...args);
++    };
++  }
++  return { store: store as unknown as SubscriptionStore, calls };
++}
++
++const scope = {
++  providerCode: 'paypal',
++  accountRef: 'default',
++  applicationRef: 'test-app',
++  environment: 'sandbox' as const,
++};
++
++function fakeProvider(): SubscriptionProviderPort {
++  return {
++    createProduct: vi.fn(),
++    getProduct: vi.fn(),
++    createPlan: vi.fn(),
++    getPlan: vi.fn().mockResolvedValue({
++      providerPlanId: 'PLAN-1',
++      providerProductId: 'PROD-1',
++      planStatus: 'active',
++    }),
++    activatePlan: vi.fn(),
++    deactivatePlan: vi.fn(),
++    createSubscription: vi.fn().mockResolvedValue({
++      providerSubscriptionId: 'SUB-1',
++      providerPlanId: 'PLAN-1',
++      subscriptionStatus: 'approval_pending',
++      approvalUrl: 'https://sandbox.paypal.com/approve/sub-1',
++      startTime: null,
++      nextBillingTime: null,
++    }),
++    getSubscription: vi.fn(),
++    cancelSubscription: vi.fn(),
++    suspendSubscription: vi.fn(),
++    activateSubscription: vi.fn(),
++  };
++}
++
++function lookup(): ReconciliationProviderLookup {
++  const unexpected = () => Promise.reject(new Error('not a subscription lookup'));
++  return {
++    getOrder: unexpected,
++    getRefund: unexpected,
++    getPayoutBatch: unexpected,
++    getPayoutItem: unexpected,
++    getProduct: unexpected,
++    getPlan: unexpected,
++    getReferral: unexpected,
++    getMarketplaceOrder: unexpected,
++    getSubscription: vi.fn().mockResolvedValue({
++      providerSubscriptionId: 'SUB-1',
++      providerPlanId: 'PLAN-1',
++      subscriptionStatus: 'active',
++      startTime: null,
++      nextBillingTime: null,
++    }),
++  } as unknown as ReconciliationProviderLookup;
++}
++
++function webhookBody(eventType: string, resourceId: string, id: string): string {
++  return JSON.stringify({
++    id,
++    event_type: eventType,
++    resource: { id: resourceId },
++  });
++}
++
++const verified = (eventType: string, resourceId: string) => async () => ({
++  verified: true,
++  transmissionId: 't',
++  eventType,
++  resourceId,
++});
++
++async function createSubscription(store: SubscriptionStore) {
++  const lifecycle = new SubscriptionLifecycleService(store, fakeProvider());
++  return lifecycle.createSubscription({
++    ...scope,
++    idempotencyKey: 'sub-only-1',
++    providerPlanId: 'PLAN-1',
++    offeringRef: 'pro',
++    subscriber: { subscriberRef: 'user-1' },
++  });
++}
++
++describe('services with a store that implements only SubscriptionStore', () => {
++  it('the test store has no checkout, payout, seller or marketplace method', () => {
++    const { store } = subscriptionOnlyStore();
++    for (const method of NON_SUBSCRIPTION_METHODS) {
++      expect(method in store, method).toBe(false);
++    }
++  });
++
++  it('SubscriptionLifecycleService creates a subscription', async () => {
++    const { store } = subscriptionOnlyStore();
++    const created = await createSubscription(store);
++    expect(created.operationStatus).toBe('submitted');
++    expect(created.providerSubscriptionId).toBe('SUB-1');
++  });
++
++  it('WebhookProcessingService applies subscription events and marks other families unsupported', async () => {
++    const { store } = subscriptionOnlyStore();
++    await createSubscription(store);
++    const webhooks = new WebhookProcessingService(store);
++
++    const activated = await webhooks.receiveWebhook({
++      ...scope,
++      rawBody: webhookBody('BILLING.SUBSCRIPTION.ACTIVATED', 'SUB-1', 'WH-ACT'),
++      verify: verified('BILLING.SUBSCRIPTION.ACTIVATED', 'SUB-1'),
++    });
++    expect(activated.processingStatus).toBe('processed');
++    const operation = await store.findOperationByProviderSubscriptionId(
++      scope.providerCode,
++      scope.accountRef,
++      scope.environment,
++      'SUB-1',
++    );
++    expect(operation?.subscriptionStatus).toBe('active');
++
++    for (const [eventType, id] of [
++      ['PAYMENT.CAPTURE.COMPLETED', 'WH-CAP'],
++      ['CHECKOUT.ORDER.APPROVED', 'WH-ORD'],
++      ['PAYMENT.PAYOUTSBATCH.SUCCESS', 'WH-PAYOUT'],
++      ['MERCHANT.ONBOARDING.COMPLETED', 'WH-SELLER'],
++    ] as const) {
++      const receipt = await webhooks.receiveWebhook({
++        ...scope,
++        rawBody: webhookBody(eventType, 'RES-1', id),
++        verify: verified(eventType, 'RES-1'),
++      });
++      expect(receipt.processingStatus, eventType).toBe('unsupported');
++    }
++
++    const payouts = await webhooks.reprocessVerifiedUnmatchedPayoutEvidence({
++      limit: 10,
++    });
++    expect(payouts).toEqual({ processed: 0, skipped: 0, unmatched: 0 });
++  });
++
++  it('ReconciliationService reconciles an uncertain subscription without seller connections', async () => {
++    const { store, calls } = subscriptionOnlyStore();
++    const scopeKey = buildOperationIdempotencyScope({
++      ...scope,
++      kind: 'subscription',
++    });
++    const operation = await store.createOperation({
++      ...scope,
++      idempotencyKey: 'sub-uncertain',
++      idempotencyScope: scopeKey,
++      commandFingerprint: 'fp',
++      kind: 'subscription',
++      providerPlanId: 'PLAN-1',
++      providerSubscriptionId: 'SUB-1',
++      subscriptionStatus: 'approval_pending',
++    });
++    const claimed = await store.claimOperationForExecution({
++      operationId: operation.operationId,
++      expectedVersion: operation.version,
++    });
++    await store.transitionOperation({
++      operationId: claimed.operationId,
++      expectedVersion: claimed.version,
++      nextStatus: 'unknown',
++      reason: 'timeout',
++    });
++
++    const result = await new ReconciliationService(store, lookup()).reconcile(10);
++    expect(result.applied).toBe(1);
++    const after = await store.findOperationById(operation.operationId);
++    expect(after?.subscriptionStatus).toBe('active');
++    expect(calls).not.toContain('listSellerConnectionsForReconciliation');
++  });
++
++  it('PaymentRecoveryService recovers and delivers with the subscription store', async () => {
++    const { store } = subscriptionOnlyStore();
++    await createSubscription(store);
++    const webhooks = new WebhookProcessingService(store);
++    await webhooks.receiveWebhook({
++      ...scope,
++      rawBody: webhookBody('BILLING.SUBSCRIPTION.ACTIVATED', 'SUB-1', 'WH-REC'),
++      verify: verified('BILLING.SUBSCRIPTION.ACTIVATED', 'SUB-1'),
++    });
++    const deliver = vi.fn(async () => undefined);
++    const recovery = new PaymentRecoveryService({
++      store,
++      webhookProcessing: webhooks,
++      consumer: { deliver },
++    });
++    const summary = await recovery.recover({ workerId: 'w1' });
++    expect(summary).toMatchObject({ claimed: 1, delivered: 1, failed: 0 });
++    expect(deliver).toHaveBeenCalledTimes(1);
++  });
++});
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/webhook-evidence-resume.ts src/core/lib/webhook-evidence-resume.ts
+--- .superpowers/snap-after-t4/src/core/lib/webhook-evidence-resume.ts	2026-10-22 12:57:32.048699168 +0300
++++ src/core/lib/webhook-evidence-resume.ts	2026-10-22 13:27:10.447315652 +0300
+@@ -42,11 +42,27 @@
+   return 'ack_duplicate';
+ }
+ 
++/**
++ * No consumer delivery is left to do: confirmed, given up (`failed_terminal`), or a legacy row
++ * without delivery fields.
++ */
+ export function isConsumerDeliveryComplete(evidence: ProviderEvidenceRecord): boolean {
+   if (evidence.consumerDeliveryStatus === undefined) {
+     return true;
+   }
+-  return evidence.consumerDeliveryStatus === 'confirmed';
++  return (
++    evidence.consumerDeliveryStatus === 'confirmed' ||
++    evidence.consumerDeliveryStatus === 'failed_terminal'
++  );
++}
++
++/** Verified and processed; only the consumer delivery is outstanding. */
++export function isAwaitingConsumerDeliveryOnly(evidence: ProviderEvidenceRecord): boolean {
++  return (
++    evidence.verificationStatus === 'verified' &&
++    evidence.processingStatus === 'processed' &&
++    !isConsumerDeliveryComplete(evidence)
++  );
+ }
+ 
+ export function verificationFailureKind(
+@@ -72,7 +88,7 @@
+     return true;
+   }
+   if (evidence.verificationStatus === 'verified' && evidence.processingStatus === 'processed') {
+-    return evidence.consumerDeliveryStatus !== 'confirmed';
++    return !isConsumerDeliveryComplete(evidence);
+   }
+   if (evidence.verificationStatus === 'verified' && evidence.processingStatus === 'unmatched') {
+     return true;
+diff --color -ruN .superpowers/snap-after-t4/src/core/lib/webhook-processing-service.ts src/core/lib/webhook-processing-service.ts
+--- .superpowers/snap-after-t4/src/core/lib/webhook-processing-service.ts	2026-10-22 12:57:32.048736518 +0300
++++ src/core/lib/webhook-processing-service.ts	2026-10-22 13:14:27.807609755 +0300
+@@ -46,7 +46,19 @@
+   deriveMarketplaceOrderStatusFromUnits,
+   mapMarketplaceCaptureWebhookToUnitStatus,
+ } from './marketplace-transition-policy';
+-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
++import type {
++  CheckoutStore,
++  MarketplaceStore,
++  PayoutStore,
++  SellerStore,
++  SubscriptionStore,
++} from './persistence/payment-reliability-store';
++import {
++  hasCheckoutStore,
++  hasMarketplaceStore,
++  hasPayoutStore,
++  hasSellerStore,
++} from './persistence/store-capabilities';
+ import { sha256Payload } from './sha256-payload';
+ import { deriveProviderEventId } from '../../subscription-core/lib/normalize-paypal-subscription-event';
+ import { parseProviderTimestamp } from '../../subscription-core/lib/subscription-status-rules';
+@@ -194,11 +206,18 @@
+   'getSubscription'
+ >;
+ 
++/**
++ * A `SubscriptionStore` is enough. Checkout, payout, seller and marketplace events are applied only
++ * when the store has that capability; otherwise their evidence is recorded as `unsupported`.
++ */
++export type WebhookProcessingStore = SubscriptionStore &
++  Partial<CheckoutStore & PayoutStore & SellerStore & MarketplaceStore>;
++
+ export class WebhookProcessingService {
+   private readonly transmissionWindow: TransmissionWindow | null;
+ 
+   constructor(
+-    private readonly store: PaymentReliabilityStore,
++    private readonly store: WebhookProcessingStore,
+     private readonly subscriptionProviderLookup?: WebhookSubscriptionProviderLookup,
+     private readonly intakeOptions: WebhookIntakeOptions = {},
+   ) {
+@@ -445,7 +464,10 @@
+       ? mapPayoutWebhookEventToFinancialStatus(current.eventType)
+       : null;
+     if (payoutFinancialStatus) {
+-      return this.processPayoutWebhook(current, payoutFinancialStatus, rawBody);
++      if (!hasPayoutStore(this.store)) {
++        return this.markUnsupported(current.evidenceId);
++      }
++      return this.processPayoutWebhook(this.store, current, payoutFinancialStatus, rawBody);
+     }
+ 
+     const subscriptionRefreshOnly =
+@@ -470,27 +492,27 @@
+     }
+ 
+     if (current.eventType && isSellerOnboardingWebhookEvent(current.eventType)) {
+-      return this.processSellerOnboardingWebhook(current, rawBody);
++      if (!hasSellerStore(this.store)) {
++        return this.markUnsupported(current.evidenceId);
++      }
++      return this.processSellerOnboardingWebhook(this.store, current, rawBody);
+     }
+ 
+-    const marketplaceReceipt = await this.tryProcessMarketplaceWebhook(current);
+-    if (marketplaceReceipt) {
+-      return marketplaceReceipt;
++    if (hasMarketplaceStore(this.store) && hasCheckoutStore(this.store)) {
++      const marketplaceReceipt = await this.tryProcessMarketplaceWebhook(this.store, current);
++      if (marketplaceReceipt) {
++        return marketplaceReceipt;
++      }
+     }
+ 
+     const mappedStatus = current.eventType
+       ? mapCheckoutWebhookEventToStatus(current.eventType)
+       : null;
+-    if (!mappedStatus) {
+-      current = await this.store.updateEvidence({
+-        evidenceId: current.evidenceId,
+-        processingStatus: 'unsupported',
+-        processedAt: new Date().toISOString(),
+-      });
+-      return this.toReceipt(current, false);
++    if (!mappedStatus || !hasCheckoutStore(this.store)) {
++      return this.markUnsupported(current.evidenceId);
+     }
+ 
+-    const operation = await this.findCorrelatedOperation(current);
++    const operation = await this.findCorrelatedOperation(this.store, current);
+ 
+     if (!operation) {
+       current = await this.store.updateEvidence({
+@@ -520,6 +542,15 @@
+     return this.toReceipt(current, false);
+   }
+ 
++  private async markUnsupported(evidenceId: string): Promise<WebhookReceiptResponse> {
++    const updated = await this.store.updateEvidence({
++      evidenceId,
++      processingStatus: 'unsupported',
++      processedAt: new Date().toISOString(),
++    });
++    return this.toReceipt(updated, false);
++  }
++
+   private async markFinancialProcessed(
+     evidenceId: string,
+     input: {
+@@ -550,6 +581,10 @@
+     limit?: number;
+   }): Promise<{ processed: number; skipped: number; unmatched: number }> {
+     const counters = { processed: 0, skipped: 0, unmatched: 0 };
++    const store = this.store;
++    if (!hasPayoutStore(store)) {
++      return counters;
++    }
+     const candidates = await this.listVerifiedUnmatchedPayoutEvidence(input);
+ 
+     for (const row of candidates) {
+@@ -565,7 +600,12 @@
+         continue;
+       }
+ 
+-      const receipt = await this.processPayoutWebhook(row, payoutFinancialStatus, row.rawPayload);
++      const receipt = await this.processPayoutWebhook(
++        store,
++        row,
++        payoutFinancialStatus,
++        row.rawPayload,
++      );
+       if (receipt.processingStatus === 'processed') {
+         counters.processed += 1;
+       } else if (receipt.processingStatus === 'unmatched') {
+@@ -610,6 +650,7 @@
+   }
+ 
+   private async processPayoutWebhook(
++    store: WebhookProcessingStore & PayoutStore,
+     evidence: {
+       evidenceId: string;
+       providerCode: string;
+@@ -626,7 +667,7 @@
+   ): Promise<WebhookReceiptResponse> {
+     assertVerifiedEvidence(evidence.verificationStatus);
+ 
+-    const correlation = await correlatePayoutOperation(this.store, {
++    const correlation = await correlatePayoutOperation(store, {
+       providerCode: evidence.providerCode,
+       accountRef: evidence.accountRef,
+       applicationRef: evidence.applicationRef,
+@@ -652,7 +693,7 @@
+       payoutFinancialStatus,
+     );
+ 
+-    const transition = await applyPayoutTransition(this.store, {
++    const transition = await applyPayoutTransition(store, {
+       operation,
+       payoutStatus: payoutFinancialStatus,
+       evidenceId: evidence.evidenceId,
+@@ -664,7 +705,7 @@
+       const batch = await this.store.findOperationById(transition.operation.parentOperationId);
+       if (batch) {
+         await refreshPayoutBatchAggregate(
+-          this.store,
++          store,
+           batch,
+           evidence.evidenceId,
+           'Derived payout batch aggregate after item webhook',
+@@ -685,17 +726,20 @@
+     return this.toReceipt(updatedEvidence, false);
+   }
+ 
+-  private async tryProcessMarketplaceWebhook(evidence: {
+-    evidenceId: string;
+-    providerCode: string;
+-    accountRef: string;
+-    applicationRef: string;
+-    environment: 'sandbox' | 'live';
+-    eventType: string | null;
+-    resourceId: string | null;
+-    verificationStatus: WebhookReceiptResponse['verificationStatus'];
+-    processingStatus: WebhookReceiptResponse['processingStatus'];
+-  }): Promise<WebhookReceiptResponse | null> {
++  private async tryProcessMarketplaceWebhook(
++    store: WebhookProcessingStore & MarketplaceStore & CheckoutStore,
++    evidence: {
++      evidenceId: string;
++      providerCode: string;
++      accountRef: string;
++      applicationRef: string;
++      environment: 'sandbox' | 'live';
++      eventType: string | null;
++      resourceId: string | null;
++      verificationStatus: WebhookReceiptResponse['verificationStatus'];
++      processingStatus: WebhookReceiptResponse['processingStatus'];
++    },
++  ): Promise<WebhookReceiptResponse | null> {
+     const resourceId = evidence.resourceId;
+     if (!resourceId || !evidence.eventType) {
+       return null;
+@@ -703,18 +747,18 @@
+ 
+     const captureUnitStatus = mapMarketplaceCaptureWebhookToUnitStatus(evidence.eventType);
+     if (captureUnitStatus) {
+-      const unit = await this.store.findMarketplacePurchaseUnitByCaptureId(resourceId);
++      const unit = await store.findMarketplacePurchaseUnitByCaptureId(resourceId);
+       if (!unit) {
+         return null;
+       }
+-      const checkout = await this.store.findOperationById(unit.operationId);
++      const checkout = await store.findOperationById(unit.operationId);
+       if (!checkout || checkout.kind !== 'marketplace_checkout') {
+         return null;
+       }
+ 
+       assertVerifiedEvidence(evidence.verificationStatus);
+       if (!(unit.unitStatus === 'captured' && captureUnitStatus !== 'captured')) {
+-        await this.store.updateMarketplacePurchaseUnit({
++        await store.updateMarketplacePurchaseUnit({
+           unitId: unit.unitId,
+           expectedVersion: unit.version,
+           unitStatus: captureUnitStatus,
+@@ -722,7 +766,7 @@
+         });
+       }
+ 
+-      const units = await this.store.listMarketplacePurchaseUnits(checkout.operationId);
++      const units = await store.listMarketplacePurchaseUnits(checkout.operationId);
+       const aggregateStatus = deriveMarketplaceOrderStatusFromUnits(
+         units.map((row) => row.unitStatus),
+       );
+@@ -730,7 +774,7 @@
+       if (parentNext && parentNext !== checkout.status) {
+         try {
+           assertTransitionAllowed(checkout.status, parentNext);
+-          await this.store.transitionOperation({
++          await store.transitionOperation({
+             operationId: checkout.operationId,
+             expectedVersion: checkout.version,
+             nextStatus: parentNext,
+@@ -753,7 +797,7 @@
+       evidence.eventType === 'CHECKOUT.ORDER.APPROVED' ||
+       evidence.eventType === 'CHECKOUT.PAYMENT-APPROVAL.REVERSED'
+     ) {
+-      const checkout = await this.store.findOperationByProviderOrderId(
++      const checkout = await store.findOperationByProviderOrderId(
+         evidence.providerCode,
+         evidence.accountRef,
+         evidence.environment,
+@@ -774,7 +818,7 @@
+       if (checkout.status !== 'submitted') {
+         try {
+           assertTransitionAllowed(checkout.status, 'submitted');
+-          await this.store.transitionOperation({
++          await store.transitionOperation({
+             operationId: checkout.operationId,
+             expectedVersion: checkout.version,
+             nextStatus: 'submitted',
+@@ -811,13 +855,16 @@
+     }
+   }
+ 
+-  private async findCorrelatedOperation(evidence: {
+-    providerCode: string;
+-    accountRef: string;
+-    environment: 'sandbox' | 'live';
+-    eventType: string | null;
+-    resourceId: string | null;
+-  }) {
++  private async findCorrelatedOperation(
++    store: WebhookProcessingStore & CheckoutStore,
++    evidence: {
++      providerCode: string;
++      accountRef: string;
++      environment: 'sandbox' | 'live';
++      eventType: string | null;
++      resourceId: string | null;
++    },
++  ) {
+     const resourceId = evidence.resourceId;
+     if (!resourceId) {
+       return null;
+@@ -825,7 +872,7 @@
+ 
+     const kind = evidence.eventType ? mapWebhookEventToOperationKind(evidence.eventType) : null;
+     if (kind === 'checkout') {
+-      return this.store.findOperationByProviderOrderId(
++      return store.findOperationByProviderOrderId(
+         evidence.providerCode,
+         evidence.accountRef,
+         evidence.environment,
+@@ -834,13 +881,13 @@
+     }
+     if (kind === 'capture') {
+       return (
+-        (await this.store.findOperationByProviderCaptureId(
++        (await store.findOperationByProviderCaptureId(
+           evidence.providerCode,
+           evidence.accountRef,
+           evidence.environment,
+           resourceId,
+         )) ??
+-        (await this.store.findOperationByProviderOrderId(
++        (await store.findOperationByProviderOrderId(
+           evidence.providerCode,
+           evidence.accountRef,
+           evidence.environment,
+@@ -850,13 +897,13 @@
+     }
+     if (kind === 'refund') {
+       return (
+-        (await this.store.findOperationByProviderRefundId(
++        (await store.findOperationByProviderRefundId(
+           evidence.providerCode,
+           evidence.accountRef,
+           evidence.environment,
+           resourceId,
+         )) ??
+-        (await this.store.findOperationByProviderCaptureId(
++        (await store.findOperationByProviderCaptureId(
+           evidence.providerCode,
+           evidence.accountRef,
+           evidence.environment,
+@@ -865,7 +912,7 @@
+       );
+     }
+ 
+-    return this.store.findOperationByProviderReference(
++    return store.findOperationByProviderReference(
+       evidence.providerCode,
+       evidence.accountRef,
+       evidence.environment,
+@@ -1165,6 +1212,7 @@
+   }
+ 
+   private async processSellerOnboardingWebhook(
++    store: WebhookProcessingStore & SellerStore,
+     evidence: {
+       evidenceId: string;
+       providerCode: string;
+@@ -1191,7 +1239,7 @@
+ 
+     const connection =
+       (merchantId
+-        ? await this.store.findSellerConnectionByMerchantId(
++        ? await store.findSellerConnectionByMerchantId(
+             evidence.applicationRef,
+             evidence.providerCode,
+             evidence.accountRef,
+@@ -1200,7 +1248,7 @@
+           )
+         : null) ??
+       (trackingId
+-        ? await this.store.findSellerConnectionByTrackingId(
++        ? await store.findSellerConnectionByTrackingId(
+             evidence.applicationRef,
+             evidence.providerCode,
+             evidence.accountRef,
+@@ -1223,7 +1271,7 @@
+       : null;
+     if (consentHint === 'revoked') {
+       const readinessReady = false;
+-      await this.store.updateSellerConnection({
++      await store.updateSellerConnection({
+         connectionId: connection.connectionId,
+         expectedVersion: connection.version,
+         providerMerchantId: merchantId ?? connection.providerMerchantId,
+@@ -1243,7 +1291,7 @@
+       connection.consentStatus !== 'revoked' &&
+       evidence.eventType !== 'MERCHANT.ONBOARDING.COMPLETED'
+     ) {
+-      await this.store.updateSellerConnection({
++      await store.updateSellerConnection({
+         connectionId: connection.connectionId,
+         expectedVersion: connection.version,
+         providerMerchantId: merchantId ?? connection.providerMerchantId,
+@@ -1256,7 +1304,7 @@
+         }),
+       });
+     } else if (merchantId && !connection.providerMerchantId) {
+-      await this.store.updateSellerConnection({
++      await store.updateSellerConnection({
+         connectionId: connection.connectionId,
+         expectedVersion: connection.version,
+         providerMerchantId: merchantId,
+diff --color -ruN .superpowers/snap-after-t4/src/testing/index.ts src/testing/index.ts
+--- .superpowers/snap-after-t4/src/testing/index.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/testing/index.ts	2026-10-22 13:28:27.256273508 +0300
+@@ -0,0 +1,7 @@
++export {
++  runStoreConformance,
++  type ConformanceAssertion,
++  type ConformanceExpect,
++  type StoreConformanceCapabilities,
++  type StoreConformanceOptions,
++} from './lib/run-store-conformance';
+diff --color -ruN .superpowers/snap-after-t4/src/testing/lib/run-store-conformance.ts src/testing/lib/run-store-conformance.ts
+--- .superpowers/snap-after-t4/src/testing/lib/run-store-conformance.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/testing/lib/run-store-conformance.ts	2026-10-22 13:32:40.524758546 +0300
+@@ -0,0 +1,1205 @@
++import {
++  PAYMENT_RELIABILITY_ERROR,
++  PAYMENT_TRANSITION_REJECTION_REASON,
++  type CreatePaymentOperationInput,
++  type PaymentEnvironment,
++  type PaymentOperation,
++  type PaymentOperationKind,
++  type ProviderEvidenceRecord,
++} from '../../contracts/index';
++import type {
++  CheckoutStore,
++  MarketplaceStore,
++  PayoutStore,
++  SellerStore,
++  SubscriptionStore,
++} from '../../core/lib/persistence/payment-reliability-store';
++import {
++  CHECKOUT_STORE_METHODS,
++  MARKETPLACE_STORE_METHODS,
++  PAYOUT_STORE_METHODS,
++  SELLER_STORE_METHODS,
++} from '../../core/lib/persistence/store-capabilities';
++
++/** The subset of an `expect` matcher the kit uses (vitest, jest and similar runners fit). */
++export type ConformanceAssertion = {
++  toBe(expected: unknown): void;
++  toEqual(expected: unknown): void;
++};
++
++export type ConformanceExpect = (actual: unknown, message?: string) => ConformanceAssertion;
++
++/** Optional capabilities the store under test implements, beyond `SubscriptionStore`. */
++export type StoreConformanceCapabilities = {
++  checkout?: boolean;
++  payout?: boolean;
++  seller?: boolean;
++  marketplace?: boolean;
++};
++
++export type StoreConformanceOptions<TStore extends SubscriptionStore = SubscriptionStore> = {
++  /**
++   * Returns an EMPTY store for one test case (a fresh schema or truncated tables): the ordering and
++   * listing cases read every row of the store.
++   */
++  createStore: () => TStore | Promise<TStore>;
++  /** Called after each case with the store it used (close pools, drop schemas). */
++  destroyStore?: (store: TStore) => void | Promise<void>;
++  describe: (name: string, fn: () => void) => void;
++  it: (name: string, fn: () => Promise<void>) => void;
++  expect: ConformanceExpect;
++  capabilities?: StoreConformanceCapabilities;
++  /**
++   * How long the lease-expiry case waits for a lease to expire (the lease itself is a quarter of
++   * it). Default 200 ms; raise it when the database clock and the test clock differ.
++   */
++  leaseExpiryWaitMs?: number;
++  /** Pause between inserts in the ordering cases so timestamps differ. Default 5 ms. */
++  orderingGapMs?: number;
++};
++
++type CaseContext = {
++  providerCode: string;
++  accountRef: string;
++  applicationRef: string;
++  environment: PaymentEnvironment;
++};
++
++type Rejection = { code?: unknown; rejectionReason?: unknown };
++
++function pause(ms: number): Promise<void> {
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
++
++function uniqueId(prefix: string): string {
++  return `${prefix}-${globalThis.crypto.randomUUID()}`;
++}
++
++/** Resolves with the rejection (or `null` when the work succeeded). */
++async function rejectionOf(work: () => Promise<unknown>): Promise<Rejection | null> {
++  try {
++    await work();
++    return null;
++  } catch (error) {
++    return (error ?? {}) as Rejection;
++  }
++}
++
++function missingMethods(store: object, methods: ReadonlyArray<string>): string[] {
++  return methods.filter(
++    (method) => typeof (store as Record<string, unknown>)[method] !== 'function',
++  );
++}
++
++/**
++ * Registers the store contract cases with the host's test runner. No dependency on a specific
++ * runner: pass its `describe`, `it` and `expect`. Every case gets its own store from `createStore`.
++ *
++ * Covers: idempotency by fingerprint, optimistic `version` compare-and-set, the `prepared ->
++ * submitted` claim and the create execution lease (one winner under concurrency, typed
++ * `transitionKind`), transition + history atomicity, provider-id uniqueness per kind, patch
++ * semantics (`undefined` keeps, `null` clears), evidence uniqueness, recovery lease exclusivity and
++ * expiry, the oldest-first ORDER BY of the candidate lists, and the consumer-delivery fields.
++ */
++export function runStoreConformance<TStore extends SubscriptionStore>(
++  options: StoreConformanceOptions<TStore>,
++): void {
++  const { describe, expect } = options;
++  const capabilities = options.capabilities ?? {};
++  const leaseExpiryWaitMs = options.leaseExpiryWaitMs ?? 200;
++  const leaseMs = Math.max(1, Math.floor(leaseExpiryWaitMs / 4));
++  const gapMs = options.orderingGapMs ?? 5;
++
++  const it = (name: string, body: (store: TStore, ctx: CaseContext) => Promise<void>) => {
++    options.it(name, async () => {
++      const store = await options.createStore();
++      const ctx: CaseContext = {
++        providerCode: 'conformance',
++        accountRef: uniqueId('acct'),
++        applicationRef: 'conformance-app',
++        environment: 'sandbox',
++      };
++      try {
++        await body(store, ctx);
++      } finally {
++        await options.destroyStore?.(store);
++      }
++    });
++  };
++
++  const expectRejected = (
++    rejection: Rejection | null,
++    code: string,
++    rejectionReason?: string,
++  ): void => {
++    expect(rejection?.code ?? 'no error thrown', `error code`).toBe(code);
++    if (rejectionReason !== undefined) {
++      expect(rejection?.rejectionReason, 'rejectionReason').toBe(rejectionReason);
++    }
++  };
++
++  const createOperation = (
++    store: SubscriptionStore,
++    ctx: CaseContext,
++    over: Partial<CreatePaymentOperationInput> & {
++      kind?: PaymentOperationKind;
++    } = {},
++  ): Promise<PaymentOperation> =>
++    store.createOperation({
++      ...ctx,
++      idempotencyKey: uniqueId('idem'),
++      idempotencyScope: `${ctx.applicationRef}:${ctx.accountRef}:${over.kind ?? 'subscription'}`,
++      commandFingerprint: 'fp-1',
++      kind: 'subscription',
++      ...over,
++    });
++
++  const claim = (store: SubscriptionStore, operation: PaymentOperation) =>
++    store.claimOperationForExecution({
++      operationId: operation.operationId,
++      expectedVersion: operation.version,
++    });
++
++  const toUnknown = async (store: SubscriptionStore, operation: PaymentOperation) => {
++    const claimed = await claim(store, operation);
++    return store.transitionOperation({
++      operationId: claimed.operationId,
++      expectedVersion: claimed.version,
++      nextStatus: 'unknown',
++      executionOwnerToken: null,
++      executionLeaseExpiresAt: null,
++      reason: 'conformance: provider outcome unknown',
++    });
++  };
++
++  const insertEvidence = (
++    store: SubscriptionStore,
++    ctx: CaseContext,
++    providerEventId = uniqueId('evt'),
++  ): Promise<ProviderEvidenceRecord> =>
++    store.insertEvidence({
++      ...ctx,
++      evidenceKind: 'webhook',
++      providerEventId,
++      rawPayload: `{"id":"${providerEventId}"}`,
++      payloadSha256: 'sha-conformance',
++      eventType: 'BILLING.SUBSCRIPTION.ACTIVATED',
++      resourceId: 'I-CONFORMANCE',
++    });
++
++  const insertEvidenceIn = async (
++    store: SubscriptionStore,
++    ctx: CaseContext,
++    state: Partial<
++      Pick<
++        ProviderEvidenceRecord,
++        'verificationStatus' | 'processingStatus' | 'consumerDeliveryStatus'
++      >
++    >,
++  ): Promise<ProviderEvidenceRecord> => {
++    const row = await insertEvidence(store, ctx);
++    if (Object.keys(state).length === 0) {
++      return row;
++    }
++    return store.updateEvidence({ evidenceId: row.evidenceId, ...state });
++  };
++
++  describe('payment store conformance', () => {
++    describe('idempotency', () => {
++      it('createOperation inserts prepared at version 1 and replays the same key and fingerprint', async (store, ctx) => {
++        const first = await createOperation(store, ctx, {
++          idempotencyKey: 'idem-replay',
++        });
++        expect(first.status).toBe('prepared');
++        expect(first.version).toBe(1);
++        const replay = await createOperation(store, ctx, {
++          idempotencyKey: 'idem-replay',
++        });
++        expect(replay.operationId).toBe(first.operationId);
++        const found = await store.findOperationByIdempotency(first.idempotencyScope, 'idem-replay');
++        expect(found?.operationId).toBe(first.operationId);
++      });
++
++      it('a different command fingerprint for the same key throws IDEMPOTENCY_CONFLICT', async (store, ctx) => {
++        await createOperation(store, ctx, { idempotencyKey: 'idem-fp' });
++        const rejection = await rejectionOf(() =>
++          createOperation(store, ctx, {
++            idempotencyKey: 'idem-fp',
++            commandFingerprint: 'fp-2',
++          }),
++        );
++        expectRejected(rejection, PAYMENT_RELIABILITY_ERROR.IDEMPOTENCY_CONFLICT);
++      });
++
++      it('concurrent creates with one key return a single operation', async (store, ctx) => {
++        const results = await Promise.all(
++          Array.from({ length: 5 }, () =>
++            createOperation(store, ctx, { idempotencyKey: 'idem-race' }),
++          ),
++        );
++        expect(new Set(results.map((row) => row.operationId)).size).toBe(1);
++      });
++    });
++
++    describe('optimistic version', () => {
++      it('updateOperation is a compare-and-set on version and changes nothing on a conflict', async (store, ctx) => {
++        const created = await createOperation(store, ctx);
++        const updated = await store.updateOperation({
++          operationId: created.operationId,
++          expectedVersion: created.version,
++          lifecycleReason: 'first',
++        });
++        expect(updated.version).toBe(created.version + 1);
++        const rejection = await rejectionOf(() =>
++          store.updateOperation({
++            operationId: created.operationId,
++            expectedVersion: created.version,
++            lifecycleReason: 'stale writer',
++          }),
++        );
++        expectRejected(rejection, PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT);
++        const after = await store.findOperationById(created.operationId);
++        expect(after?.version).toBe(updated.version);
++        expect(after?.lifecycleReason).toBe('first');
++      });
++
++      it('transitionOperation with a stale version throws TRANSITION_CONFLICT', async (store, ctx) => {
++        const created = await createOperation(store, ctx);
++        const claimed = await claim(store, created);
++        const rejection = await rejectionOf(() =>
++          store.transitionOperation({
++            operationId: claimed.operationId,
++            expectedVersion: created.version,
++            nextStatus: 'unknown',
++            reason: 'stale',
++          }),
++        );
++        expectRejected(rejection, PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT);
++      });
++    });
++
++    describe('claim prepared -> submitted', () => {
++      it('claimOperationForExecution moves prepared to submitted and records transitionKind claim_execution', async (store, ctx) => {
++        const created = await createOperation(store, ctx);
++        const claimed = await claim(store, created);
++        expect(claimed.status).toBe('submitted');
++        expect(claimed.version).toBe(created.version + 1);
++        const history = await store.listOperationTransitions(created.operationId);
++        expect(history.length).toBe(1);
++        expect(history[0]?.fromStatus).toBe('prepared');
++        expect(history[0]?.toStatus).toBe('submitted');
++        expect(history[0]?.transitionKind).toBe('claim_execution');
++      });
++
++      it('of two concurrent claims exactly one wins; the other throws OPERATION_CONFLICT', async (store, ctx) => {
++        const created = await createOperation(store, ctx);
++        const results = await Promise.allSettled([claim(store, created), claim(store, created)]);
++        expect(results.filter((result) => result.status === 'fulfilled').length).toBe(1);
++        const loser = results.find((result) => result.status === 'rejected');
++        expectRejected(
++          (loser as PromiseRejectedResult | undefined)?.reason ?? null,
++          PAYMENT_RELIABILITY_ERROR.OPERATION_CONFLICT,
++        );
++        expect((await store.listOperationTransitions(created.operationId)).length).toBe(1);
++      });
++
++      it('a claim of an operation that is not prepared throws OPERATION_CONFLICT', async (store, ctx) => {
++        const claimed = await claim(store, await createOperation(store, ctx));
++        expectRejected(
++          await rejectionOf(() => claim(store, claimed)),
++          PAYMENT_RELIABILITY_ERROR.OPERATION_CONFLICT,
++        );
++      });
++
++      it('create execution lease: one acquired of two concurrent calls, claim_execution from prepared', async (store, ctx) => {
++        const created = await createOperation(store, ctx);
++        const input = {
++          operationId: created.operationId,
++          expectedVersion: created.version,
++        };
++        const results = await Promise.allSettled([
++          store.acquireCheckoutCreateExecutionLease(input),
++          store.acquireCheckoutCreateExecutionLease(input),
++        ]);
++        const kinds = results
++          .map((result) => (result.status === 'fulfilled' ? result.value.kind : 'rejected'))
++          .sort();
++        expect(kinds.filter((kind) => kind === 'acquired').length).toBe(1);
++        const acquired = results.find(
++          (result) => result.status === 'fulfilled' && result.value.kind === 'acquired',
++        ) as PromiseFulfilledResult<{
++          kind: 'acquired';
++          operation: PaymentOperation;
++          executionOwnerToken: string;
++        }>;
++        expect(acquired.value.operation.status).toBe('submitted');
++        expect(acquired.value.operation.executionOwnerToken).toBe(
++          acquired.value.executionOwnerToken,
++        );
++        const history = await store.listOperationTransitions(created.operationId);
++        expect(history.map((row) => row.transitionKind ?? null)).toEqual(['claim_execution']);
++      });
++
++      it('create execution lease from unknown records claim_retry; a provider reference is not_eligible', async (store, ctx) => {
++        const unknown = await toUnknown(store, await createOperation(store, ctx));
++        const retry = await store.acquireCheckoutCreateExecutionLease({
++          operationId: unknown.operationId,
++          expectedVersion: unknown.version,
++        });
++        expect(retry.kind).toBe('acquired');
++        const history = await store.listOperationTransitions(unknown.operationId);
++        expect(history[history.length - 1]?.transitionKind).toBe('claim_retry');
++
++        const bound = await createOperation(store, ctx, {
++          providerSubscriptionId: uniqueId('I'),
++        });
++        const notEligible = await store.acquireCheckoutCreateExecutionLease({
++          operationId: bound.operationId,
++          expectedVersion: bound.version,
++        });
++        expect(notEligible.kind).toBe('not_eligible');
++      });
++    });
++
++    describe('transition and history atomicity', () => {
++      it('a transition writes exactly one history row with reason, evidence id and transitionKind', async (store, ctx) => {
++        const created = await createOperation(store, ctx);
++        const evidence = await insertEvidence(store, ctx);
++        const claimed = await claim(store, created);
++        await store.transitionOperation({
++          operationId: claimed.operationId,
++          expectedVersion: claimed.version,
++          nextStatus: 'unknown',
++          evidenceId: evidence.evidenceId,
++          reason: 'free text that services never read',
++          transitionKind: 'claim_retry',
++        });
++        const history = await store.listOperationTransitions(created.operationId);
++        expect(history.map((row) => `${row.fromStatus}->${row.toStatus}`)).toEqual([
++          'prepared->submitted',
++          'submitted->unknown',
++        ]);
++        expect(history[1]?.evidenceId).toBe(evidence.evidenceId);
++        expect(history[1]?.reason).toBe('free text that services never read');
++        expect(history[1]?.transitionKind).toBe('claim_retry');
++      });
++
++      it('a transition without transitionKind stores null', async (store, ctx) => {
++        const claimed = await claim(store, await createOperation(store, ctx));
++        await store.transitionOperation({
++          operationId: claimed.operationId,
++          expectedVersion: claimed.version,
++          nextStatus: 'unknown',
++          reason: 'plain',
++        });
++        const history = await store.listOperationTransitions(claimed.operationId);
++        expect(history[1]?.transitionKind ?? null).toBe(null);
++      });
++
++      it('a rejected transition writes no history row and leaves the operation unchanged', async (store, ctx) => {
++        const claimed = await claim(store, await createOperation(store, ctx));
++        const done = await store.transitionOperation({
++          operationId: claimed.operationId,
++          expectedVersion: claimed.version,
++          nextStatus: 'succeeded',
++          reason: 'done',
++        });
++        expectRejected(
++          await rejectionOf(() =>
++            store.transitionOperation({
++              operationId: done.operationId,
++              expectedVersion: done.version,
++              nextStatus: 'submitted',
++              lifecycleReason: 'must not be written',
++              reason: 'regress',
++            }),
++          ),
++          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
++          PAYMENT_TRANSITION_REJECTION_REASON.INVALID_TRANSITION,
++        );
++        const after = await store.findOperationById(done.operationId);
++        expect(after?.version).toBe(done.version);
++        expect(after?.lifecycleReason ?? null).toBe(null);
++        expect((await store.listOperationTransitions(done.operationId)).length).toBe(2);
++      });
++
++      it('an execution owner mismatch is rejected and writes nothing', async (store, ctx) => {
++        const created = await createOperation(store, ctx);
++        const lease = await store.acquireCheckoutCreateExecutionLease({
++          operationId: created.operationId,
++          expectedVersion: created.version,
++        });
++        expectRejected(
++          await rejectionOf(() =>
++            store.transitionOperation({
++              operationId: lease.operation.operationId,
++              expectedVersion: lease.operation.version,
++              nextStatus: 'unknown',
++              expectedExecutionOwnerToken: 'someone-else',
++              reason: 'not mine',
++            }),
++          ),
++          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
++          PAYMENT_TRANSITION_REJECTION_REASON.EXECUTION_OWNER_MISMATCH,
++        );
++        expect((await store.listOperationTransitions(created.operationId)).length).toBe(1);
++      });
++
++      it('of two concurrent transitions at one version exactly one is applied and recorded', async (store, ctx) => {
++        const claimed = await claim(store, await createOperation(store, ctx));
++        const results = await Promise.allSettled(
++          (['unknown', 'failed'] as const).map((nextStatus) =>
++            store.transitionOperation({
++              operationId: claimed.operationId,
++              expectedVersion: claimed.version,
++              nextStatus,
++              reason: `race to ${nextStatus}`,
++            }),
++          ),
++        );
++        expect(results.filter((result) => result.status === 'fulfilled').length).toBe(1);
++        expect((await store.listOperationTransitions(claimed.operationId)).length).toBe(2);
++        const after = await store.findOperationById(claimed.operationId);
++        expect(after?.version).toBe(claimed.version + 1);
++      });
++    });
++
++    describe('provider-id uniqueness per kind', () => {
++      it('a provider id bound to another operation of the same kind is rejected (transition, update, create)', async (store, ctx) => {
++        const subscriptionId = uniqueId('I');
++        const owner = await claim(store, await createOperation(store, ctx));
++        await store.transitionOperation({
++          operationId: owner.operationId,
++          expectedVersion: owner.version,
++          nextStatus: 'submitted',
++          providerSubscriptionId: subscriptionId,
++          reason: 'bind',
++        });
++        const other = await claim(store, await createOperation(store, ctx));
++        expectRejected(
++          await rejectionOf(() =>
++            store.transitionOperation({
++              operationId: other.operationId,
++              expectedVersion: other.version,
++              nextStatus: 'submitted',
++              providerSubscriptionId: subscriptionId,
++              reason: 'steal',
++            }),
++          ),
++          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
++          PAYMENT_TRANSITION_REJECTION_REASON.PROVIDER_REFERENCE_BOUND,
++        );
++        expectRejected(
++          await rejectionOf(() =>
++            store.updateOperation({
++              operationId: other.operationId,
++              expectedVersion: other.version,
++              providerSubscriptionId: subscriptionId,
++            }),
++          ),
++          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
++          PAYMENT_TRANSITION_REJECTION_REASON.PROVIDER_REFERENCE_BOUND,
++        );
++        expectRejected(
++          await rejectionOf(() =>
++            createOperation(store, ctx, {
++              providerSubscriptionId: subscriptionId,
++            }),
++          ),
++          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
++          PAYMENT_TRANSITION_REJECTION_REASON.PROVIDER_REFERENCE_BOUND,
++        );
++        const found = await store.findOperationByProviderSubscriptionId(
++          ctx.providerCode,
++          ctx.accountRef,
++          ctx.environment,
++          subscriptionId,
++        );
++        expect(found?.operationId).toBe(owner.operationId);
++        expect((await store.findOperationById(other.operationId))?.version).toBe(other.version);
++      });
++
++      it('a provider reference id is unique across kinds', async (store, ctx) => {
++        const reference = uniqueId('REF');
++        const owner = await claim(store, await createOperation(store, ctx));
++        await store.transitionOperation({
++          operationId: owner.operationId,
++          expectedVersion: owner.version,
++          nextStatus: 'submitted',
++          providerReferenceId: reference,
++          reason: 'bind',
++        });
++        const plan = await claim(
++          store,
++          await createOperation(store, ctx, { kind: 'billing_plan' }),
++        );
++        expectRejected(
++          await rejectionOf(() =>
++            store.transitionOperation({
++              operationId: plan.operationId,
++              expectedVersion: plan.version,
++              nextStatus: 'submitted',
++              providerReferenceId: reference,
++              reason: 'steal',
++            }),
++          ),
++          PAYMENT_RELIABILITY_ERROR.TRANSITION_REJECTED,
++          PAYMENT_TRANSITION_REJECTION_REASON.PROVIDER_REFERENCE_BOUND,
++        );
++        const found = await store.findOperationByProviderReference(
++          ctx.providerCode,
++          ctx.accountRef,
++          ctx.environment,
++          reference,
++        );
++        expect(found?.operationId).toBe(owner.operationId);
++      });
++
++      it('product, plan and subscription lookups are scoped to their kind and environment', async (store, ctx) => {
++        const productId = uniqueId('PROD');
++        const planId = uniqueId('P');
++        const subscriptionId = uniqueId('I');
++        const product = await createOperation(store, ctx, {
++          kind: 'catalog_product',
++          providerProductId: productId,
++        });
++        const plan = await createOperation(store, ctx, {
++          kind: 'billing_plan',
++          providerPlanId: planId,
++          providerProductId: productId,
++        });
++        const subscription = await createOperation(store, ctx, {
++          providerPlanId: planId,
++          providerSubscriptionId: subscriptionId,
++        });
++        // Lifecycle command operations carry the ids without competing for them.
++        await createOperation(store, ctx, {
++          kind: 'subscription_cancel',
++          providerPlanId: planId,
++          providerSubscriptionId: subscriptionId,
++        });
++        const { providerCode, accountRef, environment } = ctx;
++        expect(
++          (
++            await store.findOperationByProviderProductId(
++              providerCode,
++              accountRef,
++              environment,
++              productId,
++            )
++          )?.operationId,
++        ).toBe(product.operationId);
++        expect(
++          (await store.findOperationByProviderPlanId(providerCode, accountRef, environment, planId))
++            ?.operationId,
++        ).toBe(plan.operationId);
++        expect(
++          (
++            await store.findOperationByProviderSubscriptionId(
++              providerCode,
++              accountRef,
++              environment,
++              subscriptionId,
++            )
++          )?.operationId,
++        ).toBe(subscription.operationId);
++        expect(
++          await store.findOperationByProviderSubscriptionId(
++            providerCode,
++            accountRef,
++            'live',
++            subscriptionId,
++          ),
++        ).toBe(null);
++      });
++
++      it('clearing a provider id with null frees it', async (store, ctx) => {
++        const subscriptionId = uniqueId('I');
++        const owner = await createOperation(store, ctx, {
++          providerSubscriptionId: subscriptionId,
++        });
++        await store.updateOperation({
++          operationId: owner.operationId,
++          expectedVersion: owner.version,
++          providerSubscriptionId: null,
++        });
++        const { providerCode, accountRef, environment } = ctx;
++        expect(
++          await store.findOperationByProviderSubscriptionId(
++            providerCode,
++            accountRef,
++            environment,
++            subscriptionId,
++          ),
++        ).toBe(null);
++        const next = await createOperation(store, ctx, {
++          providerSubscriptionId: subscriptionId,
++        });
++        expect(
++          (
++            await store.findOperationByProviderSubscriptionId(
++              providerCode,
++              accountRef,
++              environment,
++              subscriptionId,
++            )
++          )?.operationId,
++        ).toBe(next.operationId);
++      });
++    });
++
++    describe('patch semantics', () => {
++      it('updateOperation: undefined keeps and null clears', async (store, ctx) => {
++        const created = await createOperation(store, ctx);
++        const set = await store.updateOperation({
++          operationId: created.operationId,
++          expectedVersion: created.version,
++          nextBillingTime: '2026-02-01T00:00:00.000Z',
++          approvalUrl: 'https://example.test/approve',
++          lifecycleReason: 'kept',
++        });
++        const kept = await store.updateOperation({
++          operationId: set.operationId,
++          expectedVersion: set.version,
++          approvalUrl: null,
++        });
++        expect(kept.nextBillingTime).toBe('2026-02-01T00:00:00.000Z');
++        expect(kept.lifecycleReason).toBe('kept');
++        expect(kept.approvalUrl).toBe(null);
++        expect((await store.findOperationById(created.operationId))?.approvalUrl).toBe(null);
++      });
++
++      it('transitionOperation: failureCode and failureMessage, undefined keeps and null clears', async (store, ctx) => {
++        const claimed = await claim(store, await createOperation(store, ctx));
++        const failed = await store.transitionOperation({
++          operationId: claimed.operationId,
++          expectedVersion: claimed.version,
++          nextStatus: 'unknown',
++          failureCode: 'PROVIDER_UNCERTAIN',
++          failureMessage: 'timed out',
++          reason: 'timeout',
++        });
++        const kept = await store.transitionOperation({
++          operationId: failed.operationId,
++          expectedVersion: failed.version,
++          nextStatus: 'unknown',
++          reason: 'still unknown',
++        });
++        expect(kept.failureCode).toBe('PROVIDER_UNCERTAIN');
++        expect(kept.failureMessage).toBe('timed out');
++        const cleared = await store.transitionOperation({
++          operationId: kept.operationId,
++          expectedVersion: kept.version,
++          nextStatus: 'submitted',
++          failureCode: null,
++          failureMessage: null,
++          reason: 'resolved',
++        });
++        expect(cleared.failureCode).toBe(null);
++        expect(cleared.failureMessage).toBe(null);
++      });
++
++      it('transitionOperation: providerReferenceId null keeps the bound reference', async (store, ctx) => {
++        const reference = uniqueId('REF');
++        const claimed = await claim(store, await createOperation(store, ctx));
++        const bound = await store.transitionOperation({
++          operationId: claimed.operationId,
++          expectedVersion: claimed.version,
++          nextStatus: 'unknown',
++          providerReferenceId: reference,
++          reason: 'bind',
++        });
++        const after = await store.transitionOperation({
++          operationId: bound.operationId,
++          expectedVersion: bound.version,
++          nextStatus: 'submitted',
++          providerReferenceId: null,
++          reason: 'webhook without resource id',
++        });
++        expect(after.providerReferenceId).toBe(reference);
++      });
++
++      it('updateEvidence: undefined keeps and null clears', async (store, ctx) => {
++        const operation = await createOperation(store, ctx);
++        const row = await insertEvidence(store, ctx);
++        const set = await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          errorCode: 'VERIFICATION_UNAVAILABLE',
++          errorMessage: 'down',
++          processedAt: '2026-01-01T00:00:00.000Z',
++          relatedOperationId: operation.operationId,
++        });
++        expect(set.errorCode).toBe('VERIFICATION_UNAVAILABLE');
++        const kept = await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          verificationStatus: 'verified',
++        });
++        expect(kept.errorMessage).toBe('down');
++        expect(kept.processedAt).toBe('2026-01-01T00:00:00.000Z');
++        expect(kept.relatedOperationId).toBe(operation.operationId);
++        const cleared = await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          errorCode: null,
++          errorMessage: null,
++          processedAt: null,
++          relatedOperationId: null,
++        });
++        expect([
++          cleared.errorCode,
++          cleared.errorMessage,
++          cleared.processedAt,
++          cleared.relatedOperationId,
++        ]).toEqual([null, null, null, null]);
++        expect((await store.findEvidenceById(row.evidenceId))?.processedAt).toBe(null);
++      });
++    });
++
++    describe('evidence uniqueness', () => {
++      it('inserts pending evidence and finds it by id and by provider event', async (store, ctx) => {
++        const row = await insertEvidence(store, ctx, 'WH-FIND');
++        expect(row.verificationStatus).toBe('pending');
++        expect(row.processingStatus).toBe('pending');
++        expect(row.rawPayload).toBe('{"id":"WH-FIND"}');
++        expect((await store.findEvidenceById(row.evidenceId))?.providerEventId).toBe('WH-FIND');
++        const byEvent = await store.findEvidenceByProviderEvent(
++          ctx.providerCode,
++          ctx.accountRef,
++          ctx.environment,
++          'WH-FIND',
++        );
++        expect(byEvent?.evidenceId).toBe(row.evidenceId);
++      });
++
++      it('a duplicate provider event id in the same scope throws EVIDENCE_DUPLICATE, also concurrently', async (store, ctx) => {
++        await insertEvidence(store, ctx, 'WH-DUP');
++        expectRejected(
++          await rejectionOf(() => insertEvidence(store, ctx, 'WH-DUP')),
++          PAYMENT_RELIABILITY_ERROR.EVIDENCE_DUPLICATE,
++        );
++        const otherAccount = await insertEvidence(
++          store,
++          { ...ctx, accountRef: uniqueId('acct') },
++          'WH-DUP',
++        );
++        expect(otherAccount.providerEventId).toBe('WH-DUP');
++        const race = await Promise.allSettled([
++          insertEvidence(store, ctx, 'WH-RACE'),
++          insertEvidence(store, ctx, 'WH-RACE'),
++        ]);
++        expect(race.filter((result) => result.status === 'fulfilled').length).toBe(1);
++        const loser = race.find((result) => result.status === 'rejected') as
++          | PromiseRejectedResult
++          | undefined;
++        expectRejected(loser?.reason ?? null, PAYMENT_RELIABILITY_ERROR.EVIDENCE_DUPLICATE);
++      });
++    });
++
++    describe('recovery lease', () => {
++      it('claimPendingEvidence requires a workerId', async (store) => {
++        expectRejected(
++          await rejectionOf(() =>
++            store.claimPendingEvidence({
++              limit: 1,
++              leaseMs: leaseMs,
++              workerId: '  ',
++            }),
++          ),
++          PAYMENT_RELIABILITY_ERROR.INVALID_REQUEST,
++        );
++      });
++
++      it('claims only recoverable rows, oldest first, and honours includeConsumerDelivery', async (store, ctx) => {
++        const pending = await insertEvidenceIn(store, ctx, {});
++        await pause(gapMs);
++        const toProcess = await insertEvidenceIn(store, ctx, {
++          verificationStatus: 'verified',
++        });
++        await pause(gapMs);
++        await insertEvidenceIn(store, ctx, {
++          verificationStatus: 'verified',
++          processingStatus: 'processed',
++          consumerDeliveryStatus: 'confirmed',
++        });
++        await insertEvidenceIn(store, ctx, {
++          verificationStatus: 'rejected',
++          processingStatus: 'failed',
++        });
++        await pause(gapMs);
++        const unmatched = await insertEvidenceIn(store, ctx, {
++          verificationStatus: 'verified',
++          processingStatus: 'unmatched',
++        });
++        await pause(gapMs);
++        const awaitingDelivery = await insertEvidenceIn(store, ctx, {
++          verificationStatus: 'verified',
++          processingStatus: 'processed',
++          consumerDeliveryStatus: 'failed',
++        });
++        await insertEvidenceIn(store, ctx, {
++          verificationStatus: 'verified',
++          processingStatus: 'processed',
++          consumerDeliveryStatus: 'failed_terminal',
++        });
++
++        const withoutDelivery = await store.claimPendingEvidence({
++          limit: 10,
++          leaseMs,
++          workerId: 'w1',
++          includeConsumerDelivery: false,
++        });
++        expect(withoutDelivery.map((row) => row.evidenceId)).toEqual([
++          pending.evidenceId,
++          toProcess.evidenceId,
++          unmatched.evidenceId,
++        ]);
++        const all = await store.claimPendingEvidence({
++          limit: 10,
++          leaseMs,
++          workerId: 'w1',
++        });
++        expect(all.map((row) => row.evidenceId)).toEqual([
++          pending.evidenceId,
++          toProcess.evidenceId,
++          unmatched.evidenceId,
++          awaitingDelivery.evidenceId,
++        ]);
++        expect(
++          all.every((row) => row.claimWorkerId === 'w1' && row.claimLeaseExpiresAt !== null),
++        ).toBe(true);
++        const limited = await store.claimPendingEvidence({
++          limit: 2,
++          leaseMs,
++          workerId: 'w1',
++        });
++        expect(limited.map((row) => row.evidenceId)).toEqual([
++          pending.evidenceId,
++          toProcess.evidenceId,
++        ]);
++      });
++
++      it('two concurrent workers get disjoint rows', async (store, ctx) => {
++        for (let index = 0; index < 4; index += 1) {
++          await insertEvidenceIn(store, ctx, {});
++        }
++        const [first, second] = await Promise.all([
++          store.claimPendingEvidence({
++            limit: 2,
++            leaseMs: 60_000,
++            workerId: 'w1',
++          }),
++          store.claimPendingEvidence({
++            limit: 2,
++            leaseMs: 60_000,
++            workerId: 'w2',
++          }),
++        ]);
++        const ids = [...(first ?? []), ...(second ?? [])].map((row) => row.evidenceId);
++        expect(ids.length).toBe(4);
++        expect(new Set(ids).size).toBe(4);
++      });
++
++      it('a lease held by one worker is not claimable by another until it expires', async (store, ctx) => {
++        const row = await insertEvidenceIn(store, ctx, {});
++        expect(
++          (
++            await store.claimPendingEvidence({
++              limit: 5,
++              leaseMs,
++              workerId: 'w1',
++            })
++          ).length,
++        ).toBe(1);
++        expect(
++          (
++            await store.claimPendingEvidence({
++              limit: 5,
++              leaseMs,
++              workerId: 'w2',
++            })
++          ).length,
++        ).toBe(0);
++        expect(
++          (
++            await store.claimPendingEvidence({
++              limit: 5,
++              leaseMs,
++              workerId: 'w1',
++            })
++          ).length,
++        ).toBe(1);
++        await pause(leaseExpiryWaitMs);
++        const taken = await store.claimPendingEvidence({
++          limit: 5,
++          leaseMs,
++          workerId: 'w2',
++        });
++        expect(taken.map((claimed) => claimed.evidenceId)).toEqual([row.evidenceId]);
++        expect(taken[0]?.claimWorkerId).toBe('w2');
++      });
++    });
++
++    describe('candidate ordering', () => {
++      it('listReconciliationCandidates returns verified unmatched evidence oldest first', async (store, ctx) => {
++        const ids: string[] = [];
++        for (let index = 0; index < 3; index += 1) {
++          ids.push(
++            (
++              await insertEvidenceIn(store, ctx, {
++                verificationStatus: 'verified',
++                processingStatus: 'unmatched',
++              })
++            ).evidenceId,
++          );
++          await pause(gapMs);
++        }
++        await insertEvidenceIn(store, ctx, { processingStatus: 'unmatched' });
++        expect((await store.listReconciliationCandidates(10)).map((row) => row.evidenceId)).toEqual(
++          ids,
++        );
++        expect((await store.listReconciliationCandidates(2)).map((row) => row.evidenceId)).toEqual(
++          ids.slice(0, 2),
++        );
++      });
++
++      it('listUncertainOperations returns unknown operations oldest first (by createdAt)', async (store, ctx) => {
++        const created: PaymentOperation[] = [];
++        for (let index = 0; index < 3; index += 1) {
++          created.push(await createOperation(store, ctx));
++          await pause(gapMs);
++        }
++        await createOperation(store, ctx);
++        for (const operation of [...created].reverse()) {
++          await toUnknown(store, operation);
++          await pause(gapMs);
++        }
++        const ids = created.map((operation) => operation.operationId);
++        expect((await store.listUncertainOperations(10)).map((row) => row.operationId)).toEqual(
++          ids,
++        );
++        expect((await store.listUncertainOperations(2)).map((row) => row.operationId)).toEqual(
++          ids.slice(0, 2),
++        );
++      });
++    });
++
++    describe('consumer delivery fields', () => {
++      it('persists and returns the consumer-delivery fields as written', async (store, ctx) => {
++        const row = await insertEvidence(store, ctx, 'WH-CONSUMER');
++        const read = async () => {
++          const byId = await store.findEvidenceById(row.evidenceId);
++          const byEvent = await store.findEvidenceByProviderEvent(
++            ctx.providerCode,
++            ctx.accountRef,
++            ctx.environment,
++            'WH-CONSUMER',
++          );
++          expect(byEvent?.consumerDeliveryStatus, 'findEvidenceByProviderEvent').toBe(
++            byId?.consumerDeliveryStatus,
++          );
++          return [
++            byId?.consumerDeliveryStatus,
++            byId?.consumerDeliveryAttempts,
++            byId?.consumerDeliveryLastError ?? null,
++            byId?.consumerDeliveredAt ?? null,
++          ];
++        };
++        await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          verificationStatus: 'verified',
++          processingStatus: 'processed',
++          consumerDeliveryStatus: 'pending',
++          consumerDeliveryAttempts: 0,
++        });
++        expect(await read()).toEqual(['pending', 0, null, null]);
++        const claimed = await store.claimPendingEvidence({
++          limit: 5,
++          leaseMs: 60_000,
++          workerId: 'w1',
++        });
++        expect(claimed[0]?.consumerDeliveryStatus, 'claimPendingEvidence').toBe('pending');
++        await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          consumerDeliveryStatus: 'failed',
++          consumerDeliveryAttempts: 1,
++          consumerDeliveryLastError: 'Consumer event delivery failed',
++        });
++        expect(await read()).toEqual(['failed', 1, 'Consumer event delivery failed', null]);
++        await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          consumerDeliveryStatus: 'failed_terminal',
++          consumerDeliveryAttempts: 10,
++        });
++        expect(await read()).toEqual([
++          'failed_terminal',
++          10,
++          'Consumer event delivery failed',
++          null,
++        ]);
++        await store.updateEvidence({
++          evidenceId: row.evidenceId,
++          consumerDeliveryStatus: 'confirmed',
++          consumerDeliveredAt: '2026-01-02T00:00:00.000Z',
++          consumerDeliveryLastError: null,
++        });
++        expect(await read()).toEqual(['confirmed', 10, null, '2026-01-02T00:00:00.000Z']);
++      });
++    });
++
++    describe('reconciliation attempts', () => {
++      it('insertReconciliationAttempt stores the attempt', async (store, ctx) => {
++        const evidence = await insertEvidence(store, ctx);
++        const attempt = await store.insertReconciliationAttempt({
++          evidenceId: evidence.evidenceId,
++          outcome: 'no_op',
++          resultCode: 'UNMATCHED',
++        });
++        expect(typeof attempt.attemptId).toBe('string');
++        expect([
++          attempt.evidenceId,
++          attempt.outcome,
++          attempt.resultCode,
++          attempt.operationId ?? null,
++        ]).toEqual([evidence.evidenceId, 'no_op', 'UNMATCHED', null]);
++      });
++    });
++
++    if (capabilities.checkout) {
++      describe('checkout capability', () => {
++        it('implements every CheckoutStore method', async (store) => {
++          expect(missingMethods(store, CHECKOUT_STORE_METHODS)).toEqual([]);
++        });
++
++        it('takes a create lease for a checkout and finds it by provider order id', async (store, ctx) => {
++          const checkoutStore = store as unknown as SubscriptionStore & CheckoutStore;
++          const created = await createOperation(store, ctx, {
++            kind: 'checkout',
++          });
++          const lease = await checkoutStore.acquireCheckoutCreateExecutionLease({
++            operationId: created.operationId,
++            expectedVersion: created.version,
++          });
++          expect(lease.kind).toBe('acquired');
++          const orderId = uniqueId('ORDER');
++          await store.transitionOperation({
++            operationId: lease.operation.operationId,
++            expectedVersion: lease.operation.version,
++            nextStatus: 'submitted',
++            providerOrderId: orderId,
++            reason: 'order created',
++          });
++          const found = await checkoutStore.findOperationByProviderOrderId(
++            ctx.providerCode,
++            ctx.accountRef,
++            ctx.environment,
++            orderId,
++          );
++          expect(found?.operationId).toBe(created.operationId);
++        });
++      });
++    }
++
++    if (capabilities.payout) {
++      describe('payout capability', () => {
++        it('implements every PayoutStore method', async (store) => {
++          expect(missingMethods(store, PAYOUT_STORE_METHODS)).toEqual([]);
++        });
++
++        it('lists child operations by parent', async (store, ctx) => {
++          const payoutStore = store as unknown as SubscriptionStore & PayoutStore;
++          const batch = await createOperation(store, ctx, {
++            kind: 'payout_batch',
++          });
++          const item = await createOperation(store, ctx, {
++            kind: 'payout_item',
++            parentOperationId: batch.operationId,
++          });
++          const children = await payoutStore.listOperationsByParent(batch.operationId);
++          expect(children.map((row) => row.operationId)).toEqual([item.operationId]);
++        });
++      });
++    }
++
++    if (capabilities.seller) {
++      describe('seller capability', () => {
++        it('implements every SellerStore method', async (store) => {
++          expect(missingMethods(store, SELLER_STORE_METHODS)).toEqual([]);
++        });
++
++        it('creates one connection per seller ref and updates it by version', async (store, ctx) => {
++          const sellerStore = store as unknown as SubscriptionStore & SellerStore;
++          const input = {
++            ...ctx,
++            sellerRef: uniqueId('seller'),
++            trackingId: uniqueId('track'),
++          };
++          const first = await sellerStore.createSellerConnection(input);
++          const again = await sellerStore.createSellerConnection(input);
++          expect(again.connectionId).toBe(first.connectionId);
++          await sellerStore.updateSellerConnection({
++            connectionId: first.connectionId,
++            expectedVersion: first.version,
++            consentStatus: 'granted',
++          });
++          expectRejected(
++            await rejectionOf(() =>
++              sellerStore.updateSellerConnection({
++                connectionId: first.connectionId,
++                expectedVersion: first.version,
++                consentStatus: 'revoked',
++              }),
++            ),
++            PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT,
++          );
++        });
++      });
++    }
++
++    if (capabilities.marketplace) {
++      describe('marketplace capability', () => {
++        it('implements every MarketplaceStore method', async (store) => {
++          expect(missingMethods(store, MARKETPLACE_STORE_METHODS)).toEqual([]);
++        });
++
++        it('updates a purchase unit by version and finds it by capture id', async (store, ctx) => {
++          const marketplaceStore = store as unknown as SubscriptionStore & MarketplaceStore;
++          const checkout = await createOperation(store, ctx, {
++            kind: 'marketplace_checkout',
++          });
++          const [unit] = await marketplaceStore.insertMarketplacePurchaseUnits([
++            {
++              operationId: checkout.operationId,
++              referenceId: 'unit-1',
++              sellerRef: 'seller-1',
++              providerMerchantId: null,
++              amountMinor: '1000',
++              currencyCode: 'USD',
++            },
++          ]);
++          if (!unit) {
++            throw new Error('insertMarketplacePurchaseUnits returned no unit');
++          }
++          const captureId = uniqueId('CAP');
++          await marketplaceStore.updateMarketplacePurchaseUnit({
++            unitId: unit.unitId,
++            expectedVersion: unit.version,
++            unitStatus: 'captured',
++            providerCaptureId: captureId,
++          });
++          expectRejected(
++            await rejectionOf(() =>
++              marketplaceStore.updateMarketplacePurchaseUnit({
++                unitId: unit.unitId,
++                expectedVersion: unit.version,
++                unitStatus: 'failed',
++              }),
++            ),
++            PAYMENT_RELIABILITY_ERROR.TRANSITION_CONFLICT,
++          );
++          expect(
++            (await marketplaceStore.findMarketplacePurchaseUnitByCaptureId(captureId))?.unitId,
++          ).toBe(unit.unitId);
++        });
++      });
++    }
++  });
++}
+diff --color -ruN .superpowers/snap-after-t4/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts
+--- .superpowers/snap-after-t4/src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/testing/lib/__tests__/store-conformance-detects-broken-stores.unit.test.ts	2026-10-22 13:28:27.294273396 +0300
+@@ -0,0 +1,214 @@
++import { describe, expect, it } from 'vitest';
++import {
++  PaymentReliabilityError,
++  type PaymentOperation,
++  type TransitionPaymentOperationInput,
++  type UpdatePaymentOperationInput,
++  type UpdateProviderEvidenceInput,
++  type ProviderEvidenceRecord,
++  type ClaimPendingEvidenceInput,
++  type CreatePaymentOperationInput,
++} from '../../../contracts/index';
++import { MemoryPaymentReliabilityStore } from '../../../core/lib/persistence/memory-payment-reliability-store';
++import type { SubscriptionStore } from '../../../core/lib/persistence/payment-reliability-store';
++import { runStoreConformance, type StoreConformanceCapabilities } from '../../index';
++
++/*
++ * The kit is only useful if it fails for stores that break a guarantee. Each broken store below
++ * reproduces one deviation found in the issue #6 review (or a plausible SQL mistake); the kit must
++ * report at least one failing case for it, and no failing case for the reference store.
++ */
++
++type CollectedCase = { name: string; run: () => Promise<void> | void };
++
++function collectCases(
++  createStore: () => SubscriptionStore,
++  capabilities?: StoreConformanceCapabilities,
++): CollectedCase[] {
++  const cases: CollectedCase[] = [];
++  const path: string[] = [];
++  runStoreConformance({
++    createStore,
++    describe: (name, fn) => {
++      path.push(name);
++      fn();
++      path.pop();
++    },
++    it: (name, fn) => {
++      cases.push({ name: [...path, name].join(' > '), run: fn });
++    },
++    expect,
++    capabilities,
++    leaseExpiryWaitMs: 40,
++  });
++  return cases;
++}
++
++async function failingCases(
++  createStore: () => SubscriptionStore,
++  capabilities?: StoreConformanceCapabilities,
++): Promise<string[]> {
++  const failures: string[] = [];
++  for (const testCase of collectCases(createStore, capabilities)) {
++    try {
++      await testCase.run();
++    } catch {
++      failures.push(testCase.name);
++    }
++  }
++  return failures;
++}
++
++class DropsConsumerDeliveryFields extends MemoryPaymentReliabilityStore {
++  override async updateEvidence(
++    input: UpdateProviderEvidenceInput,
++  ): Promise<ProviderEvidenceRecord> {
++    const {
++      consumerDeliveryStatus: _status,
++      consumerDeliveredAt: _at,
++      consumerDeliveryAttempts: _attempts,
++      consumerDeliveryLastError: _error,
++      ...rest
++    } = input;
++    return super.updateEvidence(rest);
++  }
++}
++
++class ClaimWithoutTransitionKind extends MemoryPaymentReliabilityStore {
++  override async transitionOperation(
++    input: TransitionPaymentOperationInput,
++  ): Promise<PaymentOperation> {
++    return super.transitionOperation({ ...input, transitionKind: undefined });
++  }
++}
++
++class IgnoresFingerprint extends MemoryPaymentReliabilityStore {
++  override async createOperation(input: CreatePaymentOperationInput): Promise<PaymentOperation> {
++    const existing = await this.findOperationByIdempotency(
++      input.idempotencyScope,
++      input.idempotencyKey,
++    );
++    return existing ?? super.createOperation(input);
++  }
++}
++
++class NoVersionCheckOnUpdate extends MemoryPaymentReliabilityStore {
++  override async updateOperation(input: UpdatePaymentOperationInput): Promise<PaymentOperation> {
++    const current = await this.findOperationById(input.operationId);
++    return super.updateOperation({
++      ...input,
++      expectedVersion: current?.version ?? input.expectedVersion,
++    });
++  }
++}
++
++class NewestUncertainFirst extends MemoryPaymentReliabilityStore {
++  override async listUncertainOperations(limit: number): Promise<PaymentOperation[]> {
++    return (await super.listUncertainOperations(Number.MAX_SAFE_INTEGER)).reverse().slice(0, limit);
++  }
++}
++
++class FailureCodeCannotBeCleared extends MemoryPaymentReliabilityStore {
++  override async transitionOperation(
++    input: TransitionPaymentOperationInput,
++  ): Promise<PaymentOperation> {
++    return super.transitionOperation({
++      ...input,
++      failureCode: input.failureCode ?? undefined,
++      failureMessage: input.failureMessage ?? undefined,
++    });
++  }
++}
++
++class LeaseIgnoringClaim extends MemoryPaymentReliabilityStore {
++  override async claimPendingEvidence(input: ClaimPendingEvidenceInput) {
++    const rows = await super.claimPendingEvidence(input);
++    // Second worker steals rows the first one holds: release before every claim.
++    for (const row of rows) {
++      await super.updateEvidence({
++        evidenceId: row.evidenceId,
++        claimLeaseExpiresAt: null,
++        claimWorkerId: null,
++      });
++    }
++    return rows;
++  }
++}
++
++class OverwritesProviderSubscriptionId extends MemoryPaymentReliabilityStore {
++  override async transitionOperation(
++    input: TransitionPaymentOperationInput,
++  ): Promise<PaymentOperation> {
++    try {
++      return await super.transitionOperation(input);
++    } catch (error) {
++      if (error instanceof PaymentReliabilityError && input.providerSubscriptionId) {
++        // Silently "wins" like a store without the partial unique index.
++        return super.transitionOperation({
++          ...input,
++          providerSubscriptionId: undefined,
++          providerReferenceId: undefined,
++        });
++      }
++      throw error;
++    }
++  }
++}
++
++describe('runStoreConformance detects broken stores', () => {
++  it('passes every case for the reference memory store', async () => {
++    expect(
++      await failingCases(() => new MemoryPaymentReliabilityStore(), {
++        checkout: true,
++        payout: true,
++        seller: true,
++        marketplace: true,
++      }),
++    ).toEqual([]);
++  });
++
++  it.each([
++    [
++      'drops the consumer-delivery fields',
++      () => new DropsConsumerDeliveryFields(),
++      /consumer-delivery/,
++    ],
++    [
++      'records no transitionKind on a claim',
++      () => new ClaimWithoutTransitionKind(),
++      /claim_execution/,
++    ],
++    ['ignores the command fingerprint', () => new IgnoresFingerprint(), /fingerprint/],
++    ['skips the version check on update', () => new NoVersionCheckOnUpdate(), /version/],
++    ['lists uncertain operations newest first', () => new NewestUncertainFirst(), /oldest first/],
++    ['cannot clear failureCode with null', () => new FailureCodeCannotBeCleared(), /null clears/],
++    ['lets a second worker take a held lease', () => new LeaseIgnoringClaim(), /lease/],
++    [
++      'silently ignores a provider subscription id bound elsewhere',
++      () => new OverwritesProviderSubscriptionId(),
++      /provider id/,
++    ],
++  ])('fails a store that %s', async (_label, createStore, expectedCase) => {
++    const failures = await failingCases(createStore);
++    expect(failures.length).toBeGreaterThan(0);
++    expect(
++      failures.some((name) => expectedCase.test(name)),
++      failures.join('\n'),
++    ).toBe(true);
++  });
++
++  it('fails a declared capability whose methods are missing', async () => {
++    const failures = await failingCases(() => new MemoryPaymentReliabilityStore(), {
++      checkout: true,
++    });
++    expect(failures).toEqual([]);
++    const subscriptionOnly = () => {
++      const backing = new MemoryPaymentReliabilityStore();
++      const store = Object.create(backing) as Record<string, unknown>;
++      store.findOperationByProviderOrderId = undefined;
++      return store as unknown as SubscriptionStore;
++    };
++    const missing = await failingCases(subscriptionOnly, { checkout: true });
++    expect(missing.some((name) => /checkout/.test(name))).toBe(true);
++  });
++});
+diff --color -ruN .superpowers/snap-after-t4/src/testing/lib/__tests__/store-conformance-memory.unit.test.ts src/testing/lib/__tests__/store-conformance-memory.unit.test.ts
+--- .superpowers/snap-after-t4/src/testing/lib/__tests__/store-conformance-memory.unit.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ src/testing/lib/__tests__/store-conformance-memory.unit.test.ts	2026-10-22 13:28:44.496222421 +0300
+@@ -0,0 +1,12 @@
++import { describe, expect, it } from 'vitest';
++import { MemoryPaymentReliabilityStore } from '../../../core/lib/persistence/memory-payment-reliability-store';
++import { runStoreConformance } from '../../index';
++
++// The in-memory reference store must honour every guarantee the kit checks (issue #6).
++runStoreConformance({
++  createStore: () => new MemoryPaymentReliabilityStore(),
++  describe,
++  it,
++  expect,
++  capabilities: { checkout: true, payout: true, seller: true, marketplace: true },
++});
+diff --color -ruN .superpowers/snap-after-t4/test/dist-declarations.test.ts test/dist-declarations.test.ts
+--- .superpowers/snap-after-t4/test/dist-declarations.test.ts	2026-10-22 12:57:32.057031630 +0300
++++ test/dist-declarations.test.ts	2026-10-22 13:23:35.874872713 +0300
+@@ -47,7 +47,7 @@
+     rmSync(consumerDir, { recursive: true, force: true });
+   });
+ 
+-  it.each(['index', 'paypal', 'subscription'])('dist/%s declarations and their shared chunks do not mention it', (entry) => {
++  it.each(['index', 'paypal', 'subscription', 'testing'])('dist/%s declarations and their shared chunks do not mention it', (entry) => {
+     for (const ext of ['.d.ts', '.d.cts']) {
+       for (const file of reachableDeclarations(`${entry}${ext}`)) {
+         expect(readFileSync(join(root, 'dist', file), 'utf8'), file).not.toContain('@idevconn/payment"');
+diff --color -ruN .superpowers/snap-after-t4/test/dist-entry-identity.test.ts test/dist-entry-identity.test.ts
+--- .superpowers/snap-after-t4/test/dist-entry-identity.test.ts	2026-10-22 12:57:32.057089105 +0300
++++ test/dist-entry-identity.test.ts	2026-10-22 13:23:35.874711520 +0300
+@@ -72,7 +72,7 @@
+     console.log(JSON.stringify({ seen, cached }));
+   `;
+ 
+-  it.each(['index', 'paypal', 'subscription'])('loads dist/%s.cjs without axios, zod, express or @idevconn/payment', (entry) => {
++  it.each(['index', 'paypal', 'subscription', 'testing'])('loads dist/%s.cjs without axios, zod, express or @idevconn/payment', (entry) => {
+     const out = JSON.parse(runNode(['-e', cjsGuard(entry)]));
+     expect(out).toEqual({ seen: [], cached: [] });
+   });
+@@ -101,7 +101,7 @@
+       .filter((line) => line.startsWith('BLOCKED:'));
+   };
+ 
+-  it.each(['index', 'paypal', 'subscription'])('loads dist/%s.js without axios, zod, express or @idevconn/payment', (entry) => {
++  it.each(['index', 'paypal', 'subscription', 'testing'])('loads dist/%s.js without axios, zod, express or @idevconn/payment', (entry) => {
+     expect(esmGuard(entry)).toEqual([]);
+   });
+ 
+diff --color -ruN .superpowers/snap-after-t4/test/dist-package-surface.test.ts test/dist-package-surface.test.ts
+--- .superpowers/snap-after-t4/test/dist-package-surface.test.ts	2026-10-22 12:57:32.056822649 +0300
++++ test/dist-package-surface.test.ts	2026-10-22 13:27:10.447419074 +0300
+@@ -39,6 +39,10 @@
+     expect(existsSync(join(root, 'dist/subscription.cjs'))).toBe(true);
+     expect(existsSync(join(root, 'dist/subscription.d.ts'))).toBe(true);
+     expect(existsSync(join(root, 'dist/subscription.d.cts'))).toBe(true);
++    expect(existsSync(join(root, 'dist/testing.js'))).toBe(true);
++    expect(existsSync(join(root, 'dist/testing.cjs'))).toBe(true);
++    expect(existsSync(join(root, 'dist/testing.d.ts'))).toBe(true);
++    expect(existsSync(join(root, 'dist/testing.d.cts'))).toBe(true);
+   });
+ 
+   it('loads the subscription subpath from dist (ESM and CJS)', async () => {
+diff --color -ruN .superpowers/snap-after-t4/test/entries-consumer.test.ts test/entries-consumer.test.ts
+--- .superpowers/snap-after-t4/test/entries-consumer.test.ts	2026-10-22 12:57:32.056741931 +0300
++++ test/entries-consumer.test.ts	2026-10-22 13:23:35.878537746 +0300
+@@ -19,8 +19,9 @@
+ import { PaypalWebhookVerifier, PaypalSubscriptionExecutor } from '@idevconn/payment-providers/paypal';
+ import { reduceSubscription, initialSubscriptionState } from '@idevconn/payment-providers/subscription';
+ import { createPaypalPaymentProvider, LegacyPaymentError } from '@idevconn/payment-providers/legacy';
++import { runStoreConformance } from '@idevconn/payment-providers/testing';
+ declare const order: OrderResult;
+-export { order, WebhookProcessingService, PaymentCapabilityError, PaypalWebhookVerifier, PaypalSubscriptionExecutor, reduceSubscription, initialSubscriptionState, createPaypalPaymentProvider, LegacyPaymentError };
++export { order, WebhookProcessingService, PaymentCapabilityError, PaypalWebhookVerifier, PaypalSubscriptionExecutor, reduceSubscription, initialSubscriptionState, createPaypalPaymentProvider, LegacyPaymentError, runStoreConformance };
+ `;
+ 
+ describe.skipIf(!distReady)('every entry resolves for a consumer', () => {
+@@ -41,7 +42,7 @@
+   });
+ 
+   it.each(['node10', 'node16'])(
+-    'type-checks root, /paypal, /subscription and /legacy under moduleResolution %s',
++    'type-checks root, /paypal, /subscription, /legacy and /testing under moduleResolution %s',
+     (moduleResolution) => {
+       const dir = join(consumerDir, moduleResolution);
+       mkdirSync(dir, { recursive: true });
+diff --color -ruN .superpowers/snap-after-t4/test/testing-entry-consumer.test.ts test/testing-entry-consumer.test.ts
+--- .superpowers/snap-after-t4/test/testing-entry-consumer.test.ts	1970-01-01 02:00:00.000000000 +0200
++++ test/testing-entry-consumer.test.ts	2026-10-22 13:28:27.522272722 +0300
+@@ -0,0 +1,155 @@
++import { execFileSync } from 'node:child_process';
++import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
++import { createRequire } from 'node:module';
++import { join } from 'node:path';
++import { pathToFileURL } from 'node:url';
++import { afterAll, beforeAll, describe, expect, it } from 'vitest';
++
++/*
++ * Consumer smoke checks for the `./testing` entry (store conformance kit), run against the built
++ * package linked by name: ESM import, CJS require (without loading any test runner), and
++ * TypeScript under `moduleResolution` node10 (`typesVersions`) and node16 (`exports`). The kit
++ * runs end to end with a tiny hand-written runner, so it needs no vitest at runtime.
++ */
++
++const root = join(import.meta.dirname, '..');
++const distReady = existsSync(join(root, 'dist/testing.js'));
++const consumerDir = join(root, 'node_modules/.cache/testing-consumer-smoke');
++const tscBin = join(root, 'node_modules/typescript/bin/tsc');
++
++function run(args: string[]): string {
++  return execFileSync(process.execPath, args, {
++    cwd: consumerDir,
++    encoding: 'utf8',
++  });
++}
++
++// A minimal runner: collects cases, runs them in order, prints the failures.
++const miniRunner = `
++  const cases = [];
++  const path = [];
++  const describe = (name, fn) => { path.push(name); fn(); path.pop(); };
++  const it = (name, fn) => cases.push({ name: [...path, name].join(' > '), fn });
++  const expect = (actual, message) => ({
++    toBe: (expected) => { if (!Object.is(actual, expected)) throw new Error((message ?? '') + ' toBe'); },
++    toEqual: (expected) => { if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error((message ?? '') + ' toEqual'); },
++  });
++`;
++
++const runAll = `
++  testing.runStoreConformance({
++    createStore: () => new core.MemoryPaymentReliabilityStore(),
++    describe, it, expect,
++    capabilities: { checkout: true, payout: true, seller: true, marketplace: true },
++    leaseExpiryWaitMs: 40,
++  });
++  const failed = [];
++  for (const c of cases) { try { await c.fn(); } catch (e) { failed.push(c.name + ': ' + e.message); } }
++  const loaded = typeof require === 'undefined' ? [] : Object.keys(require.cache).filter((k) => /node_modules[\\\\/](vitest|jest|@vitest)[\\\\/]/.test(k));
++  console.log(JSON.stringify({ cases: cases.length, failed, loaded }));
++`;
++
++describe.skipIf(!distReady)('testing entry consumer smoke', () => {
++  beforeAll(() => {
++    rmSync(consumerDir, { recursive: true, force: true });
++    mkdirSync(join(consumerDir, 'node_modules/@idevconn'), { recursive: true });
++    symlinkSync(root, join(consumerDir, 'node_modules/@idevconn/payment-providers'), 'dir');
++    writeFileSync(
++      join(consumerDir, 'package.json'),
++      JSON.stringify({ name: 'consumer', private: true }),
++    );
++  });
++
++  afterAll(() => {
++    rmSync(consumerDir, { recursive: true, force: true });
++  });
++
++  it('loads the built ESM and CJS files directly', async () => {
++    const esm = await import(pathToFileURL(join(root, 'dist/testing.js')).href);
++    const require = createRequire(import.meta.url);
++    const cjs = require(join(root, 'dist/testing.cjs'));
++    for (const mod of [esm, cjs]) {
++      expect(typeof mod.runStoreConformance).toBe('function');
++    }
++  });
++
++  it('runs the kit against the memory store under ESM import with no test runner installed', () => {
++    const out = run([
++      '--input-type=module',
++      '-e',
++      `import * as testing from '@idevconn/payment-providers/testing';
++       import * as core from '@idevconn/payment-providers';
++       ${miniRunner}
++       ${runAll}`,
++    ]);
++    const result = JSON.parse(out);
++    expect(result.failed).toEqual([]);
++    expect(result.cases).toBeGreaterThan(30);
++  }, 30_000);
++
++  it('runs the kit under CJS require without loading vitest or jest', () => {
++    const out = run([
++      '-e',
++      `const testing = require('@idevconn/payment-providers/testing');
++       const core = require('@idevconn/payment-providers');
++       (async () => {
++         ${miniRunner}
++         ${runAll}
++       })();`,
++    ]);
++    const result = JSON.parse(out);
++    expect(result.failed).toEqual([]);
++    expect(result.loaded).toEqual([]);
++  }, 30_000);
++
++  it.each(['node10', 'node16'])(
++    'type-checks a consumer under moduleResolution %s',
++    (moduleResolution) => {
++      const dir = join(consumerDir, moduleResolution);
++      mkdirSync(dir, { recursive: true });
++      writeFileSync(
++        join(dir, 'index.ts'),
++        `import { runStoreConformance, type ConformanceExpect } from '@idevconn/payment-providers/testing';
++         import { MemoryPaymentReliabilityStore, type SubscriptionStore } from '@idevconn/payment-providers';
++         declare const expect: ConformanceExpect;
++         const createStore = (): SubscriptionStore => new MemoryPaymentReliabilityStore();
++         runStoreConformance({
++           createStore,
++           describe: (_name: string, fn: () => void) => fn(),
++           it: (_name: string, _fn: () => Promise<void>) => undefined,
++           expect,
++           capabilities: { checkout: false },
++         });
++        `,
++      );
++      writeFileSync(
++        join(dir, 'tsconfig.json'),
++        JSON.stringify({
++          compilerOptions: {
++            target: 'ES2022',
++            module: moduleResolution === 'node10' ? 'commonjs' : 'node16',
++            moduleResolution,
++            strict: true,
++            noEmit: true,
++            skipLibCheck: true,
++            types: [],
++          },
++          files: ['index.ts'],
++        }),
++      );
++      const result = (() => {
++        try {
++          return execFileSync(process.execPath, [tscBin, '-p', join(dir, 'tsconfig.json')], {
++            cwd: dir,
++            encoding: 'utf8',
++          });
++        } catch (error) {
++          const failure = error as { stdout?: string; stderr?: string };
++          return `FAILED\n${failure.stdout ?? ''}${failure.stderr ?? ''}`;
++        }
++      })();
++      expect(result).toBe('');
++    },
++    60_000,
++  );
++});

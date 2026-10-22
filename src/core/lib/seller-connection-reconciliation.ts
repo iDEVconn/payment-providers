@@ -7,8 +7,12 @@ import {
 import { applySellerMerchantStatus } from './seller-evidence-application';
 import { readinessFromConnection } from './seller-connection-readiness';
 import type { ReconciliationProviderLookup } from './checkout-provider-port';
-import type { PaymentReliabilityStore } from './persistence/payment-reliability-store';
-import { sha256Payload } from './persistence/memory-payment-reliability-store';
+import type {
+  EvidenceStore,
+  ReconciliationStore,
+  SellerStore,
+} from './persistence/payment-reliability-store';
+import { sha256Payload } from './sha256-payload';
 
 export type SellerConnectionReconcileResult = {
   outcome: 'applied' | 'no_op' | 'retryable_failure' | 'ambiguous' | 'not_found';
@@ -36,7 +40,7 @@ function toConnectionResult(connection: SellerConnectionRecord): SellerConnectio
 }
 
 async function insertConnectionReconciliationEvidence(
-  store: PaymentReliabilityStore,
+  store: EvidenceStore & ReconciliationStore & SellerStore,
   connection: SellerConnectionRecord,
   input: { eventType: string; resourceId: string | null },
 ): Promise<ProviderEvidenceRecord> {
@@ -80,7 +84,7 @@ function providerContext(connection: SellerConnectionRecord) {
  * Never creates a referral or duplicate connection aggregate.
  */
 export async function reconcileSellerConnectionAggregate(input: {
-  store: PaymentReliabilityStore;
+  store: EvidenceStore & ReconciliationStore & SellerStore;
   providerLookup: SellerConnectionReconciliationLookup;
   connection: SellerConnectionRecord;
 }): Promise<SellerConnectionReconcileResult> {
